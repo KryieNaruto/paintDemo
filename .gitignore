@@ -1,0 +1,27 @@
+# 工作区隔离（git worktree 落点）
+.worktrees/
+
+# 状态锁 / 缓存
+.exec/.taskline.lock
+.exec/__pycache__/
+__pycache__/
+*.pyc
+
+# 构建产物
+build/
+.cxx/
+*.o
+*.a
+*.so
+.gradle/
+local.properties
+app/build/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+# 大文件 / 抓帧依据（49MB，不入版控）
+RenderDoc结果/*.rdc
