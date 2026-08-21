@@ -26,6 +26,7 @@
 | [docs/tasks/detail/共同基座.md](docs/tasks/detail/共同基座.md) | C API + 内部 core 任务书 |
 | [docs/git/README.md](docs/git/README.md) | 消费者 submodule 约定 |
 | [docs/env/toolchain.md](docs/env/toolchain.md) | host 工具链版本下限与 `check-env.sh` 退出码 |
+| [docs/env/linux-host.md](docs/env/linux-host.md) | Linux / WSL Ubuntu：apt 四包与探测 |
 | [docs/调研/路线整理.md](docs/调研/路线整理.md) | 路线分组 + §7 SDK/C API |
 | [docs/调研/技术路线评审汇总.md](docs/调研/技术路线评审汇总.md) | 5 路线评审结论 |
 | [docs/调研/路线E-白盒移植libmypaint-技术方案.md](docs/调研/路线E-白盒移植libmypaint-技术方案.md) | 路线 E 详细技术方案 |
@@ -88,6 +89,8 @@ python3 .exec/taskline.py status
 版本下限以 [`docs/env/toolchain.md`](docs/env/toolchain.md) 为准；下面只给安装入口，不另写一套数字。
 
 #### 5.1 Linux host
+
+完整步骤、WSL 路径与「无 GPU 不算失败」见 [`docs/env/linux-host.md`](docs/env/linux-host.md)。可重复安装：[`scripts/setup-linux-host.sh`](scripts/setup-linux-host.sh)（需 sudo）。
 
 ```bash
 sudo apt install build-essential cmake ninja-build libvulkan-dev
@@ -154,9 +157,9 @@ cmake --build --preset android-arm64
 | `tests/` | host ctest（C API / engine，headless） |
 | `docs/tasks/` | 任务线 SOT + 任务书 |
 | `docs/git/` | 消费者 submodule 约定与模板 |
-| `docs/env/` | host 工具链探测规则（`toolchain.md`） |
+| `docs/env/` | host 工具链探测规则（`toolchain.md`）与 Linux 安装（`linux-host.md`） |
 | `docs/调研/` | 路线与评审 |
-| `scripts/` | `check-env.sh`、`bootstrap-consumer.sh` |
+| `scripts/` | `check-env.sh`、`setup-linux-host.sh`、`bootstrap-consumer.sh` |
 | `.exec/taskline.py` | 任务申领脚本 |
 
 **不在本仓库**：`ui/`、`platform/`、`app/`。
