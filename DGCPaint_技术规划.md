@@ -1,7 +1,10 @@
-# DGCamp Paint 原型 · 技术规划（v2.0）
+# DGCamp Paint 原型 · 技术规划（v4.0）
 
-> **版本说明**：v2.0 基于 5 路线评审结论重写。保留 v1.0 的开发环境与测试环境搭建，任务线全部基于路线 A–E 分类重新规划。
-> **日期**：2026-08-20
+> **版本说明**：
+> - **v4.0**（2026-08-21）：仓库收敛为 SDK 基座（`libdgc_paint`），不含 UI 消费者。任务表迁至 [`docs/tasks/任务线.md`](docs/tasks/任务线.md)，先落地环境（E0 线）与最小 SDK 基座（B 线），并**并入 v3.0 的 §4.0.1-4.0.6 技术设计**（SDK C API / 离屏 / 确定性 / CLI 批处理），保持「AI 可编程外壳」主线。
+> - **v3.0**（2026-08-21）：新增 **可编程外壳** 章节——SDK C API 边界提前到第一版、PC 离屏渲染（headless Vulkan）、CLI 批处理脚本模式、确定性渲染与图像输出。目标：**AI 能通过命令行完成界面上的所有操作，并输出图片自行对比结果**。
+> - **v2.0**（2026-08-20）：基于 5 路线评审结论重写，主线改为路线 E（白盒移植 libmypaint → 自研 C++ 内核 + Vulkan Compute）。
+> - **v1.0**：开发环境与测试环境搭建。
 > **任务与仓库边界（2026-08-21）**：本 Git 仓库是 SDK 基座（C API + `core/`/`kernels/`/`render/`），不含 UI 消费者。任务 SOT → [`docs/tasks/任务线.md`](docs/tasks/任务线.md)；详情 → [`docs/tasks/detail/`](docs/tasks/detail/)；消费者 submodule → [`docs/git/README.md`](docs/git/README.md)；C API 分析 → [`docs/调研/路线整理.md`](docs/调研/路线整理.md) §7。
 
 ---
@@ -13,6 +16,22 @@ DGCamp Paint 工具的完整需求中，绘画功能是核心。本阶段剔除�
 > **libmypaint（笔刷引擎）+ Jetpack Ink（低延迟输入）+ Vulkan Compute Shader（GPU 笔刷合成）三者组合，能否达到 Procreate 级别的绘画手感。**
 
 目标平台为 **Android 平板**。这是一个"技术验证型原型"，不是产品 MVP——核心交付物是「能画 + 能测延迟/帧率」的最小闭环，用于评估技术路线的可行性，而非完成产品功能。
+
+### v3.0 新增目标：AI 可编程外壳
+
+在绘画原型之上增加一条 **AI 可自主驱动的通道**：
+
+> **通过命令行完成界面上的所有操作**（选笔刷 / 调参数 / 选颜色 / 画笔迹 / 清空 / 撤销 / 保存），并在 PC 下以**离屏渲染**（不弹窗口）产出 **PNG 图片结果**，供 AI 自行对比验证。
+
+这使 `kernels/` + `render/` 从「只能被 UI 驱动」升级为「可以被任何宿主驱动」。CLI 是 SDK C API 的第一个宿主，与 Android/PC UI 调同一套 C API，因此**界面操作 ↔ CLI 命令 ↔ C API 三者一一对应**，不存在「CLI 做得到但 UI 做不到」或反向偏差。
+
+**三个新支柱**：
+
+| 支柱 | 内容 | 对应章节 |
+|---|---|---|
+| ① SDK C API 边界 | `sdk_api/` 提前到第一版，UI 与 CLI 统一走 C API | §4.0.2 |
+| ② PC 离屏渲染 | `IRenderBackend` headless 模式，无窗口渲染到离屏 image + 导出 PNG | §4.0.5 |
+| ③ 确定性渲染 | seed 注入 + 固定时间戳，同脚本同 seed 像素级可复现 | §4.0.3 |
 
 ### 技术选型（已与用户确认）
 
@@ -26,6 +45,11 @@ DGCamp Paint 工具的完整需求中，绘画功能是核心。本阶段剔除�
 | 笔刷引擎 | **路线 E：白盒移植 libmypaint（自研 C++，CPU dab）** | 实现 `IPaintKernel`，**可插拔** |
 | 渲染 | **Vulkan 原生** | 实现 `IRenderBackend`，**可插拔** |
 | 笔刷合成 | Vulkan Compute Shader | 参考 Procreate（Metal Compute） |
+| SDK 边界 | **C API（`sdk_api/`）** | 唯一对外 ABI，UI 与 CLI 统一消费（v3.0 提前） |
+| CLI | **`cli/dgc_cli`（host-only）** | JSON 批处理脚本 → C API → 离屏 PNG |
+| 离屏渲染 | **Vulkan headless** | 无 surface，离屏 storage image + readback（PC） |
+| PNG 输出 | `stb_image_write`（header-only） | readback 后编码 PNG |
+| 确定性 | seed 注入 + 固定时间戳 | 复用 ReplayRandom，同脚本同 seed 像素级一致 |
 | C++ 编译 | CMake（多 toolchain） | Android 编 .so；PC 编可执行；host 跑单测 |
 
 > **可扩展性设计原则（详见 §4.0）**：三个插拔点——`IPaintKernel`（绘画内核）、`IRenderBackend`（渲染后端）、`IPlatform`（平台/UI）。换技术路线 = 换某个接口的底层实现，引擎核心与其余层不动。
@@ -113,7 +137,13 @@ DGCPaintPrototype/
 │   ├── types.h                         # StrokePoint / BrushParams / StampData
 │   ├── engine.h/.cpp                   # 3 线程模型编排
 │   ├── stroke_predictor.h/.cpp         # 速度外推预测
-│   └── ring_buffer.h                   # 无锁 SPSC 队列
+│   ├── ring_buffer.h                   # 无锁 SPSC 队列
+│   └── determinism.h/.cpp              # v3.0：seed 注入 + 固定时间戳（确定性）
+│
+├── sdk_api/                            # ★ v3.0：C API 边界（唯一对外 ABI）
+│   ├── CMakeLists.txt
+│   ├── dgc_paint_c_api.h               # 唯一 SDK 头文件（C 链接，全平台兼容）
+│   └── dgc_paint_c_api.cpp             # opaque handle 实现 → 内部接口
 │
 ├── kernels/                            # L5：绘画内核（插拔）
 │   ├── CMakeLists.txt
@@ -156,6 +186,11 @@ DGCPaintPrototype/
 │   └── pc/                             # ImGui UI（C++）
 │       └── imgui_shell.cpp
 │
+├── cli/                                # ★ v3.0：CLI 宿主（host-only）
+│   ├── CMakeLists.txt
+│   ├── main.cpp                        # dgc_cli 入口：run <script.json>
+│   └── script_runner.cpp               # JSON 脚本解释器 → C API
+│
 ├── app/                                # Android 工程（Kotlin/Compose）
 │   ├── build.gradle.kts
 │   └── src/main/
@@ -176,13 +211,18 @@ DGCPaintPrototype/
 ├── third_party/
 │   ├── nlohmann/                       # 路线 E：header-only JSON（MIT）
 │   ├── mypaint-brushes/                # 笔刷预设
+│   ├── stb/                            # v3.0：stb_image_write（PNG 编码）
 │   └── libmypaint/                     # 路线 A 对照测试用
 │
 ├── tests/
 │   ├── CMakeLists.txt
 │   ├── test_brush_parity.cpp           # 路线 E：对照 libmypaint oracle
 │   ├── test_rng.cpp                    # 随机数验证
-│   └── test_predictor.cpp
+│   ├── test_predictor.cpp
+│   ├── test_c_api.cpp                  # v3.0：C API 层单测
+│   ├── test_offscreen.cpp              # v3.0：离屏渲染 + PNG 导出
+│   ├── test_determinism.cpp            # v3.0：同脚本同 seed 像素级一致
+│   └── test_cli.cpp                    # v3.0：脚本解释器全操作映射
 │
 └── docs/
     └── 调研/                            # 路线技术方案 + 评审
@@ -215,6 +255,8 @@ option(DGCPAIN_RENDER_BGFX    "Route D: bgfx"                       OFF)
 # 通用选项
 option(DGCPAIN_BUILD_JNI    "Build JNI bridge (Android only)"  ${DGCPAIN_ANDROID})
 option(DGCPAIN_BUILD_TESTS  "Build host unit tests"            ON)
+option(DGCPAIN_BUILD_CLI    "Build CLI host (host only)"       ON)
+option(DGCPAIN_BUILD_SDK    "Build SDK C API layer"            ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -244,6 +286,11 @@ if(DGCPAIN_RENDER_BGFX)
     add_subdirectory(render/bgfx)
 endif()
 
+# v3.0：SDK C API 层（UI 与 CLI 的唯一对外边界，提前到第一版）
+if(DGCPAIN_BUILD_SDK)
+    add_subdirectory(sdk_api)
+endif()
+
 # L3：平台层
 if(DGCPAIN_BUILD_JNI)
     add_subdirectory(platform/android)
@@ -251,6 +298,11 @@ endif()
 if(NOT DGCPAIN_ANDROID)
     add_subdirectory(platform/pc)
     add_subdirectory(ui/pc)
+endif()
+
+# v3.0：CLI 宿主（host-only）
+if(DGCPAIN_BUILD_CLI AND NOT DGCPAIN_ANDROID)
+    add_subdirectory(cli)
 endif()
 
 # 测试
@@ -277,7 +329,9 @@ endif()
         "DGCPAIN_KERNEL_BRUSH": "ON",
         "DGCPAIN_RENDER_VULKAN": "ON",
         "DGCPAIN_BUILD_JNI": "OFF",
-        "DGCPAIN_BUILD_TESTS": "ON"
+        "DGCPAIN_BUILD_TESTS": "ON",
+        "DGCPAIN_BUILD_SDK": "ON",
+        "DGCPAIN_BUILD_CLI": "ON"
       }
     },
     {
@@ -290,7 +344,9 @@ endif()
         "DGCPAIN_KERNEL_BRUSH": "ON",
         "DGCPAIN_RENDER_VULKAN": "ON",
         "DGCPAIN_BUILD_JNI": "OFF",
-        "DGCPAIN_BUILD_TESTS": "ON"
+        "DGCPAIN_BUILD_TESTS": "ON",
+        "DGCPAIN_BUILD_SDK": "ON",
+        "DGCPAIN_BUILD_CLI": "ON"
       }
     },
     {
@@ -306,7 +362,8 @@ endif()
         "DGCPAIN_KERNEL_BRUSH": "ON",
         "DGCPAIN_RENDER_VULKAN": "ON",
         "DGCPAIN_BUILD_JNI": "ON",
-        "DGCPAIN_BUILD_TESTS": "OFF"
+        "DGCPAIN_BUILD_TESTS": "OFF",
+        "DGCPAIN_BUILD_SDK": "ON"
       }
     }
   ],
@@ -441,6 +498,191 @@ public:
 
 详见 `docs/调研/路线整理.md` 的完整分组分析。
 
+---
+
+### 4.0.1 v3.0 整体架构：可编程外壳（C API + CLI + 离屏）
+
+v3.0 在 §4.0 之上加一层 **C API 边界**，UI 与 CLI 统一走 C API：
+
+```
+┌───────────────────────┐   ┌───────────────────────┐   ┌───────────────────────┐
+│  Android UI           │   │  PC ImGui UI          │   │  cli/dgc_cli（新增）    │
+│  Compose + Ink        │   │  （GLFW 窗口）         │   │  JSON 脚本 → C API      │
+│  ↓ JNI 调 C API       │   │  ↓ 直调 C API         │   │  → 离屏 → PNG           │
+├───────────────────────┴───┴───────────────────────┴───┴───────────────────────┤
+│                      dgc_paint SDK（C API 边界）                               │
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────────────────┐  │
+│  │  ★ sdk_api/（dgc_paint_c_api.h）——唯一对外 ABI                          │  │
+│  │  生命周期 · 画布 · 输入 · 笔刷 · 参数/颜色 · 渲染 · 离屏 · 确定性 · 导出   │  │
+│  └──────────────────────────────┬──────────────────────────────────────────┘  │
+│                                 │                                             │
+│  ┌──────────────────────────────▼──────────────────────────────────────────┐  │
+│  │  core/ + kernels/ + render/（纯 C++ 内部，5 路线共享）                    │  │
+│  │  engine → Brush::strokeTo → StampData → Vulkan compute → 窗口/离屏       │  │
+│  └─────────────────────────────────────────────────────────────────────────┘  │
+└───────────────────────────────────────────────────────────────────────────────┘
+             libdgc_paint.so / .a / .dll / .dylib
+```
+
+**为什么 UI 也要改走 C API**：UI 若直调 C++ 虚接口，则「CLI 完成所有界面操作」无法成立——CLI 无法复用 UI 的调用路径。统一走 C API 后，**界面操作 ↔ CLI 命令 ↔ C API 一一对应**（§4.0.4 映射表），任一操作都有等价命令行，任一命令行都有等价界面操作。
+
+### 4.0.2 SDK C API 层（`sdk_api/`）
+
+在 `docs/调研/路线整理.md` §七 的 20 函数基础上，扩展离屏 / 确定性 / 参数化 / 导出：
+
+```c
+// dgc_paint_c_api.h —— 唯一 SDK 头文件，C 链接，全平台/编译器兼容
+
+// ── 生命周期 ──
+DgcContext* dgcCreate(void);
+void        dgcDestroy(DgcContext*);
+
+// ── 画布 Surface（UI 层传入原生窗口句柄）──
+void dgcSetSurface(DgcContext*, void* nativeWindow, int w, int h);
+void dgcResize(    DgcContext*, int w, int h);
+
+// ── 输入（标准化 StrokePoint）──
+void dgcBeginStroke(DgcContext*, float x,float y,float pressure,float tiltX,float tiltY);
+void dgcStrokeTo(   DgcContext*, float x,float y,float pressure,float tiltX,float tiltY);
+void dgcEndStroke(  DgcContext*);
+
+// ── 笔刷 ──
+DgcBrush dgcCreateBrush(      DgcContext*, const DgcBrushParams*);
+DgcBrush dgcLoadBrushFromMyb( DgcContext*, const char* mybJson);
+void     dgcDestroyBrush(     DgcContext*, DgcBrush);
+void     dgcSetBrush(         DgcContext*, DgcBrush);
+
+// ── 渲染 ──
+void dgcRender(DgcContext*);                        // 每帧/每次操作后调用
+void dgcClear( DgcContext*, float r, float g, float b, float a);
+
+// ── v3.0：离屏（PC CLI，无窗口）──
+void dgcSetOffscreenSurface(DgcContext*, int w, int h);
+void dgcExportPNG(          DgcContext*, const char* path);   // readback + 编码
+
+// ── v3.0：确定性 ──
+void dgcSetRandomSeed(      DgcContext*, uint64_t seed);      // → ReplayRandom
+void dgcSetFixedTime(       DgcContext*, double t_us);        // 盖掉 t_us 依赖
+
+// ── v3.0：参数化（对齐 BrushSetting 枚举）──
+void dgcSetBrushSetting(    DgcContext*, DgcBrush, int settingId, double value);
+void dgcSetBrushColor(      DgcContext*, DgcBrush, float r,float g,float b,float a);
+
+// ── v3.0：撤销 ──
+void dgcUndo(               DgcContext*);
+
+// ── v3.0：像素级读回（供对比工具/测试）──
+void dgcReadbackPixels(     DgcContext*, void* rgbaOut);
+```
+
+**为什么是 C API 不是 C++**：C 的 ABI 在所有平台/编译器间稳定。C++ 的 name mangling / RTTI / 异常在不同编译器间不兼容。C API 可被任何语言调用——C++ 直调，Kotlin 经 JNI，Swift 经桥接头，C# 经 P/Invoke。CLI、Android UI、PC UI 全走这一边界。
+
+### 4.0.3 确定性渲染机制（`core/determinism.h`）
+
+AI 对比需要「同一脚本两次运行像素级一致」：
+
+```cpp
+// core/determinism.h —— v3.0
+struct DeterminismState {
+    uint64_t    seed = 0;          // 注入内核 RNG（ReplayRandom）
+    double      fixed_time_us = 0; // 覆盖点流的 t_us 依赖
+    bool        override_time = false;
+};
+```
+
+| 非确定性来源 | 处置 |
+|---|---|
+| 内核 RNG（dab 抖动） | `dgcSetRandomSeed(seed)` → 复用 T3-3 `ReplayRandom`，同 seed 同序列 |
+| 点流 `t_us` 时间戳 | `dgcSetFixedTime(t)` → 固定时间步进，消除速度依赖抖动 |
+| 多线程执行顺序 | 离屏单线程路径（CLI 无 3 线程模型，同步调用） |
+| GPU 浮点非结合性 | 同后端同驱动可复现；跨 GPU 允许 ±1 LSB 容差（AI 对比时按需设阈值） |
+
+CLI 的离屏路径是**同步单线程**的，天然规避 engine 的 3 线程时序；确定性在 host 上由单测 `test_determinism.cpp` 用 golden PNG 逐字节 diff 验证。
+
+### 4.0.4 界面操作 ↔ CLI 命令 ↔ C API 映射表
+
+| 界面操作 | CLI 脚本命令 | C API |
+|---|---|---|
+| 建/调画布（尺寸/底色） | `canvas {w,h,background}` | `dgcSetOffscreenSurface` + `dgcClear` |
+| 选择笔刷 | `load-brush <myb路径>` / `set-brush <id>` | `dgcLoadBrushFromMyb` / `dgcSetBrush` |
+| 调整笔刷参数 | `set-param <settingId> <value>` | `dgcSetBrushSetting` |
+| 选择颜色 | `set-color r g b a` | `dgcSetBrushColor` |
+| 绘制笔画 | `stroke {points:[...]}` | `dgcBeginStroke` / `dgcStrokeTo` / `dgcEndStroke` |
+| 清空画布 | `clear` | `dgcClear` |
+| 撤销 | `undo` | `dgcUndo` |
+| 保存/导出 | `export <path>` | `dgcExportPNG` |
+| 确定性配置 | `seed N` / `fixed-time T` | `dgcSetRandomSeed` / `dgcSetFixedTime` |
+
+> 双向保证：Compose/ImGui 按钮与 `dgc_cli` 脚本调**同一函数**。不存在「CLI 做得到但 UI 做不到」或反向偏差。
+
+### 4.0.5 PC 离屏渲染（Vulkan headless）
+
+`IRenderBackend` 扩展：
+
+```cpp
+// render/vulkan/vk_backend.h —— v3.0 新增
+class VkBackend : public IRenderBackend {
+    // 窗口模式（保留）
+    void init(PlatformSurface, int w, int h) override;
+    void present() override;
+    // v3.0：离屏模式（无窗口）
+    void initOffscreen(int w, int h);                 // 无 surface 扩展
+    void readback(void* rgbaOut);                     // CopyImageToBuffer + map
+    void exportPNG(const char* path);                 // readback + stbi_write_png
+};
+```
+
+```
+dgc_cli run script.json
+  → dgcSetOffscreenSurface(w,h)          // VkInstance 无 surface 扩展
+  → ops → C API → 内核 strokeTo → StampData
+  → vkCmdDispatch(brush_composite.comp)  // 合成到离屏 storage image
+  → dgcExportPNG(path)                   // CopyImageToBuffer → map → stbi_write_png
+```
+
+离屏资源要点：
+- Canvas storage image 常驻 `VK_IMAGE_LAYOUT_GENERAL`，usage 含 `STORAGE | SAMPLED | TRANSFER_DST | TRANSFER_SRC`（读回需要 `TRANSFER_SRC`）。
+- 窗口模式的 `present()` 在离屏模式下为 no-op；离屏模式不创建 swapchain。
+- `dgcExportPNG` 用 `stb_image_write.h`（header-only，入 `third_party/stb/`）。
+- T2-2 的「offscreen 合成验证」直接复用此链路，成为离屏模式的验收基础。
+
+### 4.0.6 CLI 宿主（`cli/dgc_cli`，host-only）
+
+批处理脚本模式（**不含对比模式**，对比交给 AI 侧工具）：
+
+```
+dgc_cli run <script.json> [--out <result.png>]
+```
+
+JSON 脚本示例：
+
+```json
+{
+  "canvas": { "w": 2048, "h": 2048, "background": [1, 1, 1, 1] },
+  "seed": 42, "fixed-time": 1000000,
+  "ops": [
+    { "op": "load-brush", "id": "b1", "path": "brushes/basic_round.myb" },
+    { "op": "set-brush",  "id": "b1" },
+    { "op": "set-color",  "r": 0.2, "g": 0.3, "b": 0.8, "a": 1.0 },
+    { "op": "set-param",  "setting": "radius_logarithmic", "value": 0.9 },
+    { "op": "stroke", "points": [
+      { "x": 100, "y": 100, "p": 0.2, "tiltX": 0.0, "tiltY": 0.0 },
+      { "x": 400, "y": 100, "p": 0.8, "tiltX": 0.3, "tiltY": -0.2 }
+    ] },
+    { "op": "export", "path": "out/result_a.png" }
+  ]
+}
+```
+
+**CLI 定位**：
+- 是 SDK C API 的第一个宿主（host-only，不参与 Android 构建）。
+- 批处理脚本描述整段会话（建画布 → 选笔刷 → 画笔迹 → 清空 → 撤销 → 导出），一次执行产出 PNG。
+- AI 用同一脚本换 seed / 换笔刷 / 换渲染后端，产出多图自行对比；确定性保证同脚本同 seed 像素级一致。
+- **对比模式不在 CLI 范围内**，像素对比交给 AI 侧工具（外部 diff）。
+
+---
+
 ### 4.1 整体架构（路线 E 主线）
 
 ```
@@ -496,11 +738,13 @@ Vulkan 1.1 baseline（minSdk 30 覆盖）
 资源：
   Canvas storage image   : VK_IMAGE_USAGE_STORAGE_BIT | SAMPLED_BIT | TRANSFER_DST_BIT
                            布局常驻 VK_IMAGE_LAYOUT_GENERAL
+                           v3.0 离屏模式追加 TRANSFER_SRC_BIT（readback 读回）
   Stamp 纹理池           : TRANSFER_DST | SAMPLED，host staging buffer 上传
   Staging buffer 池      : HOST_VISIBLE | HOST_COHERENT，环形复用
   Descriptor sets        : compute 用（canvas + stamp + sampler）
   Command buffers        : 每帧重录 compute + graphics
   同步                   : semaphore（acquire→compute→draw→present）+ fence
+  离屏（v3.0，§4.0.5）：无 swapchain，无 present，export 前 fence 等待 + readback
 ```
 
 ### 4.5 Compute Shader 合成（`brush_composite.comp`）
@@ -621,13 +865,14 @@ void main() {
 - 交付：结论文档（预测点来源：自研外推 vs MotionEvent 历史）+ **host oracle 对照测试框架**（libmypaint host 版 dump dab 参数序列，与自研 C++ 内核 diff）
 - **验收**：两篇结论各自成立；单 dab / 单段 / 整条 stroke 三级对照测试 diff ≤ 1e-5 全绿（`ctest`）
 
-### 阶段 1 · 接口层 + 多平台骨架（全平台地基）
+### 阶段 1 · 接口层 + SDK C API + 多平台骨架（全平台地基）
 
-**目标**：先立三根插拔桩 + 路线切换 CMake 结构，让内核 / 渲染 / 平台三线可以并行。
+**目标**：先立三根插拔桩 + **v3.0 SDK C API 边界** + 路线切换 CMake 结构，让内核 / 渲染 / 平台 / CLI 四线可以并行。
 
 - 定义三个插拔接口 + 共享类型
-- CMake 多 toolchain 骨架 + 多路线选项（`DGCPAIN_KERNEL_*` + `DGCPAIN_RENDER_*`）
-- **验收**：`host-windows` / `host-linux` / `android-arm64` 三 preset 通过；PC 可执行 + Android `.so` 都能编出空壳
+- **v3.0：`sdk_api/` C API 层**（生命周期 / 画布 / 输入 / 笔刷 / 参数 / 渲染 / 离屏 / 确定性 / 导出，§4.0.2）——提前到第一版，UI 与 CLI 统一走 C API
+- CMake 多 toolchain 骨架 + 多路线选项（`DGCPAIN_KERNEL_*` + `DGCPAIN_RENDER_*`）+ `DGCPAIN_BUILD_SDK/CLI`
+- **验收**：`host-windows` / `host-linux` / `android-arm64` 三 preset 通过；PC 可执行 + Android `.so` 都能编出空壳；C API 层单测（`test_c_api`）通过
 
 ### 阶段 2 · 渲染后端（Vulkan，实现 `IRenderBackend`）
 
@@ -660,6 +905,20 @@ void main() {
 - AGI + RenderDoc + 高速摄影测 §3.3 全部指标
 - **验收**：满足 §3.3 指标，产出性能报告 + 技术路线结论
 
+### 阶段 7 · 可编程外壳（v3.0：CLI + 离屏 + 确定性 + 图像输出）
+
+**目标**：让 AI 能通过命令行完成界面上的所有操作，并输出图片对比结果。
+
+- **离屏渲染**：`IRenderBackend` 增加 `initOffscreen` / `readback` / `exportPNG`（Vulkan headless，§4.0.5）
+- **确定性**：`core/determinism.h` + `dgcSetRandomSeed` / `dgcSetFixedTime`（§4.0.3）
+- **CLI 宿主**：`cli/dgc_cli` JSON 批处理脚本解释器，覆盖 §4.0.4 全操作映射（**不含对比模式**）
+- PNG 编码：`stb_image_write`（header-only）
+- **验收**：
+  - `dgc_cli run script.json` 产出 PNG，与窗口渲染结果一致（`test_offscreen`）
+  - 同脚本同 seed 两次运行 PNG 像素级一致，逐字节 diff = 0（`test_determinism`）
+  - §4.0.4 映射表中每个 UI 操作都有 CLI 命令且输出可对比（`test_cli`）
+  - 全操作闭环：`dgc_cli` 可从无到有完成建画布 → 选笔刷 → 调参 → 选色 → 画笔迹 → 撤销 → 导出
+
 ### 里程碑
 
 | 里程碑 | 触发 | 交付 |
@@ -667,6 +926,7 @@ void main() {
 | M1 | 阶段 4 末 | 双平台 Vulkan 画布上屏（PC + Android） |
 | M2 | 阶段 3 末 | 笔刷内核经 compute 合成可画（offscreen 验证） |
 | M3 | 阶段 6 末 | 全链路 + 性能报告 |
+| M4 | 阶段 7 末 | **CLI 全操作闭环，AI 图像对比通道可用**（离屏 PNG + 确定性可复现） |
 
 ---
 
@@ -681,6 +941,9 @@ void main() {
 | Compute 在低端 Mali GPU 性能不足 | 中 | 包围盒 dispatch + tile 化；baseline 先锁 Adreno |
 | 预测点与真实点合成冲突产生拖影 | 中 | 预测 stamp 标记 isPredicted，真实点重合成覆盖 |
 | Compose 输入事件有额外延迟 | 中 | Ink 用 `PointerEventPass.Initial`；必要时绕过 Compose 直连 MotionEvent |
+| v3.0：GPU 离屏 readback 在不同 GPU 上浮点不一致 | 低 | 确定性限同后端同驱动；跨 GPU 对比按需设 ±1 LSB 容差（§4.0.3） |
+| v3.0：headless Vulkan 在无 GPU/驱动环境不可用 | 中 | 离屏链路必须可降级到窗口模式调试；CI 冒烟用 GPU 直通模拟器 |
+| v3.0：确定性被非确定性来源（多线程/未注入 RNG）破坏 | 低 | CLI 走同步单线程路径；单测 golden PNG 逐字节 diff 兜底（§4.0.3） |
 
 ---
 
@@ -707,5 +970,6 @@ void main() {
 - `docs/调研/路线整理.md` —— 路线分组、中间层复用、§7 C API / SDK 化
 - `docs/调研/技术路线评审汇总.md` —— 5 路线评审结论
 - `docs/调研/路线E-白盒移植libmypaint-技术方案.md` —— 路线 E 详细技术方案
+- [stb_image_write（PNG 编码，header-only，MIT）](https://github.com/nothings/stb) —— v3.0 离屏导出
 - `docs/调研/笔刷渲染技术路线评审.md` —— 评审框架与评分依据
 - `docs/调研/绘画内核功能清单.md` —— 功能优先级
