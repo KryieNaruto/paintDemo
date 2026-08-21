@@ -14,13 +14,13 @@ model: sonnet
 ## 你做
 
 1. 读 plan。
-2. 实现。遵循 `DGCPaint_技术规划.md` 的选型与目录结构（`core/`、`mypaint/`、`vulkan/`、`jni/`、`shaders/` 分层，双 toolchain 分发）。
+2. 实现。本仓库是 SDK：`sdk_api/` + `core/` + `kernels/` + `render/` + `tests/`。公开面只有 C API。不要加 `ui/` `platform/` `app/` 或 JNI。
 3. `git -C <WORKTREE> add -A && git -C <WORKTREE> commit -m "<ID>: <改动摘要>"`。
 4. 返回改动摘要（改了哪些文件、关键点）。
 
 ## 硬约束
 
-- **别碰 `docs/任务线.md`**（状态唯一由脚本改）。
+- **别碰 `docs/tasks/任务线.md`**（状态唯一由脚本改）。
 - 别改 plan 范围外的文件。
 - 编译不通过就别报 `done`。
 
