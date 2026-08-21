@@ -1,146 +1,129 @@
-# DGCamp Paint 原型
+# DGCamp Paint SDK（paintDemo）
 
-技术验证型原型：验证 **libmypaint 笔刷算法（白盒移植自研 C++） + Jetpack Ink 低延迟输入 + Vulkan Compute Shader GPU 合成** 三者组合能否达到 Procreate 级别的绘画手感。目标平台 **Android 平板 + PC**。
+本仓库是绘画内核 **SDK 基座**：产出 `libdgc_paint`（`.so` / `.a` / `.dll` / `.dylib`）和唯一公开头 `sdk_api/dgc_paint_c_api.h`。
 
-## 技术全景
+**不含 UI 消费者。** Android Compose、PC ImGui/GLFW、JNI 分别在独立仓库，通过 git submodule 引用本库（路径固定 `sdk/`）。拓扑见 [`docs/git/README.md`](docs/git/README.md)。
 
-```
-┌───────────────────────────────────────────────────────────────┐
-│  UI 层（插拔）：Compose(Kotlin) / ImGui(C++)                   │
-├───────────────────────────────────────────────────────────────┤
-│  引擎核心（3 线程）：Input → Brush(自研CPU) → Render(Vulkan)    │
-├──────────────────┬────────────────────────────────────────────┤
-│  绘画内核（插拔）  │  渲染后端（插拔）                            │
-│  kernels/brush/  │  render/vulkan/                             │
-│  （自研 C++）     │  （Vulkan Compute）                         │
-├──────────────────┴────────────────────────────────────────────┤
-│  平台层（插拔）：Android(ANativeWindow) / PC(GLFW)              │
-└───────────────────────────────────────────────────────────────┘
-```
-
-**5 条技术路线评审结论**：主线走 **路线 E**（白盒移植 libmypaint → 自研 C++ 笔刷内核 + Vulkan Compute），终局演进到路线 B（全 GPU 内核）。详见 `docs/调研/路线整理.md`。
+技术验证目标：libmypaint 算法（白盒移植）+ 低延迟输入（由消费者送入 C API）+ Vulkan Compute 合成，能否达到 Procreate 级手感。主线 **路线 E**，终局 **路线 B**。详见 [`docs/调研/路线整理.md`](docs/调研/路线整理.md)（含 §7 C API）。
 
 | 路线 | 加权分 | 定位 |
 |------|--------|------|
-| **E 白盒移植+Vulkan** | **4.18** | **主线起点（当前开发）** |
+| **E 白盒移植+Vulkan** | **4.18** | **SDK 内部默认实现（后续任务）** |
 | B 自研GPU+Vulkan | 4.03 | 终局形态 |
 | C libmypaint+Skia | 3.65 | 快速验证垫脚石 |
 | D 自研+bgfx | 3.55 | iOS 扩展储备 |
 | A 链接libmypaint | 3.33 | 对照基准/兜底 |
 
+换路线 = 换 SDK **内部** `kernels/` / `render/`；**C API 不变**，消费者代码零改动。
+
 ## 文档索引
 
 | 文档 | 说明 |
 |------|------|
-| [DGCPaint_技术规划.md](DGCPaint_技术规划.md) | 主技术规划（v2.0 · 架构 + 路线 + 任务线） |
-| [docs/任务线.md](docs/任务线.md) | 任务状态与进度（SOT） |
-| [docs/调研/路线整理.md](docs/调研/路线整理.md) | 路线 A–E 分组与中间层复用分析 |
+| [DGCPaint_技术规划.md](DGCPaint_技术规划.md) | 主技术规划（架构 + 路线） |
+| [docs/tasks/任务线.md](docs/tasks/任务线.md) | 任务状态 SOT（脚本申领） |
+| [docs/tasks/detail/开发与测试环境.md](docs/tasks/detail/开发与测试环境.md) | SDK 工具链任务书 |
+| [docs/tasks/detail/共同基座.md](docs/tasks/detail/共同基座.md) | C API + 内部 core 任务书 |
+| [docs/git/README.md](docs/git/README.md) | 消费者 submodule 约定 |
+| [docs/调研/路线整理.md](docs/调研/路线整理.md) | 路线分组 + §7 SDK/C API |
 | [docs/调研/技术路线评审汇总.md](docs/调研/技术路线评审汇总.md) | 5 路线评审结论 |
 | [docs/调研/路线E-白盒移植libmypaint-技术方案.md](docs/调研/路线E-白盒移植libmypaint-技术方案.md) | 路线 E 详细技术方案 |
-| [docs/调研/绘画内核功能清单.md](docs/调研/绘画内核功能清单.md) | 功能优先级（对标 CSP/Procreate） |
 | `.claude/skills/paint-dev/SKILL.md` | 5 阶段开发流水线编排 |
+
+## 消费者如何引用
+
+```bash
+# 先自行创建 KryieNaruto/paint-android 或 paint-pc 空库，再：
+git clone git@github.com:KryieNaruto/paint-android.git
+cd paint-android
+/path/to/paintDemo/scripts/bootstrap-consumer.sh
+# 钉 tag 后提交 .gitmodules
+```
+
+CMake：`add_subdirectory(sdk)`，链接 `dgc_paint`，只 `#include "dgc_paint_c_api.h"`。模板：[docs/git/templates/](docs/git/templates/)。
+
+待建远端：`paint-android`、`paint-pc`（本环境不能代建 GitHub 仓库）。
 
 ---
 
-## 换设备快速搭建开发环境
+## 换设备搭建 SDK 开发环境
 
-> 目标：在新机器上从 clone 到能开工，**30 分钟内**完成。
+> 目标：clone 本仓库后能编 `libdgc_paint` 并跑 host ctest。GLFW / Compose / JDK **不是** SDK 必需（属于消费者）。
 
-### 1. Clone 仓库
+### 1. Clone
 
 ```bash
 git clone git@github.com:KryieNaruto/paintDemo.git
 cd paintDemo
 ```
 
-> 需要将新设备的 SSH 公钥（`~/.ssh/id_ed25519.pub`）添加到 GitHub 账号 [Settings → SSH and GPG keys](https://github.com/settings/keys)。
+将本机 SSH 公钥加到 GitHub [Settings → SSH and GPG keys](https://github.com/settings/keys)。
 
-### 2. 配置 Git 身份
+### 2. Git 身份
 
 ```bash
 git config user.name  "<你的名字>"
 git config user.email "<你的邮箱>"
 ```
 
-### 3. 验证任务线系统
-
-任务线系统自包含在仓库中，随 clone 一起到达：
+### 3. 验证任务线
 
 ```bash
 python3 .exec/taskline.py status
 ```
 
-应显示 22 条任务，首波可领任务（T0-1、T0-2、T1-1 等）。
+应显示 **14** 条任务。首波可领：`E0-1`、`E0-2`、`E0-3`、`E0-4`、`G0-1`。
 
-### 4. 安装开发工具
+### 4. 安装 SDK 工具链
 
-#### 4.1 Android Studio（主 IDE，产出 .so + APK）
-
-| 组件 | 版本要求 | 说明 |
-|------|---------|------|
-| Android Studio | Ladybug (2024.3) 及以上 | 最新稳定版 |
-| Android SDK | compileSdk 35+ | SDK Manager 安装 |
-| Android NDK | r27+（建议 r28） | SDK Manager 安装 |
-| CMake | 3.22+（NDK 内置） | SDK Manager 安装 |
-| JDK | 21 | Android Studio 自带或单独安装 |
-
-**SDK Manager 必需组件**：
-- `platform-tools`、`platforms;android-35`
-- `ndk;28.x`、`cmake;3.31.x`
-- `build-tools;35.x`
-
-**环境变量**（建议写入 `~/.bashrc` 或 `~/.zshrc`）：
-```bash
-export ANDROID_HOME=$HOME/Android/Sdk
-export ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.x.x
-export PATH=$ANDROID_HOME/platform-tools:$PATH
-```
-
-#### 4.2 VS2022+（Windows 可选，host 快速验证 C++）
-
-用于秒级编译 C++ 核心、跑单元测试，**不产出 Android .so**。
-
-- 工作负载：「使用 C++ 的桌面开发」（MSVC + CMake 集成）
-- 单个组件：「C++ CMake tools for Windows」
-- 额外：[LunarG Vulkan SDK](https://vulkan.lunarg.com/)（提供 `vulkan-1.lib`、`glslc`）
-
-#### 4.3 Linux 开发机（host 快速验证）
+#### 4.1 Linux host
 
 ```bash
-# Debian/Ubuntu
-sudo apt install build-essential cmake ninja-build libglfw3-dev libvulkan-dev
-
-# 如需对照测试 oracle（host 版 libmypaint）
-sudo apt install libglib2.0-dev libjson-c-dev
+sudo apt install build-essential cmake ninja-build libvulkan-dev
 ```
 
-#### 4.4 物理测试平板
+不要把 `libglfw3-dev` 当作本仓库必需。探测脚本见任务 E0-1（`scripts/check-env.sh`）。
 
-| 推荐 | 说明 |
+#### 4.2 命令行 NDK（编 Android `.so`）
+
+| 组件 | 版本 |
 |------|------|
-| Galaxy Tab S9+ / S10+ | S Pen 原生压力+tilt，Vulkan 1.3，≥120Hz |
-| 小米平板 6 Pro / 7 Pro | 性价比高，Vulkan 1.1+ |
+| Android NDK | r27+（建议 r28） |
+| CMake | 3.22+ |
+| ANDROID_NDK_HOME | 指向 NDK 根目录 |
 
-**必备配置**：
-- 开发者模式 + USB 调试（或 `adb pair` 无线调试）
-- 关闭系统省电模式的 GPU 降频
-- 固定横屏，关闭多窗口
-
-### 5. 验证构建
+Android Studio / Gradle / Compose / JDK 21 属于 **paint-android** 消费者。
 
 ```bash
-# Host Linux 构建（路线 E）
+export ANDROID_NDK_HOME=/path/to/ndk
+```
+
+#### 4.3 Windows（编 `dgc_paint.dll`，【人工】）
+
+- VS：C++ 桌面开发 + CMake tools + Ninja
+- [LunarG Vulkan SDK](https://vulkan.lunarg.com/)
+
+#### 4.4 真机 / 性能测试
+
+平板与 AGI/RenderDoc 用于**消费者联调**，不阻塞 SDK host 构建。清单见任务 E0-5 / E0-6。
+
+### 5. 验证构建（基座 CMake 落地后）
+
+```bash
 cmake --preset host-linux
 cmake --build --preset host-linux
+ctest --test-dir build/host-linux --output-on-failure
 
-# Android 构建
+# NDK 已配置时
 cmake --preset android-arm64
 cmake --build --preset android-arm64
 ```
 
+当前任务线尚未实现 B1-2 时，上述 preset 还不存在。
+
 ### 6. 开工
 
-任意终端输入 **「开工 / 领任务」** 或 **`/paint-dev`**，进入 5 阶段流水线：
+任意终端输入 **「开工 / 领任务」** 或 **`/paint-dev`**：
 
 ```
 申领 → 计划 → 执行 → 测试 → 收尾 + 评审
@@ -148,48 +131,34 @@ cmake --build --preset android-arm64
 
 ---
 
-## 目录结构
+## 目录结构（本仓库）
 
 | 路径 | 说明 |
 |------|------|
-| `core/` | 平台无关核心（接口 + engine + ring buffer + 预测） |
-| `kernels/brush/` | 路线 E：自研 C++ 笔刷内核 |
-| `kernels/mypaint/` | 路线 A：链接 libmypaint（对照测试用） |
-| `render/vulkan/` | 路线 A/E/B：Vulkan Compute 渲染后端 |
-| `render/skia/` | 路线 C：Skia 渲染后端（备选） |
-| `render/bgfx/` | 路线 D：bgfx 渲染后端（储备） |
-| `platform/android/` | Android 平台层（ANativeWindow + JNI） |
-| `platform/pc/` | PC 平台层（GLFW 窗口） |
-| `ui/android/` | Compose UI（Kotlin） |
-| `ui/pc/` | ImGui UI（C++） |
-| `shaders/` | GLSL compute shader 源码 |
-| `app/` | Android 工程（build.gradle.kts + Activity） |
-| `tests/` | CTest host 单元测试 |
-| `docs/` | 技术规划 + 调研 + 任务线 |
-| `.claude/` | Claude Code 编排（skills + agents） |
-| `.exec/taskline.py` | 任务线查询/认领/收尾脚本 |
+| `sdk_api/` | 唯一对外 C ABI（`dgc_paint_c_api.h`） |
+| `core/` | 内部：类型、插拔接口、engine、ring buffer、predictor |
+| `kernels/` | L5 内部插拔（占位；默认 Null） |
+| `render/` | L4 内部插拔（占位；默认 Null） |
+| `shaders/` | 后续 Vulkan/bgfx shader |
+| `tests/` | host ctest（C API / engine，headless） |
+| `docs/tasks/` | 任务线 SOT + 任务书 |
+| `docs/git/` | 消费者 submodule 约定与模板 |
+| `docs/调研/` | 路线与评审 |
+| `scripts/` | `check-env.sh`、`bootstrap-consumer.sh` |
+| `.exec/taskline.py` | 任务申领脚本 |
 
----
+**不在本仓库**：`ui/`、`platform/`、`app/`。
 
-## 路线切换
-
-通过 CMake 选项切换不同路线组合：
+## 路线切换（SDK 内部）
 
 ```cmake
-# 绘画内核（L5）
-DGCPAIN_KERNEL_BRUSH=ON   # 路线 E：自研 C++ 内核（主线，默认）
-DGCPAIN_KERNEL_MYPAINT=ON # 路线 A：链接 libmypaint
-DGCPAIN_KERNEL_GPU=ON     # 路线 B：GPU compute 内核
-
-# 渲染后端（L4）
-DGCPAIN_RENDER_VULKAN=ON  # 路线 A/E/B：Vulkan Compute（默认）
-DGCPAIN_RENDER_SKIA=ON    # 路线 C：Skia GLES3
-DGCPAIN_RENDER_BGFX=ON    # 路线 D：bgfx 跨 API
+DGCPAIN_KERNEL_BRUSH=ON    # 路线 E（默认）
+DGCPAIN_KERNEL_MYPAINT=ON  # 路线 A
+DGCPAIN_KERNEL_GPU=ON      # 路线 B
+DGCPAIN_RENDER_VULKAN=ON   # A/E/B
+DGCPAIN_RENDER_SKIA=ON     # C
+DGCPAIN_RENDER_BGFX=ON     # D
 ```
-
-路线切换**只换对应目录**，其余层（core/engine/输入/平台/UI）完全不动。
-
----
 
 ## 性能指标（目标）
 
@@ -201,7 +170,7 @@ DGCPAIN_RENDER_BGFX=ON    # 路线 D：bgfx 跨 API
 | Stamp 上传耗时 | < 1ms | CPU 打点 |
 | 自研内核单 stamp | < 3ms | CPU 打点 |
 
----
+端到端延迟在消费者 + SDK 联调时测；SDK 内先打 compute/stamp 点。
 
 ## 许可
 
