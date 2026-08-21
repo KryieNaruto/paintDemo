@@ -4,9 +4,9 @@
 
 **范围**：编译本仓库 `libdgc_paint` SDK 所需的 **host** 工具。不含 UI 消费者。
 
-本文件只定义「探测什么、退出码是什么」。安装步骤分别见后续任务：
+本文件只定义「探测什么、退出码是什么」。安装步骤：
 
-- Linux apt 包 → **E0-2**（将写 `docs/env/linux-host.md`）
+- Linux apt 包 → [`docs/env/linux-host.md`](linux-host.md)（E0-2）
 - 命令行 NDK → **E0-3**
 - Windows VS2026 + LunarG Vulkan SDK → **E0-4**
 
@@ -75,7 +75,7 @@ GLFW / JDK / Android Studio 属于 `paint-android` / `paint-pc` 消费者，见 
 
 ## 明确不做
 
-- 不 `sudo apt install …`（E0-2）
+- 不 `sudo apt install …`（安装步骤见 [`linux-host.md`](linux-host.md)）
 - 不创建仓库根 `CMakeLists.txt` / `CMakePresets.json`（B1-2）
 - 不创建 `ui/` `platform/` `app/`
 - 不把 GLFW / JDK / Android Studio / Compose / ImGui 列为 SDK 必需

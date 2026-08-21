@@ -1,0 +1,2 @@
+# Keep shell scripts LF so WSL / Linux bash can run them from a Windows worktree.
+*.sh text eol=lf
