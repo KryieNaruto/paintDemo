@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """DGCPaint 任务线查询 / 认领 / 收尾脚本。
 
-唯一真相源：docs/任务线.md 的任务表（状态与依赖）。状态只经本脚本修改，不要手改表格。
+唯一真相源：docs/tasks/任务线.md 的任务表（状态与依赖）。状态只经本脚本修改，不要手改表格。
 
 状态机：
   可申领 --claim--> 执行中 --finish(通过)--> 已完成
@@ -30,6 +30,7 @@ AUDITS = ("待审核", "已通过", "打回")
 DEFAULT_BRANCHES = ("main", "master")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TASKS_REL = os.path.join("docs", "tasks", "任务线.md")
 ROOT = None
 TASKS_MD = None
 LOCK_FILE = None
@@ -39,14 +40,14 @@ WORKTREE_DIR = None
 def find_root():
     d = os.path.abspath(SCRIPT_DIR)
     while True:
-        if os.path.isfile(os.path.join(d, "docs", "任务线.md")):
+        if os.path.isfile(os.path.join(d, TASKS_REL)):
             return d
         parent = os.path.dirname(d)
         if parent == d:
             break
         d = parent
     env = os.environ.get("DGCPAIN_ROOT")
-    if env and os.path.isfile(os.path.join(env, "docs", "任务线.md")):
+    if env and os.path.isfile(os.path.join(env, TASKS_REL)):
         return env
     return None
 
@@ -54,7 +55,7 @@ def find_root():
 def _init_paths():
     global ROOT, TASKS_MD, LOCK_FILE, WORKTREE_DIR
     ROOT = find_root() or os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
-    TASKS_MD = os.path.join(ROOT, "docs", "任务线.md")
+    TASKS_MD = os.path.join(ROOT, TASKS_REL)
     LOCK_FILE = os.path.join(ROOT, ".exec", ".taskline.lock")
     WORKTREE_DIR = os.path.join(ROOT, ".worktrees")
 
@@ -195,7 +196,7 @@ def lock():
 
 
 def commit_and_push(msg):
-    if not git_ok("add", "docs/任务线.md"):
+    if not git_ok("add", TASKS_REL):
         sys.exit("git add 失败")
     r = git("commit", "-m", msg)
     if r.returncode != 0:
@@ -230,7 +231,7 @@ def print_section(title, items):
 def cmd_status():
     tasks = read_tasks()
     if not tasks:
-        print("（docs/任务线.md 尚未就绪）")
+        print("（docs/tasks/任务线.md 尚未就绪）")
         return
     print(render_summary(tasks))
     print()

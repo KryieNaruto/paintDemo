@@ -9,13 +9,13 @@ model: sonnet
 
 ## 输入
 
-`TASK=<ID>` · `WORKTREE=<绝对路径>` · `BRANCH=<分支名>`。任务定义在项目根 `docs/任务线.md` 里你那一行；技术背景在 `DGCPaint_技术规划.md`（对应阶段的 4.x 节与「验收」）。
+`TASK=<ID>` · `WORKTREE=<绝对路径>` · `BRANCH=<分支名>`。任务定义在 `docs/tasks/任务线.md` 里你那一行；验收在 `docs/tasks/detail/` 对应任务书；技术背景在 `DGCPaint_技术规划.md` 与 `docs/调研/路线整理.md` §7。
 
 ## 你做
 
-1. 读 `docs/任务线.md` 你那一行 + `DGCPaint_技术规划.md` 相关章节（阶段对应的目录结构 / 技术路线 / 验收标准）。
-2. 在 worktree 里看现状：`git -C <WORKTREE> status` 与目录结构。
-3. 写计划到 `<WORKTREE>/docs/plans/<ID>.md`：目标 / **验收标准**（从规划该阶段的「验收」抄，不自己编）/ 改动文件清单 / 步骤 / 风险。
+1. 读 `docs/tasks/任务线.md` 你那一行 + `docs/tasks/detail/` 里该 ID 的章节（**验收标准从 detail 抄，不自己编**）+ 规划/路线整理相关节。
+2. 在 worktree 里看现状：`git -C <WORKTREE> status` 与目录结构。本仓库是 SDK，不要往 `ui/` `platform/` `app/` 加消费者代码。
+3. 写计划到 `<WORKTREE>/docs/plans/<ID>.md`：目标 / **验收标准** / 改动文件清单 / 步骤 / 风险。
 4. 返回 `PLAN=` 路径（plan 不提交，后续 execute 的 `git add -A` 会一并带上）。
 
 ## 回报格式
@@ -29,4 +29,4 @@ NOTE=<可选>
 
 ## 你不做
 
-不实现、不测试、不评审。验收标准必须来自规划文档，缺了就 `need-human`。
+不实现、不测试、不评审。验收标准必须来自 `docs/tasks/detail/`（可对照规划），缺了就 `need-human`。

@@ -1,6 +1,6 @@
 ---
 name: paint-dev
-description: Use when the user asks to claim and drive DGCPaint prototype tasks from docs/任务线.md — e.g. "开工"、"推进任务"、"领任务"、"跑流水线" — or to run the multi-terminal task pipeline that works each task in its own isolated workspace and syncs results back.
+description: Use when the user asks to claim and drive DGCPaint SDK tasks from docs/tasks/任务线.md — e.g. "开工"、"推进任务"、"领任务"、"跑流水线" — or to run the multi-terminal task pipeline that works each task in its own isolated workspace and syncs results back.
 ---
 
 你是**主会话**（驱动者）。你只做三件事：算谁能领、派 5 阶段 agent、收结果。写 plan、写实现、写测试、评审 —— 全在各阶段 agent 里，不在你这儿。
@@ -20,8 +20,8 @@ description: Use when the user asks to claim and drive DGCPaint prototype tasks 
 
 ## 硬规则
 
-- **别转述任务是什么**：把任务 ID 和 `docs/任务线.md` 里那一行原样交给 agent，让它自己读。你要给的是它够不到的东西：`WORKTREE=`/`BRANCH=` 的路径、上一步返回值。
-- **别碰 `docs/任务线.md` 的状态**：状态唯一由 `.exec/taskline.py` 改。你自己也不手改。
+- **别转述任务是什么**：把任务 ID 和 `docs/tasks/任务线.md` 里那一行原样交给 agent，让它自己读。你要给的是它够不到的东西：`WORKTREE=`/`BRANCH=` 的路径、上一步返回值。
+- **别碰 `docs/tasks/任务线.md` 的状态**：状态唯一由 `.exec/taskline.py` 改。你自己也不手改。验收标准从 `docs/tasks/detail/` 对应任务书抄，不自编。
 - **等待不轮询**：派 agent 一律**前台阻塞**（不要 `run_in_background`）；要并行就同一条消息发多个 `Agent()` 调用。有未终态 agent 就保持等待，不要 `sleep` 轮询。
 - **`RESULT=need-human` / `stuck` 停下报给人**：撞到「≥2 个站得住脚的选项」或「无技术路径」时，停下把问题与选项报给人，不自己挑一个继续。
 

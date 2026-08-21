@@ -2,6 +2,7 @@
 
 > **版本说明**：v2.0 基于 5 路线评审结论重写。保留 v1.0 的开发环境与测试环境搭建，任务线全部基于路线 A–E 分类重新规划。
 > **日期**：2026-08-20
+> **任务与仓库边界（2026-08-21）**：本 Git 仓库是 SDK 基座（C API + `core/`/`kernels/`/`render/`），不含 UI 消费者。任务 SOT → [`docs/tasks/任务线.md`](docs/tasks/任务线.md)；详情 → [`docs/tasks/detail/`](docs/tasks/detail/)；消费者 submodule → [`docs/git/README.md`](docs/git/README.md)；C API 分析 → [`docs/调研/路线整理.md`](docs/调研/路线整理.md) §7。
 
 ---
 
@@ -701,7 +702,9 @@ void main() {
 - [mypaint_ffi（libmypaint Android 移植参考实现）](https://pub.dev/packages/mypaint_ffi)
 - [MyPaint 社区：How to make it for Android](https://community.mypaint.app/t/how-to-make-it-for-android/3965)
 - [LunarG Vulkan SDK](https://vulkan.lunarg.com/)
-- `docs/调研/路线整理.md` —— 路线分组与中间层复用分析
+- `docs/tasks/任务线.md` —— SDK 任务状态（脚本申领）
+- `docs/git/README.md` —— 消费者以 submodule 引用本 SDK
+- `docs/调研/路线整理.md` —— 路线分组、中间层复用、§7 C API / SDK 化
 - `docs/调研/技术路线评审汇总.md` —— 5 路线评审结论
 - `docs/调研/路线E-白盒移植libmypaint-技术方案.md` —— 路线 E 详细技术方案
 - `docs/调研/笔刷渲染技术路线评审.md` —— 评审框架与评分依据
