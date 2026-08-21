@@ -100,8 +100,8 @@ export ANDROID_NDK_HOME=/path/to/ndk
 
 #### 4.3 Windows（编 `dgc_paint.dll`，【人工】）
 
-- VS：C++ 桌面开发 + CMake tools + Ninja
-- [LunarG Vulkan SDK](https://vulkan.lunarg.com/)
+- **VS2026**：工作负载「使用 C++ 的桌面开发」+「C++ CMake tools for Windows」+ Ninja
+- [LunarG Vulkan SDK](https://vulkan.lunarg.com/)（`vulkan-1.lib`、`glslc`）
 
 #### 4.4 真机 / 性能测试
 
