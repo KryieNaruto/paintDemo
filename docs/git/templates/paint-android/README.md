@@ -20,6 +20,7 @@ cd paint-android
 2. Jetpack Ink → `dgcStrokeTo(..., isPredicted)`
 3. 每帧 `dgcRender()`
 4. **JNI 写在本仓库**，不要改 SDK
+5. 只 `#include "dgc_paint_c_api.h"`，禁止 include `sdk/core/` 或 C++ 虚接口
 
 ## CMake
 
