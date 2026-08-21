@@ -12,12 +12,17 @@ DGCamp Paint 工具的完整需求中，绘画功能是核心。本阶段剔除�
 
 | 层 | 选型 | 备注 |
 |---|---|---|
-| UI | Jetpack Compose | 平板优先，横向布局 |
-| 输入 | Jetpack Ink（`androidx.ink` 1.0.0 stable） | 低延迟输入/预测，底层 graphics-core |
-| 笔刷引擎 | libmypaint（C，CPU 端） | 生成笔刷印章（stamp/dab） |
-| 渲染 | **Vulkan 原生**（替代 bgfx） | 直接控制 swapchain/compute，最低延迟 |
+| 平台 | **Android 平板 + PC（双平台）** | 平台无关核心 + 平台层插拔 |
+| UI（Android Pad） | Jetpack Compose | 平板优先，横向布局 |
+| UI（PC） | **ImGui**（GLFW 窗口） | 轻量，直接贴 Vulkan 渲染结果 |
+| 输入（Android） | Jetpack Ink（`androidx.ink` 1.0.0 stable） | 低延迟输入/预测，底层 graphics-core |
+| 输入（PC） | GLFW 鼠标 / 数位笔 | 走同一输入点流 |
+| 笔刷引擎 | libmypaint（C，CPU 端） | 实现 `IPaintKernel`，**可插拔** |
+| 渲染 | **Vulkan 原生** | 实现 `IRenderBackend`，**可插拔** |
 | 笔刷合成 | Vulkan Compute Shader | 参考 Procreate（Metal Compute） |
-| C++ 编译 | CMake（双 toolchain） | Android Studio 编 .so；VS2026 host 快速验证 |
+| C++ 编译 | CMake（多 toolchain） | Android 编 .so；PC 编可执行；host 跑单测 |
+
+> **可扩展性设计原则（详见 §4.0）**：三个插拔点——`IPaintKernel`（绘画内核）、`IRenderBackend`（渲染后端）、`IPlatform`（平台/UI）。换技术路线 = 换某个接口的底层实现，引擎核心与其余层不动。
 
 ### 非目标（本原型明确不做）
 
@@ -69,66 +74,76 @@ VS2026 走 **host toolchain** 编译 C++ 核心（不含 JNI/swapchain），用�
 
 ### 2.1 设计原则
 
-1. **一份 CMakeLists，双 toolchain 分发**：通过 `CMAKE_SYSTEM_NAME STREQUAL "Android"` 区分 Android / host。
+1. **一份 CMakeLists，多 toolchain 分发**：通过 `CMAKE_SYSTEM_NAME STREQUAL "Android"` 区分 Android / host（host 再分 Windows / Linux）。
 2. **平台无关核心与平台层严格分离**：
-   - `core/`、`mypaint/`、`vulkan/compute/` 是平台无关的 → host 与 android 都编译。
-   - `jni/`、`vulkan/swapchain/` 只在 Android 编译 → host 跳过。
-3. **VS2026 打开根目录即得 host 配置**，Android 产物由 Gradle 调同一份顶层 CMake 产出。
+   - `core/`、`kernels/`、`render/`（compute 部分）是平台无关的 → host 与 android 都编译。
+   - `platform/android/`（JNI、swapchain、surface）只在 Android 编译；`platform/pc/`、`ui/pc/`（GLFW、ImGui）只在 host 编译。
+3. **三个插拔接口（§4.0）决定编译边界**：换内核 / 渲染 / 平台 = 换一个子目录的实现，不动接口与引擎核心。
+4. **VS2026 打开根目录即得 host 配置**，Android 产物由 Gradle 调同一份顶层 CMake 产出；PC 可执行由 host preset 直接产出。
 
-### 2.2 目录结构
+### 2.2 目录结构（分层·可插拔）
 
 ```
 DGCPaintPrototype/
-├── CMakeLists.txt                      # 顶层：双 toolchain 分发（见 2.3）
-├── CMakePresets.json                   # VS2026 / 命令行一键选配置（见 2.4）
-├── app/                                # Android 工程
+├── CMakeLists.txt                      # 顶层：多 toolchain 分发（见 2.3）
+├── CMakePresets.json                   # host-windows / host-linux / android-arm64（见 2.4）
+├── core/                               # ★ 平台无关核心 + 接口定义（双平台共享）
+│   ├── CMakeLists.txt
+│   ├── interfaces/                     # 三个插拔接口（见 §4.0）
+│   │   ├── i_paint_kernel.h            # 绘画内核接口
+│   │   ├── i_render_backend.h          # 渲染后端接口
+│   │   └── i_platform.h                # 平台抽象接口（surface/input/lifecycle）
+│   ├── types.h                         # StrokePoint / BrushParams / StampData
+│   ├── engine.h/.cpp                   # 引擎核心（3 线程模型，编排三接口）
+│   ├── stroke_predictor.h/.cpp         # 预测算法（host 可单测）
+│   └── ring_buffer.h                   # 线程间无锁队列
+├── kernels/                            # ★ 绘画内核（插拔·实现 IPaintKernel）
+│   ├── CMakeLists.txt
+│   └── mypaint/
+│       ├── mypaint_kernel.h/.cpp       # IPaintKernel 实现
+│       └── mypaint_surface.h/.cpp      # MyPaintSurface → StampData
+├── render/                             # ★ 渲染后端（插拔·实现 IRenderBackend）
+│   ├── CMakeLists.txt
+│   └── vulkan/
+│       ├── vk_backend.h/.cpp           # IRenderBackend 实现
+│       ├── vk_canvas.h/.cpp            # Canvas storage image 管理
+│       └── vk_composite.h/.cpp         # compute 合成管线
+├── platform/                           # ★ 平台层（插拔·实现 IPlatform）
+│   ├── CMakeLists.txt
+│   ├── android/                        # Android：ANativeWindow + MotionEvent + swapchain/present
+│   │   ├── android_platform.cpp
+│   │   └── jni_bridge.cpp              # JNI 入口
+│   └── pc/                             # PC：GLFW 窗口 + 鼠标/数位笔
+│       └── glfw_platform.cpp
+├── ui/                                 # ★ UI 壳（插拔·编译期选）
+│   ├── android/                        # Compose UI（Kotlin，见 app/）
+│   └── pc/                             # ImGui UI（C++）
+│       └── imgui_shell.cpp
+├── app/                                # Android 工程（Kotlin/Compose）
 │   ├── build.gradle.kts                # externalNativeBuild 指向 ../CMakeLists.txt
 │   └── src/main/
 │       ├── AndroidManifest.xml
-│       ├── cpp/                        # ★ C++ 源码（可被 VS2026 直接打开）
-│       │   ├── core/                   # 平台无关核心
-│       │   │   ├── CMakeLists.txt
-│       │   │   ├── brush_types.h       # StampData / BrushParams 结构
-│       │   │   ├── stroke_predictor.h/.cpp  # 预测算法（host 可单测）
-│       │   │   └── ring_buffer.h       # 线程间无锁队列
-│       │   ├── mypaint/                # libmypaint 封装
-│       │   │   ├── CMakeLists.txt
-│       │   │   ├── mypaint_surface.h/.cpp  # MyPaintSurface 自定义实现 → 产出 StampData
-│       │   │   └── brush_session.h/.cpp    # begin/stroke_to/end 会话封装
-│       │   ├── vulkan/                 # Vulkan 渲染 + 计算
-│       │   │   ├── CMakeLists.txt
-│       │   │   ├── vk_context.h/.cpp   # Instance/Device/Queue（平台无关部分）
-│       │   │   ├── vk_canvas.h/.cpp    # Canvas storage image 管理
-│       │   │   ├── vk_composite.h/.cpp # compute 合成管线
-│       │   │   ├── vk_swapchain.h/.cpp # ★ 仅 Android 编译
-│       │   │   └── vk_surface_android.cpp  # ★ 仅 Android 编译（ANativeWindow）
-│       │   ├── jni/                    # ★ 仅 Android 编译
-│       │   │   ├── CMakeLists.txt
-│       │   │   └── jni_bridge.cpp      # JNI 入口
-│       │   └── shaders/                # GLSL → SPIR-V
-│       │       ├── brush_composite.comp
-│       │       ├── clear_canvas.comp
-│       │       └── present.vert / present.frag
+│       ├── cpp/                        # → 顶层 core/kernels/render/platform 的 CMake 入口
 │       ├── java/com/dgcamp/paint/
 │       │   ├── MainActivity.kt
 │       │   ├── ui/                     # Compose：CanvasView / BrushPanel / ColorPicker
-│       │   ├── engine/                 # CanvasEngine / RenderThread / NativeBridge
 │       │   └── input/InkHandler.kt     # Jetpack Ink 集成
 │       └── res/
+├── shaders/                            # GLSL → SPIR-V
+│   ├── brush_composite.comp
+│   ├── clear_canvas.comp
+│   └── present.vert / present.frag
 ├── third_party/
-│   ├── libmypaint/
-│   │   ├── arm64-v8a/libmypaint.a     # 交叉编译产物
-│   │   ├── x86_64/libmypaint.a        # host 产物（或模拟器）
-│   │   └── include/                   # libmypaint.h + mypaint-config.h
+│   ├── libmypaint/                     # arm64-v8a / x86_64 静态库 + include
 │   └── json-c/  mypaint-brushes/
 ├── tools/
-│   ├── build_mypaint_android.sh       # 交叉编译 libmypaint（见 2.7）
+│   ├── build_mypaint_android.sh        # 交叉编译 libmypaint（见 2.7）
 │   └── build_mypaint_host.sh
-├── tests/
-│   ├── CMakeLists.txt                 # CTest host 单测
+├── tests/                              # CTest host 单测（接口 + 预测 + math）
+│   ├── CMakeLists.txt
 │   └── test_predictor.cpp
 └── docs/
-    └── 技术规划.md                    # ★ 本计划留痕
+    └── 技术规划.md                     # ★ 本计划留痕
 ```
 
 ### 2.3 顶层 CMakeLists.txt（核心分发逻辑）
@@ -145,23 +160,32 @@ else()
 endif()
 
 # host 编译平台无关核心；android 编译全部
-option(DGCPAIN_BUILD_JNI   "Build JNI bridge (Android only)" ${DGCPAIN_ANDROID})
-option(DGCPAIN_BUILD_TESTS "Build host unit tests"           ON)
-option(DGCPAIN_USE_VULKAN  "Enable Vulkan renderer"          ON)
+option(DGCPAIN_BUILD_JNI    "Build JNI bridge (Android only)"  ${DGCPAIN_ANDROID})
+option(DGCPAIN_BUILD_TESTS  "Build host unit tests"            ON)
+option(DGCPAIN_USE_VULKAN   "Enable Vulkan renderer"           ON)
+option(DGCPAIN_BUILD_PC_APP "Build PC executable (GLFW+ImGui)" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 目标产物：平台无关核心静态库（host/android 都产）
-add_subdirectory(app/src/main/cpp/core)
-add_subdirectory(app/src/main/cpp/mypaint)
+# 平台无关：接口 + 引擎核心（host/android 都产）
+add_subdirectory(core)
+
+# 插拔实现：绘画内核 / 渲染后端（平台无关，host/android 都产）
+add_subdirectory(kernels/mypaint)
 if(DGCPAIN_USE_VULKAN)
-    add_subdirectory(app/src/main/cpp/vulkan)
+    add_subdirectory(render/vulkan)
 endif()
 
-# Android 专属：JNI 层 → 编成 libdgc_paint.so
+# Android 专属：平台层 + JNI → libdgc_paint.so
 if(DGCPAIN_BUILD_JNI)
-    add_subdirectory(app/src/main/cpp/jni)
+    add_subdirectory(platform/android)
+endif()
+
+# PC 专属：平台层 + ImGui UI → 可执行文件
+if(DGCPAIN_BUILD_PC_APP AND NOT DGCPAIN_ANDROID)
+    add_subdirectory(platform/pc)
+    add_subdirectory(ui/pc)
 endif()
 
 # host 专属：单元测试
@@ -309,6 +333,87 @@ libmypaint 依赖 **json-c**、**glib**（可裁剪）、**mypaint-brushes**（�
 ---
 
 ## 4. 技术路线详情
+
+### 4.0 分层架构与插拔接口（可扩展核心）
+
+高度可扩展的目标靠**三个插拔点**实现：换技术路线 = 换某个接口的底层实现，引擎核心与其余层不动。分层如下：
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│  UI 层（插拔·编译期选）                                        │
+│   Android Pad UI（Compose/Kotlin）    PC UI（ImGui/C++）       │
+└──────────────┬───────────────────────────────────────────────┘
+               │ 绑定稳定引擎 API（IEngine）
+┌──────────────▼───────────────────────────────────────────────┐
+│  engine（平台无关核心，双平台共享）                             │
+│   3 线程模型（Input → Brush → Render）+ ring buffer + 预测      │
+└──────┬───────────────────────────────┬───────────────────────┘
+       │ IPaintKernel 接口             │ IRenderBackend 接口
+┌──────▼──────────────┐   ┌────────────▼───────────────────────┐
+│ 绘画内核（插拔）      │   │ 渲染后端（插拔）                     │
+│ libmypaint / 自研 GPU│   │ Vulkan compute / bgfx / Metal       │
+└─────────────────────┘   └────────────────────────────────────┘
+                ▲                          ▲
+                └──── IPlatform 接口（surface/input/lifecycle）──┐
+                                                          ┌─────▼─────┐
+                                                          │ 平台层（插拔）│
+                                                          │ Android/PC │
+                                                          └───────────┘
+```
+
+三个接口定义在 `core/interfaces/`，共享类型在 `core/types.h`：
+
+```cpp
+// ── 共享类型 ────────────────────────────────
+struct StrokePoint { float x, y, pressure, tilt_x, tilt_y; uint64_t t_us; bool is_predicted; };
+struct BrushParams { float radius, hardness, opacity; /* 颜色/纹理按需扩 */ };
+struct StampData   { float x, y, radius, hardness, opacity; /* alpha 形状位图 */ };
+
+// ── IPaintKernel：绘画内核（笔迹输入 → StampData）──
+// 插拔点①：libmypaint / 自研 GPU 内核 各自实现
+class IPaintKernel {
+public:
+    virtual ~IPaintKernel() = default;
+    virtual BrushHandle createBrush(const BrushParams&) = 0;
+    virtual void beginStroke(BrushHandle, const StrokePoint&) = 0;
+    virtual std::vector<StampData> strokeTo(BrushHandle, const StrokePoint&) = 0;
+    virtual void endStroke(BrushHandle) = 0;
+};
+
+// ── IRenderBackend：渲染后端（StampData → 画布合成 → 上屏）──
+// 插拔点②：Vulkan compute / bgfx / Metal 各自实现
+class IRenderBackend {
+public:
+    virtual ~IRenderBackend() = default;
+    virtual void init(PlatformSurface, int w, int h) = 0;
+    virtual void resize(int w, int h) = 0;
+    virtual void beginFrame() = 0;
+    virtual void composite(const std::vector<StampData>&) = 0;
+    virtual void clearCanvas() = 0;
+    virtual void present() = 0;
+    virtual void shutdown() = 0;
+};
+
+// ── IPlatform：平台抽象（表面 / 输入 / 生命周期）──
+// 插拔点③：Android(TextureView+ANativeWindow+MotionEvent) / PC(GLFW+鼠标+数位笔)
+class IPlatform {
+public:
+    virtual ~IPlatform() = default;
+    virtual PlatformSurface createSurface() = 0;
+    virtual std::vector<StrokePoint> pollInput() = 0;
+    virtual void runLoop(std::function<void()> frame) = 0;
+};
+```
+
+**换路线的含义**：
+
+| 换什么 | 动哪 | 不动 |
+|---|---|---|
+| 换绘画内核（libmypaint → 自研 GPU 内核） | 新增一个 `IPaintKernel` 实现 | engine / 渲染后端 / UI |
+| 换渲染后端（Vulkan → bgfx/Metal） | 新增一个 `IRenderBackend` 实现 | engine / 内核 / UI |
+| 换平台/UI（Android ↔ PC） | 新增一个 `IPlatform` 实现 + 一个 UI 壳 | engine / 内核 / 渲染后端 |
+
+UI 本身也是编译期插拔：`ui/android/`（Compose）与 `ui/pc/`（ImGui）各自实现同一个「引擎控制 API」（设笔刷、设颜色、undo 等），互不影响。PC UI 用 ImGui 绘制控制面板，画布区域贴 Vulkan 渲染结果；Android UI 用 Compose 画 BrushPanel/ColorPicker，画布是 TextureView。
 
 ### 4.1 整体架构
 
@@ -468,54 +573,58 @@ MotionEvent → authoring 捕获（或直接构建 StrokeInputBatch）
 
 ### 阶段 0 · 技术风险 spike（最高优先，先做）
 
-**目标**：验证两大项——(a) Jetpack Ink 预测点获取方式（Ink 已确认模块化，strokes 纯数据层直接可用，只需确认预测点来源）；(b) libmypaint 交叉编译链。
+**目标**：验证两大项——(a) Jetpack Ink 预测点获取方式；(b) libmypaint 交叉编译链。不依赖接口层，可与阶段 1 并行。
 
-- 交付：一个最小 demo（用 strokes 模块拿输入点 + 临时 Ink 自带渲染对比）+ libmypaint 在 arm64 上编译通过并跑通 `stroke_to`。
-- 输出：技术结论文档，确定预测点来源（自研外推 vs MotionEvent 历史）。
+- 交付：结论文档（预测点来源：自研外推 vs MotionEvent 历史）+ libmypaint arm64 编译通过并跑通 `stroke_to`。
+- **验收**：两篇结论各自成立，输出到 `docs/`。
 
-### 阶段 1 · 脚手架 + Vulkan 渲染到 Compose Surface
+### 阶段 1 · 接口层 + 多平台骨架（全平台地基）
 
-- 建 Android 工程，配 Compose + NDK + CMake（顶层 + presets 先落地）。
-- TextureView 嵌入 Compose，创建 Vulkan instance/device/swapchain。
-- 全屏四边形渲染纯色/渐变，跑通渲染循环。
-- **验收**：设备上看到 Vulkan 渐变画布，60fps 稳定。
+**目标**：先立三根插拔桩，让内核 / 渲染 / 平台三线可以并行、互不阻塞。
 
-### 阶段 2 · libmypaint 集成
+- 定义三个插拔接口（`IPaintKernel` / `IRenderBackend` / `IPlatform`）+ 共享类型（`StrokePoint`/`BrushParams`/`StampData`）。
+- CMake 多 toolchain 骨架 + 分层目录（`core/` `kernels/` `render/` `platform/` `ui/`）。
+- **验收**：`host-windows` / `host-linux` / `android-arm64` 三 preset 配置通过；PC 可执行 + Android `.so` 都能编出空壳。
+
+### 阶段 2 · 渲染后端（Vulkan，实现 `IRenderBackend`）
+
+- `vk_backend` / `vk_canvas` / `vk_composite` + staging buffer 池（平台无关，host 可跑）。
+- shader 编译 + `brush_composite.comp` + 批量 dispatch + 包围盒优化。
+- **验收**：offscreen 用固定 stamp 合成出笔刷痕迹（不依赖内核与平台）。
+
+### 阶段 3 · 绘画内核（libmypaint，实现 `IPaintKernel`）
 
 - 交叉编译 libmypaint + json-c，打包 mypaint-brushes 预设。
-- 实现 `MyPaintSurface` 回调 → 产出 `StampData`。
-- JNI 暴露 `createBrush / beginStroke / strokeTo / endStroke`。
-- **验收**：JNI 调用 libmypaint 生成 stamp 数据（先 dump 到日志/离屏位图验证形状正确）。
+- `mypaint_surface` → `StampData`，`mypaint_kernel` 实现 `IPaintKernel`，JNI 暴露 `createBrush/beginStroke/strokeTo/endStroke`。
+- **验收**：JNI 调 libmypaint 生成 stamp，送入 `vk_composite` 可画（offscreen）。
 
-### 阶段 3 · Compute Shader 合成
+### 阶段 4 · 平台层 + UI（双平台，UI 插拔）
 
-- Canvas storage image + stamp 纹理池 + staging 上传。
-- `brush_composite.comp` + 批量 dispatch + 包围盒优化。
-- present 管线把 Canvas 画到 swapchain。
-- **验收**：用固定/手动输入点（非真实笔）在画布画出笔刷痕迹。
+- **Android**：TextureView + ANativeWindow + swapchain/present + JNI；Compose UI（CanvasView/BrushPanel/ColorPicker）。
+- **PC**：GLFW 窗口 + Vulkan surface + swapchain/present；ImGui UI（笔刷面板/取色器，画布贴 Vulkan 结果）。
+- **验收**：双平台都看到 Vulkan 画布，UI 能切换笔刷/颜色。
 
-### 阶段 4 · Jetpack Ink 输入集成
+### 阶段 5 · 输入集成
 
-- 按阶段 0 结论接入 Ink 点流（或降级方案）。
-- 预测点流 + 真实点覆盖策略。
-- **验收**：S Pen 绘制，笔迹跟随良好，无明显可感知延迟。
+- Android Jetpack Ink 点流（按阶段 0 结论）+ PC 鼠标/数位笔输入，统一进 `ring_buffer`。
+- 预测点覆盖策略（`isPredicted` 标记 + 真实点重合成）。
+- **验收**：双平台笔迹跟随良好，无明显可感知延迟。
 
-### 阶段 5 · 全链路 + 性能测试
+### 阶段 6 · 全链路 + 性能测试
 
-- 全链路联调，压测大 canvas / 连续快速笔触。
-- 用 AGI + RenderDoc + 高速摄影测 3.3 全部指标。
-- 输出性能测试报告 + 技术路线结论（是否达到 Procreate 级别）。
-- **验收**：满足 3.3 指标，产出结论文档。
+- 全链路联调压测（双平台：大 canvas / 连续快速笔触）。
+- AGI + RenderDoc + 高速摄影测 §3.3 全部指标。
+- **验收**：满足 §3.3 指标，产出性能报告 + 技术路线结论（是否达 Procreate 级别）。
 
 ### 里程碑
 
-| 里程碑 | 时间锚点 | 交付 |
+| 里程碑 | 触发 | 交付 |
 |---|---|---|
-| M1 | 阶段 1 末 | Vulkan 画布跑通 |
-| M2 | 阶段 3 末 | 笔刷经 compute 合成可画 |
-| M3 | 阶段 5 末 | 全链路 + 性能报告 |
+| M1 | 阶段 4 末 | 双平台 Vulkan 画布上屏（PC + Android） |
+| M2 | 阶段 3 末 | 笔刷内核经 compute 合成可画（offscreen 验证） |
+| M3 | 阶段 6 末 | 全链路 + 性能报告 |
 
----
+> M2（offscreen）可先于 M1（上屏）达成——内核与渲染和平台层解耦，offscreen 验证不需要 surface。
 
 ## 6. 关键技术风险与缓解汇总
 
