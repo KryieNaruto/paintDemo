@@ -25,6 +25,7 @@
 | [docs/tasks/detail/开发与测试环境.md](docs/tasks/detail/开发与测试环境.md) | SDK 工具链任务书 |
 | [docs/tasks/detail/共同基座.md](docs/tasks/detail/共同基座.md) | C API + 内部 core 任务书 |
 | [docs/git/README.md](docs/git/README.md) | 消费者 submodule 约定 |
+| [docs/env/toolchain.md](docs/env/toolchain.md) | host 工具链版本下限与 `check-env.sh` 退出码 |
 | [docs/调研/路线整理.md](docs/调研/路线整理.md) | 路线分组 + §7 SDK/C API |
 | [docs/调研/技术路线评审汇总.md](docs/调研/技术路线评审汇总.md) | 5 路线评审结论 |
 | [docs/调研/路线E-白盒移植libmypaint-技术方案.md](docs/调研/路线E-白盒移植libmypaint-技术方案.md) | 路线 E 详细技术方案 |
@@ -66,7 +67,15 @@ git config user.name  "<你的名字>"
 git config user.email "<你的邮箱>"
 ```
 
-### 3. 验证任务线
+### 3. 探测 host 工具链
+
+```bash
+bash scripts/check-env.sh
+```
+
+退出码 **0**：host 必需工具齐（CMake ≥ 3.22、Ninja、C++ 编译器）；NDK / Vulkan 未装时只警告，不失败。非 **0**：缺 cmake / ninja / C++，或 cmake 低于 3.22。版本下限与退出码见 [`docs/env/toolchain.md`](docs/env/toolchain.md)（与脚本常量相同）。
+
+### 4. 验证任务线
 
 ```bash
 python3 .exec/taskline.py status
@@ -74,17 +83,19 @@ python3 .exec/taskline.py status
 
 应显示 **14** 条任务。首波可领：`E0-1`、`E0-2`、`E0-3`、`E0-4`、`G0-1`。
 
-### 4. 安装 SDK 工具链
+### 5. 安装 SDK 工具链
 
-#### 4.1 Linux host
+版本下限以 [`docs/env/toolchain.md`](docs/env/toolchain.md) 为准；下面只给安装入口，不另写一套数字。
+
+#### 5.1 Linux host
 
 ```bash
 sudo apt install build-essential cmake ninja-build libvulkan-dev
 ```
 
-不要把 `libglfw3-dev` 当作本仓库必需。探测脚本见任务 E0-1（`scripts/check-env.sh`）。
+不要把 `libglfw3-dev` 当作本仓库必需。换机探测：[`scripts/check-env.sh`](scripts/check-env.sh)。
 
-#### 4.2 命令行 NDK（编 Android `.so`）
+#### 5.2 命令行 NDK（编 Android `.so`）
 
 | 组件 | 版本 |
 |------|------|
@@ -98,16 +109,16 @@ Android Studio / Gradle / Compose / JDK 21 属于 **paint-android** 消费者。
 export ANDROID_NDK_HOME=/path/to/ndk
 ```
 
-#### 4.3 Windows（编 `dgc_paint.dll`，【人工】）
+#### 5.3 Windows（编 `dgc_paint.dll`，【人工】）
 
 - **VS2026**：工作负载「使用 C++ 的桌面开发」+「C++ CMake tools for Windows」+ Ninja
 - [LunarG Vulkan SDK](https://vulkan.lunarg.com/)（`vulkan-1.lib`、`glslc`）
 
-#### 4.4 真机 / 性能测试
+#### 5.4 真机 / 性能测试
 
 平板与 AGI/RenderDoc 用于**消费者联调**，不阻塞 SDK host 构建。清单见任务 E0-5 / E0-6。
 
-### 5. 验证构建（基座 CMake 落地后）
+### 6. 验证构建（基座 CMake 落地后）
 
 ```bash
 cmake --preset host-linux
@@ -121,7 +132,7 @@ cmake --build --preset android-arm64
 
 当前任务线尚未实现 B1-2 时，上述 preset 还不存在。
 
-### 6. 开工
+### 7. 开工
 
 任意终端输入 **「开工 / 领任务」** 或 **`/paint-dev`**：
 
@@ -143,6 +154,7 @@ cmake --build --preset android-arm64
 | `tests/` | host ctest（C API / engine，headless） |
 | `docs/tasks/` | 任务线 SOT + 任务书 |
 | `docs/git/` | 消费者 submodule 约定与模板 |
+| `docs/env/` | host 工具链探测规则（`toolchain.md`） |
 | `docs/调研/` | 路线与评审 |
 | `scripts/` | `check-env.sh`、`bootstrap-consumer.sh` |
 | `.exec/taskline.py` | 任务申领脚本 |
