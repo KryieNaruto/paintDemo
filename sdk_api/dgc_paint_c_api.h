@@ -70,6 +70,32 @@ int dgcClear(DgcContext* ctx, float r, float g, float b, float a);
 /* 最近一次错误描述（线程局部）：有错误返回静态描述串，无错误返回 NULL。 */
 const char* dgcGetLastError(void);
 
+/* 笔刷参数化 settingId 常量（C API 层自定；真实内核语义归 B3-1）。 */
+typedef enum {
+    DGC_SETTING_RADIUS     = 0, /* 半径 */
+    DGC_SETTING_HARDNESS   = 1, /* 硬度 */
+    DGC_SETTING_OPACITY    = 2, /* 不透明度 */
+    DGC_SETTING_RADIUS_LOG = 3, /* §4.0.6 radius_logarithmic 别名 */
+    DGC_SETTING_COUNT      = 4  /* 非法值校验上界 */
+} DgcBrushSetting;
+
+/* ── v3.0：离屏 / 导出 / 像素读回（真实实现归 B2-1，本期 NOT_IMPLEMENTED）── */
+int dgcSetOffscreenSurface(DgcContext* ctx, int w, int h);
+int dgcExportPNG(DgcContext* ctx, const char* path);
+int dgcReadbackPixels(DgcContext* ctx, void* rgbaOut);
+
+/* ── v3.0：确定性（本期仅存参；ReplayRandom/固定步进内核归 B1-7）── */
+int dgcSetRandomSeed(DgcContext* ctx, uint64_t seed);
+/* fixed_time_us 为固定时间戳（微秒）；负值语义未定义，本期仅存参不校验。 */
+int dgcSetFixedTime(DgcContext* ctx, double t_us);
+
+/* ── v3.0：参数化（对齐 DgcBrushSetting）── */
+int dgcSetBrushSetting(DgcContext* ctx, DgcBrush brush, int settingId, double value);
+int dgcSetBrushColor(DgcContext* ctx, DgcBrush brush, float r, float g, float b, float a);
+
+/* ── v3.0：撤销（留接口不实现，撤销栈归后续任务）── */
+int dgcUndo(DgcContext* ctx);
+
 #ifdef __cplusplus
 }
 #endif
