@@ -17,3 +17,8 @@ add_test(NAME test_engine COMMAND test_engine)
 add_executable(test_c_api_header test_c_api_header.c)
 target_link_libraries(test_c_api_header PRIVATE dgc_paint)
 add_test(NAME test_c_api_header COMMAND test_c_api_header)
+
+# 纯 C 冒烟：B1-6 新增 8 个 v3.0 函数的返回码语义。
+add_executable(test_c_api_b1_6 test_c_api_b1_6.c)
+target_link_libraries(test_c_api_b1_6 PRIVATE dgc_paint)
+add_test(NAME test_c_api_b1_6 COMMAND test_c_api_b1_6)
