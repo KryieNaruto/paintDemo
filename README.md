@@ -70,7 +70,7 @@ cd paint-android
 
 CMake：`add_subdirectory(sdk)`，链接 `dgc_paint`，只 `#include "dgc_paint_c_api.h"`。模板：[docs/git/templates/](docs/git/templates/)。
 
-待建远端：`paint-android`、`paint-pc`（本环境不能代建 GitHub 仓库）。
+消费仓库：`KryieNaruto/paint-android`、`KryieNaruto/paint-pc`（已建，submodule 引用本库，见 docs/git/）。
 
 ---
 

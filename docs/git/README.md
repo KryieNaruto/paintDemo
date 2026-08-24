@@ -25,10 +25,10 @@
 | 仓库 | 状态 | 用途 |
 |------|------|------|
 | `KryieNaruto/paintDemo` | 已存在（本仓库） | 绘画内核 SDK 基座，产出 `dgc_paint`，唯一公开头 `dgc_paint_c_api.h` |
-| `KryieNaruto/paint-android` | 待建 | Android UI 消费者；自备 JNI / Compose / Ink，窗口句柄经 `dgcSetSurface` 传入 SDK |
-| `KryieNaruto/paint-pc` | 待建 | PC UI 消费者；自备 ImGui / GLFW 窗口，窗口句柄经 `dgcSetSurface` 传入 SDK |
+| `KryieNaruto/paint-android` | 已建 | Android UI 消费者；自备 JNI / Compose / Ink，窗口句柄经 `dgcSetSurface` 传入 SDK；submodule 已钉 `43500e5` |
+| `KryieNaruto/paint-pc` | 已建 | PC UI 消费者；自备 ImGui / GLFW 窗口，窗口句柄经 `dgcSetSurface` 传入 SDK；submodule 已钉 `43500e5` |
 
-> 消费者仓库不在本仓库创建；本环境 `gh` 只读，G0-1 只交付文档/模板/脚本，不代建 GitHub 仓库。
+> 消费者仓库不在本仓库创建（由独立 GitHub 仓库承载）。`paint-android` / `paint-pc` 骨架已搭建，submodule 引用本库，窗口 / 输入 / JNI 仍由消费者实现。
 
 ## 消费约定（必须遵守）
 
