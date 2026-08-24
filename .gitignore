@@ -25,3 +25,6 @@ app/build/
 
 # 大文件 / 抓帧依据（49MB，不入版控）
 RenderDoc结果/*.rdc
+
+# Claude Code 本地个人配置（不入库）
+.claude/settings.local.json

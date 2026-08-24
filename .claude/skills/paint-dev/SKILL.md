@@ -14,15 +14,24 @@ description: Use when the user asks to claim and drive DGCPaint SDK tasks from d
    - `task-plan` → 返回 `PLAN=`
    - `task-execute` → 实现
    - `task-test` → 测试结论
-   - `task-finish` → 内部派 `task-review` 评审，据结论合并回目标 + 置状态/审核
+   - `task-finish` → 内部派 `task-review` 评审（无 Task 工具的环境下它会内联完成同等评审取证），据结论合并回目标 + 置状态/审核
 4. **收结果**：agent 的最终输出文本就是返回值。终态看回报里的 `RESULT=`（`done`/`need-human`/`stuck`），**不是**通知里的 `completed`。
 5. **停下等人工**：一个任务彻底结束后（收尾已落地），汇报结果并**停下等人工审核/指示，不自动回第 1 步申领下一个**。只有人工说「继续/推进」才回第 1 步。
+
+## 恢复会话 / 接管既有 worktree
+
+会话恢复或发现某任务已处于「执行中」时，**先查再派，别机械重跑**：
+
+- 跑 `git log --oneline -5` + `git worktree list` + 看 `docs/plans/` 判断每个执行中任务的进度：已 claim 未 plan → 从 `task-plan` 接手；已 plan 未实现 → 从 `task-execute` 接手；已实现未测试 → 从 `task-test` 接手；已测试未收尾 → 从 `task-finish` 接手。
+- 用 `python3 .exec/taskline.py status`（或 available）核实任务线状态，别只信 agent 回报——本会话曾出现测试阶段任务已被并发流程收尾、plan 文件写好未提交等情况。
+- 若发现某任务已被并发完成（`git log` 见 `finish <ID>`），直接跳过该任务的剩余阶段，不要再派 agent。
 
 ## 硬规则
 
 - **别转述任务是什么**：把任务 ID 和 `docs/tasks/任务线.md` 里那一行原样交给 agent，让它自己读。你要给的是它够不到的东西：`WORKTREE=`/`BRANCH=` 的路径、上一步返回值。
 - **别碰 `docs/tasks/任务线.md` 的状态**：状态唯一由 `.exec/taskline.py` 改。你自己也不手改。验收标准从 `docs/tasks/detail/` 对应任务书抄，不自编。
 - **等待不轮询**：派 agent 一律**前台阻塞**（不要 `run_in_background`）；要并行就同一条消息发多个 `Agent()` 调用。有未终态 agent 就保持等待，不要 `sleep` 轮询。
+- **IDE clang 诊断是误报口**：host 无 compile_commands.json 时，IDE/clangd 会报 `pp_file_not_found`/`unknown_typename` 等一屏假错，实际 `g++ -I.` / `cmake` 构建是通过的。看到此类诊断别当实现问题追，以实际构建 + ctest 为准；传给 `task-test` 的提示里带上「以实际构建为准」口径。
 - **`RESULT=need-human` / `stuck` 停下报给人**：撞到「≥2 个站得住脚的选项」或「无技术路径」时，停下把问题与选项报给人，不自己挑一个继续。
 - **收尾后停下等人工，不自动申领**：`task-finish` 报回终态后，汇报并停下等人工审核。只有人工明确说「继续/推进」才回第 1 步看 `available` 并申领。别拿「还有可领任务」当继续的理由——可领 ≠ 该领。
 
