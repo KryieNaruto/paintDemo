@@ -12,4 +12,9 @@ public:
     void clearCanvas() override;
     void present() override;
     void shutdown() override;
+
+    // 离屏三函数空桩（supportsOffscreen 用基类默认 false）。
+    void initOffscreen(int w, int h) override;
+    void readback(void* rgbaOut) override;
+    void exportPNG(const char* path) override;
 };
