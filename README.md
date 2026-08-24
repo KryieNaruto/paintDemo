@@ -22,11 +22,10 @@
 |------|------|
 | [DGCPaint_技术规划.md](DGCPaint_技术规划.md) | 主技术规划（架构 + 路线） |
 | [docs/tasks/任务线.md](docs/tasks/任务线.md) | 任务状态 SOT（脚本申领） |
-| [docs/tasks/detail/开发与测试环境.md](docs/tasks/detail/开发与测试环境.md) | SDK 工具链任务书 |
+| [docs/tasks/detail/环境搭建与项目骨架.md](docs/tasks/detail/环境搭建与项目骨架.md) | E0 线任务书：环境说明书 + 一键脚本 + 项目目录 |
 | [docs/tasks/detail/共同基座.md](docs/tasks/detail/共同基座.md) | C API + 内部 core 任务书 |
-| [docs/git/README.md](docs/git/README.md) | 消费者 submodule 约定 |
-| [docs/env/toolchain.md](docs/env/toolchain.md) | host 工具链版本下限与 `check-env.sh` 退出码 |
-| [docs/env/linux-host.md](docs/env/linux-host.md) | Linux / WSL Ubuntu：apt 四包与探测 |
+| `docs/env/env-setup.md` | 环境搭建说明书（E0-1 产出） |
+| `scripts/setup-env.sh` | 换机一键脚本（E0-2 产出） |
 | [docs/调研/路线整理.md](docs/调研/路线整理.md) | 路线分组 + §7 SDK/C API |
 | [docs/调研/技术路线评审汇总.md](docs/调研/技术路线评审汇总.md) | 5 路线评审结论 |
 | [docs/调研/路线E-白盒移植libmypaint-技术方案.md](docs/调研/路线E-白盒移植libmypaint-技术方案.md) | 路线 E 详细技术方案 |
@@ -70,11 +69,13 @@ git config user.email "<你的邮箱>"
 
 ### 3. 探测 host 工具链
 
+`scripts/setup-env.sh` 由 **E0-2** 产出，未认领前不存在。可先手工探测：
+
 ```bash
-bash scripts/check-env.sh
+which cmake ninja g++   # 或 gcc / clang++
 ```
 
-退出码 **0**：host 必需工具齐（CMake ≥ 3.22、Ninja、C++ 编译器）；NDK / Vulkan 未装时只警告，不失败。非 **0**：缺 cmake / ninja / C++，或 cmake 低于 3.22。版本下限与退出码见 [`docs/env/toolchain.md`](docs/env/toolchain.md)（与脚本常量相同）。
+cmake ≥ 3.22、ninja、C++ 编译器为 host 必需；NDK / Vulkan 未装仅警告（Null 后端不硬依赖）。完整版本下限见 **E0-1** 产出的 `docs/env/env-setup.md`。
 
 ### 4. 验证任务线
 
@@ -82,46 +83,19 @@ bash scripts/check-env.sh
 python3 .exec/taskline.py status
 ```
 
-应显示 **14** 条任务。首波可领：`E0-1`、`E0-2`、`E0-3`、`E0-4`、`G0-1`。
+应显示 **15** 条任务。首波可领：`E0-1`、`G0-1`。
 
 ### 5. 安装 SDK 工具链
 
-版本下限以 [`docs/env/toolchain.md`](docs/env/toolchain.md) 为准；下面只给安装入口，不另写一套数字。
+环境搭建由 **E0 线**覆盖（见 [`docs/tasks/detail/环境搭建与项目骨架.md`](docs/tasks/detail/环境搭建与项目骨架.md)）：
+- **E0-1** 产出环境搭建说明书 `docs/env/env-setup.md`（Linux + Windows 步骤、版本下限）。
+- **E0-2** 产出换机一键脚本 `scripts/setup-env.sh`（探测 + 补缺安装）。
 
-#### 5.1 Linux host
+尚未认领这些任务时，工具链可能未就绪；换机后跑 E0-2 脚本或照 E0-1 说明书手动搭建。
 
-完整步骤、WSL 路径与「无 GPU 不算失败」见 [`docs/env/linux-host.md`](docs/env/linux-host.md)。可重复安装：[`scripts/setup-linux-host.sh`](scripts/setup-linux-host.sh)（需 sudo）。
+不要把 `libglfw3-dev` 当作本仓库必需。
 
-```bash
-sudo apt install build-essential cmake ninja-build libvulkan-dev
-```
-
-不要把 `libglfw3-dev` 当作本仓库必需。换机探测：[`scripts/check-env.sh`](scripts/check-env.sh)。
-
-#### 5.2 命令行 NDK（编 Android `.so`）
-
-| 组件 | 版本 |
-|------|------|
-| Android NDK | r27+（建议 r28） |
-| CMake | 3.22+ |
-| ANDROID_NDK_HOME | 指向 NDK 根目录 |
-
-Android Studio / Gradle / Compose / JDK 21 属于 **paint-android** 消费者。
-
-```bash
-export ANDROID_NDK_HOME=/path/to/ndk
-```
-
-#### 5.3 Windows（编 `dgc_paint.dll`，【人工】）
-
-- **VS2026**：工作负载「使用 C++ 的桌面开发」+「C++ CMake tools for Windows」+ Ninja
-- [LunarG Vulkan SDK](https://vulkan.lunarg.com/)（`vulkan-1.lib`、`glslc`）
-
-#### 5.4 真机 / 性能测试
-
-平板与 AGI/RenderDoc 用于**消费者联调**，不阻塞 SDK host 构建。清单见任务 E0-5 / E0-6。
-
-### 6. 验证构建（基座 CMake 落地后）
+### 6. 验证构建（项目骨架 E0-3 落地后）
 
 ```bash
 cmake --preset host-linux
@@ -133,7 +107,7 @@ cmake --preset android-arm64
 cmake --build --preset android-arm64
 ```
 
-当前任务线尚未实现 B1-2 时，上述 preset 还不存在。
+`CMakePresets.json` 由 **E0-3**（基础项目目录建设）产出；尚未实现时上述 preset 还不存在。
 
 ### 7. 开工
 
@@ -156,10 +130,10 @@ cmake --build --preset android-arm64
 | `shaders/` | 后续 Vulkan/bgfx shader |
 | `tests/` | host ctest（C API / engine，headless） |
 | `docs/tasks/` | 任务线 SOT + 任务书 |
-| `docs/git/` | 消费者 submodule 约定与模板 |
-| `docs/env/` | host 工具链探测规则（`toolchain.md`）与 Linux 安装（`linux-host.md`） |
+| `docs/git/` | 消费者 submodule 约定与模板（**G0-1** 产出） |
+| `docs/env/` | 环境搭建说明书 `env-setup.md`（**E0-1** 产出） |
 | `docs/调研/` | 路线与评审 |
-| `scripts/` | `check-env.sh`、`setup-linux-host.sh`、`bootstrap-consumer.sh` |
+| `scripts/` | `setup-env.sh`（**E0-2** 产出）等 |
 | `.exec/taskline.py` | 任务申领脚本 |
 
 **不在本仓库**：`ui/`、`platform/`、`app/`。
