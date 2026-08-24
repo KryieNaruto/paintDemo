@@ -12,3 +12,8 @@ add_executable(test_engine test_engine.cpp)
 target_include_directories(test_engine PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(test_engine PRIVATE dgc_paint)
 add_test(NAME test_engine COMMAND test_engine)
+
+# 纯 C 冒烟：验证对外头可被 C 编译器解析且实现已链接进 dgc_paint。
+add_executable(test_c_api_header test_c_api_header.c)
+target_link_libraries(test_c_api_header PRIVATE dgc_paint)
+add_test(NAME test_c_api_header COMMAND test_c_api_header)
