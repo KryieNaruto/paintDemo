@@ -20,7 +20,7 @@
 ┌──────────────────────────────▼─────────────────────────────────────┐
 │                      engine（平台无关核心，3 线程）                   │
 │        Input Thread ──▶ Brush Thread ──▶ Render Thread               │
-│        (Jetpack Ink)     (IPaintKernel)     (IRenderBackend)         │
+│   (Ink Stroke Modeler)  (IPaintKernel)     (IRenderBackend)         │
 └──────┬──────────────────────────┬───────────────────────────────────┘
        │ IPaintKernel（插拔点①）    │ IRenderBackend（插拔点②）
 ┌──────▼──────────────────────┐   ┌─▼───────────────────────────────┐
@@ -37,7 +37,7 @@
                                                                └───────────────┘
 ```
 
-**数据流向**：`MotionEvent → Jetpack Ink 点流 → libmypaint stroke_to → MyPaintSurface::draw_dab → StampData → Vulkan Compute over 合成 → present`。
+**数据流向**：`MotionEvent → Ink Stroke Modeler 平滑预测点流 → libmypaint stroke_to → MyPaintSurface::draw_dab → StampData → Vulkan Compute over 合成 → present`。
 
 **路线 A 与路线 E 的唯一区别**：路线 E 把 `mypaint_brush_stroke_to()` 算法抄成自研 C++；路线 A 直接链接官方 C 库。合成侧（Vulkan Compute）两者完全相同，因此本方案第 3.c、3.d、4 节对路线 E 同样适用。
 
@@ -70,7 +70,7 @@ libmypaint 不关心「画布怎么合成」，它只通过 `MyPaintSurface` 虚
 
 | 线程 | 职责 | 输入 | 输出 | 同步 |
 |---|---|---|---|---|
-| **Input Thread**（Main/Ink） | Jetpack Ink 点流捕获 + 速度外推预测 | MotionEvent | `StrokePoint`（含 `isPredicted`） | SPSC ring buffer → Brush |
+| **Input Thread**（Main/Ink） | Ink Stroke Modeler 平滑预测 | MotionEvent | `StrokePoint`（含 `isPredicted`） | SPSC ring buffer → Brush |
 | **Brush Thread** | `mypaint_brush_stroke_to` 生成 dab → 适配层收集 StampData | `StrokePoint` | `StampData` | SPSC ring buffer → Render |
 | **Render Thread** | staging 上传 + compute 批量合成 + present | `StampData` | 屏幕帧 | fence + semaphore |
 
@@ -310,12 +310,11 @@ void main() {
 
 ---
 
-### 3.d 输入层（Jetpack Ink 点流 + 预测策略）
+### 3.d 输入层（Ink Stroke Modeler 平滑预测）
 
-- **依赖**：`androidx.ink:ink-strokes` + `ink-geometry` + `ink-brush`（stable 1.0.0），**不引入 ink-rendering**（渲染被 Vulkan 替代）。`StrokeInputBatch` 是纯数据层，直接给含时间戳/压力/倾斜/方向的点流（规划 §4.6 已确认）。
-- **预测**：Ink 的预测在前缓冲渲染内部，未暴露独立 API（阶段 0 待验证项）。两条现成路径：
-  - (a) **自研速度外推**（~30 行）：`p_predicted = p_last + v * lead_time`，`v` 由最近 2~3 个真实点差分 + 一阶低通，`lead_time ≈ 2 帧（~16ms@120Hz）`。预测点标 `isPredicted=true`。
-  - (b) `MotionEvent.getHistoricalX/Y/Pressure` 历史点。
+- **依赖**：白盒移植 `ink-stroke-modeler` 进入 `core/stroke_predictor`（Apache-2.0，纯 C++，仅 stdlib+Abseil），在 SDK 内核内完成平滑预测，跨平台复用。
+- **平滑预测**：`StrokeModeler::Update` 接收原始 `MotionEvent` 点流 → wobble smoothing + 重采样 + 弹簧质点模型；`StrokeModeler::Predict`（KalmanPredictor / StrokeEndPredictor）产出预测点，标 `isPredicted=true`。
+- **确定性**：固定步长欧拉积分**无随机**，天然适配 `dgcSetRandomSeed`/`dgcSetFixedTime`。
 - **预测点覆盖策略**（Procreate 同款，规划 §4.7）：预测 stamp 只用于降低观感延迟，**不作为最终像素保留**；真实点到达时以真实 stamp 重合成该段。实现上：Brush Thread 给预测点也生成 stamp 但标 `isPredicted`，Render Thread 的 staging 池满时优先丢预测 stamp；真实点 stamp 到达后覆盖同一画布区域的预测像素（over 运算天然覆盖，但会残留「预测过冲」的拖影——缓解见 §6）。
 - **降延迟细节**：Compose 输入用 `PointerEventPass.Initial`；必要时绕过 Compose 直连 `MotionEvent`（规划 §6 风险表）。
 - **PC 侧**：GLFW 鼠标/数位笔走同一 `StrokePoint` 结构，统一进 ring buffer；鼠标无压力时 pressure 恒 1.0、tilt 恒 0。
@@ -487,9 +486,9 @@ Krita 修复过 MR !1839 类问题：`MyPaintSensorPack::read()` 若在每次 `s
 
 ### 阶段 0 · 技术风险 spike（最高优先，2 天硬 deadline）
 
-- **目标**：(a) Jetpack Ink 预测点获取方式；(b) libmypaint arm64 交叉编译链跑通。
+- **目标**：(a) Ink Stroke Modeler 预测参数按绘画场景调优；(b) libmypaint arm64 交叉编译链跑通。
 - **AI 执行**：跑 §3.a.4 脚本 → 交叉编译 json-c + libmypaint → host 版 `stroke_to` 出 dab。
-- **验收（硬性）**：arm64 版 libmypaint.a 编出，且 host 版用同一组输入 `stroke_to` 输出 >0 个 dab；预测点来源结论落文档。
+- **验收（硬性）**：arm64 版 libmypaint.a 编出，且 host 版用同一组输入 `stroke_to` 输出 >0 个 dab；Ink Stroke Modeler 绘画场景调参结论落文档。
 - **关键决策点**：**2 天内交叉编译未通 = 立即切路线 E**（不恋战）。
 
 ### 阶段 1 · 接口层 + 多平台骨架

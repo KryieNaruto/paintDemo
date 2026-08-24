@@ -9,7 +9,7 @@
 
 ## 1. 技术路线概览
 
-**一句话定位**：把 libmypaint 的 `mypaint_brush_stroke_to()` dab 生成算法**逐函数白盒移植成自研 C++（去 glib，ISC 许可允许直接抄）**，dab 生成跑 CPU，合成走 Vulkan Compute，输入走 Jetpack Ink 点流——用「成熟算法照抄 + 全自研可控代码 + 原生 GPU 合成」三条腿同时踩中 AI 强项。
+**一句话定位**：把 libmypaint 的 `mypaint_brush_stroke_to()` dab 生成算法**逐函数白盒移植成自研 C++（去 glib，ISC 许可允许直接抄）**，dab 生成跑 CPU，合成走 Vulkan Compute，输入走 Ink Stroke Modeler 平滑预测点流（白盒移植）——用「成熟算法照抄 + 全自研可控代码 + 原生 GPU 合成」三条腿同时踩中 AI 强项。
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -49,7 +49,7 @@ DGCPaintPrototype/
 │   ├── interfaces/i_platform.h
 │   ├── types.h                        # StrokePoint / BrushParams / StampData / StampShape
 │   ├── engine.h/.cpp                  # 3 线程模型编排
-│   ├── stroke_predictor.h/.cpp        # 速度外推预测（见 §3e）
+│   ├── stroke_predictor.h/.cpp        # 白盒移植 Ink Stroke Modeler 平滑预测（见 §3e）
 │   └── ring_buffer.h                  # SPSC 无锁队列
 ├── kernels/brush/                     # ★ 改：kernels/mypaint/ → kernels/brush/（纯 C++ 自研）
 │   ├── CMakeLists.txt
@@ -89,7 +89,7 @@ DGCPaintPrototype/
 
 | 线程 | 职责 | 输入 → 输出 | 同步 |
 |---|---|---|---|
-| **Input Thread**（Android 上即主线程回调） | Jetpack Ink 点流捕获 + 预测外推 | `MotionEvent` → `StrokePoint[]` | SPSC ring buffer ①（无锁） |
+| **Input Thread**（Android 上即主线程回调） | Ink Stroke Modeler 平滑预测 | `MotionEvent` → `StrokePoint[]` | SPSC ring buffer ①（无锁） |
 | **Brush Thread** | 自研 C++ 内核 `Brush::strokeTo` | `StrokePoint` → `StampData[]` | SPSC ring buffer ② |
 | **Render Thread** | stamp 上传 + Vulkan compute 合成 + present | `StampData[]` → 画布 image → swapchain | 每帧 fence + semaphore |
 
@@ -430,9 +430,9 @@ void main() {
 - 大 stamp（radius 大）与小 stamp 混批时按半径降序排，先大后小，减少 overdraw。
 - 4K 大画布：`ceil(box/8)` 单 dispatch 上限控制在 ≤ 128×128 workgroup，超过则 tile 化（对应功能清单 #119）。
 
-### 3e. 输入层（Jetpack Ink 点流 + 自研速度外推预测）
+### 3e. 输入层（Ink Stroke Modeler 平滑预测 + 白盒移植）
 
-**接入**（对照 `技术规划 §4.6`）：只用 Ink 的 `strokes` 模块（纯数据层），`StrokeInputBatch` 提供含时间戳/压力/倾斜/方向的点流，**不引入 `ink-rendering`**（渲染由 Vulkan 接管）。预测层在 graphics-core 前缓冲渲染内部、未暴露独立 API，故采用**自研速度外推**。
+**接入**：白盒移植 `ink-stroke-modeler` 进入 `core/stroke_predictor`，直接在 C++ 内核中完成平滑预测，不再依赖 Android-only 输入管线。`StrokeModeler::Update` 接收原始 `MotionEvent` 点流，`StrokeModeler::Predict` 产出预测点，输出统一进 `StrokePoint` → ring buffer。
 
 ```cpp
 // core/stroke_predictor.h（~30 行，host 可单测）
@@ -464,7 +464,7 @@ struct StrokePredictor {
 
 ```
 [触控笔按下] MotionEvent
-  │  ① Ink strokes 捕获（压力/倾斜/时间戳）             ~1–3ms（PointerEventPass.Initial 直连）
+  │  ① Ink Stroke Modeler 平滑预测（压力/倾斜/时间戳）             ~1–3ms（PointerEventPass.Initial 直连）
   ▼
 [Input Thread]
   │  ② 预测外推（速度外推 1 点）                        <0.1ms
@@ -642,7 +642,7 @@ GPU 化（阶段演进，可选）：
 | **E2 · 渲染后端** | `vk_backend/vk_canvas/vk_composite` + staging 环 + `brush_composite.comp`（程序化圆 + 纹理 + lock_alpha） | offscreen 固定 StampData 合成出笔刷痕迹，`vkCmdDispatch` 用 Vulkan timestamp query 测得 <2ms |
 | **E3 · 笔刷内核实现 IPaintKernel** | `brush_kernel` 实现 `createBrush/loadBrush/beginStroke/strokeTo/endStroke` + `myb_parser`（nlohmann/json）+ 打包 mypaint-brushes assets | JNI 调 `loadBrush("deevad/basic_round.myb")` → `strokeTo` 产出 StampData → 送入 vk_composite 可画（offscreen） |
 | **E4 · 平台层 + UI** | Android TextureView/ANativeWindow/swapchain + Compose UI；PC GLFW + ImGui | 双平台 Vulkan 画布上屏，UI 可切换笔刷/颜色 |
-| **E5 · 输入集成** | Ink strokes 点流 + `stroke_predictor` 速度外推 + isPredicted 重合成 + PC 鼠标/数位笔 | 双平台笔迹跟随良好，高速摄影测无明显可感知延迟，无拖影 |
+| **E5 · 输入集成** | Ink Stroke Modeler 平滑预测 + `stroke_predictor` 预测点流 + isPredicted 重合成 + PC 鼠标/数位笔 | 双平台笔迹跟随良好，高速摄影测无明显可感知延迟，无拖影 |
 | **E6 · 全链路压测 + 性能报告** | 大画布/快速笔触压测 + AGI/RenderDoc/高速摄影测 §3.3 全部指标 | P1<30ms、P2 60/120fps、P3<2ms、P4<1ms、P5<3ms、P6/P7 通过，产出性能报告 |
 
 **里程碑**：M2（offscreen 可画，E3 末）可先于 M1（双平台上屏，E4 末）；M3（全链路 + 报告，E6 末）。

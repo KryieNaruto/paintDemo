@@ -22,8 +22,8 @@
 │                                                                │
 │  ┌──────────────┐   ┌──────────────────┐   ┌────────────────┐  │
 │  │ Input Thread │   │  Brush Thread     │   │ Render Thread  │  │
-│  │ Jetpack Ink  │──►│  libmypaint       │──►│  Skia GPU      │  │
-│  │ 预测点流      │   │  stroke_to → dab  │   │  drawImage 合成 │  │
+│  │ Ink Stroke   │──►│  libmypaint       │──►│  Skia GPU      │  │
+│  │ Modeler 平滑  │   │  stroke_to → dab  │   │  drawImage 合成 │  │
 │  │ (ring buffer)│   │  dab → premul 位图 │   │  flush+present │  │
 │  └──────────────┘   │ (ring buffer)      │   └────────────────┘  │
 │                     └──────────────────┘                        │
@@ -31,7 +31,7 @@
 └────┴─────────────────────────┴──────────────────────┴──────────┘
 ```
 
-与规划基准（路线 A/E 的 Vulkan Compute）**唯一替换点**是 `render/vulkan/` → `render/skia/`，其余（core 接口、engine 3 线程、libmypaint 内核、Jetpack Ink 输入、平台层）**全部复用，零改动**。这正是三插拔接口设计的价值：换渲染后端 = 换一个 `IRenderBackend` 实现。
+与规划基准（路线 A/E 的 Vulkan Compute）**唯一替换点**是 `render/vulkan/` → `render/skia/`，其余（core 接口、engine 3 线程、libmypaint 内核、Ink Stroke Modeler 平滑预测输入、平台层）**全部复用，零改动**。这正是三插拔接口设计的价值：换渲染后端 = 换一个 `IRenderBackend` 实现。
 
 ---
 
@@ -194,13 +194,13 @@ Skia 提供 29 种 `SkBlendMode`，其中 16 种是 Photoshop 风格混合模式
 
 **与 Vulkan compute 路线的差异**：这些能力在 Skia 里是**现成 API**（一行为一个滤镜/蒙版），而在 E/B 路线里需要**逐一手写 compute/fragment shader**。这正是路线 C 的「功能广度」红利——若目标是「画板 + 大量 2D 特效/矢量/文字」，Skia 省下的工作量巨大。
 
-### 3.e 输入层（Jetpack Ink）
+### 3.e 输入层（Ink Stroke Modeler）
 
 与规划 §4.6 完全一致，**零差异**：
 
-- `androidx.ink:ink-strokes` 纯数据层取 `StrokeInputBatch` 点流（位置/时间戳/压力/倾斜/方向）。
-- 不引入 `ink-rendering`（Skia 渲染替代它）。
-- 预测点走自研速度外推（~30 行）或 `MotionEvent` 历史，标 `isPredicted`，真实点到达重合成覆盖。
+- 白盒移植 `ink-stroke-modeler` 进 `core/stroke_predictor`，`StrokeModeler::Update` 取点流（位置/时间戳/压力/倾斜/方向）。
+- `StrokeModeler::Predict` 产出预测点，标 `isPredicted`，真实点到达重合成覆盖。
+- 不引入任何 Android-only 输入管线（渲染由 Skia 替代）。
 
 ---
 
@@ -208,7 +208,7 @@ Skia 提供 29 种 `SkBlendMode`，其中 16 种是 Photoshop 风格混合模式
 
 ```
 触控笔按下 (MotionEvent)
-  → Jetpack Ink 建模 StrokeInputBatch（压力/倾斜/时间戳）          [~1ms]
+  → Ink Stroke Modeler 平滑预测（压力/倾斜/时间戳）             [~1ms]
   → 预测点流 push 到 input ring_buffer（isPredicted 标记）
   → Brush Thread 取点 → libmypaint stroke_to(x,y,p,tilt)          [<3ms, §3.3 P5]
   → MyPaintSurface::draw_dab 回调 → StampData
@@ -349,7 +349,7 @@ class SkBackend : public IRenderBackend {
 | **C2 · Skia 渲染后端** | `sk_backend`/`sk_canvas`/`sk_stamp`；offscreen + 窗口双 surface；stamp 位图池；GLES3 后端 | host offscreen 用固定 stamp 合成出笔刷痕迹（不依赖内核） |
 | **C3 · libmypaint 内核**（同规划阶段 3） | 交叉编译 + `mypaint_surface → StampData` + `mypaint_kernel` | JNI 调 libmypaint 生成 stamp → 送入 Skia `drawImage` 可画 |
 | **C4 · 平台层 + UI** | TextureView + EGL + Compose UI；PC GLFW + ImGui | 双平台看到 Skia 画布，UI 切换笔刷/颜色 |
-| **C5 · 输入集成**（同规划阶段 5） | Jetpack Ink 点流 + 预测覆盖 | 双平台笔迹跟随良好 |
+| **C5 · 输入集成**（同规划阶段 5） | Ink Stroke Modeler 平滑预测 + 预测覆盖 | 双平台笔迹跟随良好 |
 | **C6 · 全链路 + 性能测试** | AGI + 高速摄影测 §3.3 全部指标；重点抓 draw call 数 + CPU 栅格化耗时 | 满足 §3.3 或输出「哪些指标因 Skia 模型不达标」的证伪报告 |
 
 **里程碑**：M1（C4 末）双平台 Skia 画布上屏；M2（C3 末）内核经 Skia 合成可画；M3（C6 末）性能报告 + 「是否继续用 Skia / 转 Vulkan」的决策结论。
