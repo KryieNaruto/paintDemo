@@ -1,6 +1,6 @@
 # DGCamp Paint SDK（paintDemo）
 
-本仓库是绘画内核 **SDK 基座**：产出 `libdgc_paint`（`.so` / `.a` / `.dll` / `.dylib`）和唯一公开头 `sdk_api/dgc_paint_c_api.h`。
+本仓库是绘画内核 **SDK 基座**：产出 `libdgc_paint`（目标形态 `.so` / `.a` / `.dll` / `.dylib`；**当前阶段为静态库 `.a`**）和唯一公开头 `sdk_api/dgc_paint_c_api.h`。
 
 **不含 UI 消费者。** Android Compose、PC ImGui/GLFW、JNI 分别在独立仓库，通过 git submodule 引用本库（路径固定 `sdk/`）。拓扑见 [`docs/git/README.md`](docs/git/README.md)。
 
@@ -15,6 +15,33 @@
 | A 链接libmypaint | 3.33 | 对照基准/兜底 |
 
 换路线 = 换 SDK **内部** `kernels/` / `render/`；**C API 不变**，消费者代码零改动。
+
+---
+
+## 快速构建（已验证 · Ubuntu 24.04 + NDK r28）
+
+> 以下命令在开发服务器实测通过。产物均为静态库 `build/<preset>/libdgc_paint.a`。
+
+### PC（Linux host）
+
+```bash
+cmake --preset host-linux          # 配置（Ninja + Debug，含 3 个 host 单测）
+cmake --build --preset host-linux  # 构建 → build/host-linux/libdgc_paint.a
+ctest --test-dir build/host-linux --output-on-failure   # 3/3 通过
+```
+
+### Android（arm64-v8a）
+
+```bash
+# 先指向本机 NDK（CMakePresets 用 $env{ANDROID_NDK_HOME} 定位 toolchain）
+export ANDROID_NDK_HOME=/usr/lib/android-sdk/ndk/28.2.13676358   # 换成你的 NDK 路径
+cmake --preset android-arm64       # 配置（NDK toolchain + arm64-v8a + android-30）
+cmake --build --preset android-arm64  # 构建 → build/android-arm64/libdgc_paint.a
+```
+
+**找不到 NDK 吗？** Android preset 会用 `$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake` 定位工具链；未设置时配置报错 `Could not find toolchain file`。用 `sdkmanager --install "ndk;28.2.13676358"`（或 Android Studio SDK Manager）安装后把路径填到 `ANDROID_NDK_HOME` 即可。
+
+---
 
 ## 文档索引
 
@@ -95,19 +122,23 @@ python3 .exec/taskline.py status
 
 不要把 `libglfw3-dev` 当作本仓库必需。
 
-### 6. 验证构建（项目骨架 E0-3 落地后）
+### 6. 验证构建
+
+`CMakePresets.json` 由 **E0-3**（基础项目目录建设）产出，已含 `host-linux` / `host-windows` / `android-arm64` 三套 preset。
 
 ```bash
+# PC：工具链（cmake ≥ 3.22 + ninja + g++/clang）就绪即可
 cmake --preset host-linux
 cmake --build --preset host-linux
-ctest --test-dir build/host-linux --output-on-failure
+ctest --test-dir build/host-linux --output-on-failure   # 3 个 host 单测
 
-# NDK 已配置时
+# Android：先设 NDK，再配置构建
+export ANDROID_NDK_HOME=<你的 NDK 路径，如 /usr/lib/android-sdk/ndk/28.2.13676358>
 cmake --preset android-arm64
 cmake --build --preset android-arm64
 ```
 
-`CMakePresets.json` 由 **E0-3**（基础项目目录建设）产出；尚未实现时上述 preset 还不存在。
+产物：`build/host-linux/libdgc_paint.a`（PC）、`build/android-arm64/libdgc_paint.a`（Android arm64-v8a）。`sdk_api/dgc_paint_c_api.h` 尚未由任务产出前，库为内部 core + Null 桩；对外 C API 属 **B1-4/B1-6**，Android `.so` 属 **B5-1**（当前为静态库）。
 
 ### 7. 开工
 
@@ -127,7 +158,7 @@ cmake --build --preset android-arm64
 | `core/` | 内部：类型、插拔接口、engine、ring buffer、predictor |
 | `kernels/` | L5 内部插拔（占位；默认 Null） |
 | `render/` | L4 内部插拔（占位；默认 Null） |
-| `shaders/` | 后续 Vulkan/bgfx shader |
+| `shaders/` | 后续 Vulkan/bgfx shader（尚未创建，属 **B2-1**） |
 | `tests/` | host ctest（C API / engine，headless） |
 | `docs/tasks/` | 任务线 SOT + 任务书 |
 | `docs/git/` | 消费者 submodule 约定与模板（**G0-1** 产出） |
