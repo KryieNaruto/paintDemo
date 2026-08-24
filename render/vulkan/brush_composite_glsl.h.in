@@ -1,0 +1,4 @@
+#pragma once
+// 由 CMake 从 render/vulkan/brush_composite.comp 生成（单一权威源是 .comp）。
+// 运行时由 shaderc 库在代码内编译成 SPIR-V，构建期不调用 glslc/glslangValidator。
+static const char* kBrushCompositeGlsl = R"GLSL(@GLSL_SOURCE@)GLSL";

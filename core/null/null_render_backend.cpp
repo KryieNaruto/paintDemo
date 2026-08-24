@@ -13,3 +13,9 @@ void NullRenderBackend::clearCanvas() {}
 void NullRenderBackend::present() {}
 
 void NullRenderBackend::shutdown() {}
+
+void NullRenderBackend::initOffscreen(int, int) {}
+
+void NullRenderBackend::readback(void*) {}
+
+void NullRenderBackend::exportPNG(const char*) {}
