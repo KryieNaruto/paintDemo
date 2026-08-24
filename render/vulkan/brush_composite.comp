@@ -1,0 +1,30 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rgba8) uniform image2D u_Canvas;
+layout(set = 0, binding = 1) uniform sampler2D  u_Stamp;
+
+layout(push_constant) uniform PC {
+    vec2  stampPos;      // stamp 在画布上的像素坐标（左上）
+    vec2  stampSize;     // stamp 纹理像素尺寸
+    float opacity;
+    float alphaLock;     // 预留：阿尔法锁定
+} pc;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(u_Canvas);
+    if (c.x >= sz.x || c.y >= sz.y) return;
+
+    vec2 uv = (vec2(c) - pc.stampPos) / pc.stampSize;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return;
+
+    vec4 stamp = texture(u_Stamp, uv);
+    float a = stamp.a * pc.opacity;
+    if (a <= 0.001) return;
+
+    vec4 canvas = imageLoad(u_Canvas, c);
+    // premultiplied over：dst = src + dst*(1-src.a)
+    vec4 outColor = vec4(stamp.rgb * a + canvas.rgb * (1.0 - a),
+                         a + canvas.a * (1.0 - a));
+    imageStore(u_Canvas, c, outColor);
+}
