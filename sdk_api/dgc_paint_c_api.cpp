@@ -1,5 +1,8 @@
 #include "sdk_api/dgc_paint_c_api.h"
 
+#include <array>
+#include <unordered_map>
+
 #include "core/engine.h"
 #include "core/interfaces/i_paint_kernel.h"
 #include "core/interfaces/i_render_backend.h"
@@ -15,6 +18,12 @@ struct DgcContext {
     Engine*         engine  = nullptr;
     int             w = 0;
     int             h = 0;
+    // B1-6 新增：确定性 + 参数化存参（真实内核/渲染机制归 B1-7/B2-1/B3-1）。
+    uint64_t random_seed    = 0;
+    double   fixed_time_us  = 0.0;
+    bool     fixed_time_set = false;  // 对齐 §4.0.3 override_time
+    std::unordered_map<DgcBrush, std::array<double, DGC_SETTING_COUNT>> brush_settings;
+    std::unordered_map<DgcBrush, std::array<float, 4>>                  brush_colors;
 };
 
 namespace {
@@ -207,6 +216,107 @@ int dgcClear(DgcContext* ctx, float r, float g, float b, float a) {
 
 const char* dgcGetLastError(void) {
     return errorMessage(g_last_error);
+}
+
+/* ── v3.0：离屏 / 导出 / 像素读回（真实实现归 B2-1，本期 NOT_IMPLEMENTED）── */
+
+int dgcSetOffscreenSurface(DgcContext* ctx, int w, int h) {
+    (void)w;
+    (void)h;
+    if (ctx == nullptr) {
+        g_last_error = DGC_ERR_NULL_CONTEXT;
+        return DGC_ERR_NULL_CONTEXT;
+    }
+    g_last_error = DGC_ERR_NOT_IMPLEMENTED;
+    return DGC_ERR_NOT_IMPLEMENTED;
+}
+
+int dgcExportPNG(DgcContext* ctx, const char* path) {
+    (void)path;
+    if (ctx == nullptr) {
+        g_last_error = DGC_ERR_NULL_CONTEXT;
+        return DGC_ERR_NULL_CONTEXT;
+    }
+    g_last_error = DGC_ERR_NOT_IMPLEMENTED;
+    return DGC_ERR_NOT_IMPLEMENTED;
+}
+
+int dgcReadbackPixels(DgcContext* ctx, void* rgbaOut) {
+    (void)rgbaOut;  // 本期不写 rgbaOut
+    if (ctx == nullptr) {
+        g_last_error = DGC_ERR_NULL_CONTEXT;
+        return DGC_ERR_NULL_CONTEXT;
+    }
+    g_last_error = DGC_ERR_NOT_IMPLEMENTED;
+    return DGC_ERR_NOT_IMPLEMENTED;
+}
+
+/* ── v3.0：确定性（本期仅存参；ReplayRandom/固定步进内核归 B1-7）── */
+
+int dgcSetRandomSeed(DgcContext* ctx, uint64_t seed) {
+    if (ctx == nullptr) {
+        g_last_error = DGC_ERR_NULL_CONTEXT;
+        return DGC_ERR_NULL_CONTEXT;
+    }
+    ctx->random_seed = seed;
+    g_last_error = DGC_OK;
+    return DGC_OK;
+}
+
+int dgcSetFixedTime(DgcContext* ctx, double t_us) {
+    if (ctx == nullptr) {
+        g_last_error = DGC_ERR_NULL_CONTEXT;
+        return DGC_ERR_NULL_CONTEXT;
+    }
+    ctx->fixed_time_us  = t_us;
+    ctx->fixed_time_set = true;
+    g_last_error = DGC_OK;
+    return DGC_OK;
+}
+
+/* ── v3.0：参数化（对齐 DgcBrushSetting；存参供 B3-1 真实内核消费）── */
+
+int dgcSetBrushSetting(DgcContext* ctx, DgcBrush brush, int settingId, double value) {
+    if (ctx == nullptr) {
+        g_last_error = DGC_ERR_NULL_CONTEXT;
+        return DGC_ERR_NULL_CONTEXT;
+    }
+    if (settingId < 0 || settingId >= DGC_SETTING_COUNT) {
+        g_last_error = DGC_ERR_INVALID_ARG;
+        return DGC_ERR_INVALID_ARG;
+    }
+    if (brush == DGC_INVALID_BRUSH) {
+        g_last_error = DGC_ERR_INVALID_HANDLE;
+        return DGC_ERR_INVALID_HANDLE;
+    }
+    ctx->brush_settings[brush][settingId] = value;
+    g_last_error = DGC_OK;
+    return DGC_OK;
+}
+
+int dgcSetBrushColor(DgcContext* ctx, DgcBrush brush, float r, float g, float b, float a) {
+    if (ctx == nullptr) {
+        g_last_error = DGC_ERR_NULL_CONTEXT;
+        return DGC_ERR_NULL_CONTEXT;
+    }
+    if (brush == DGC_INVALID_BRUSH) {
+        g_last_error = DGC_ERR_INVALID_HANDLE;
+        return DGC_ERR_INVALID_HANDLE;
+    }
+    ctx->brush_colors[brush] = {r, g, b, a};
+    g_last_error = DGC_OK;
+    return DGC_OK;
+}
+
+/* ── v3.0：撤销（留接口不实现，撤销栈归后续任务）── */
+
+int dgcUndo(DgcContext* ctx) {
+    if (ctx == nullptr) {
+        g_last_error = DGC_ERR_NULL_CONTEXT;
+        return DGC_ERR_NULL_CONTEXT;
+    }
+    g_last_error = DGC_ERR_NOT_IMPLEMENTED;
+    return DGC_ERR_NOT_IMPLEMENTED;
 }
 
 }  // extern "C"
