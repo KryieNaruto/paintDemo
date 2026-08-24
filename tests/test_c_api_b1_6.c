@@ -1,9 +1,14 @@
-/* B1-6 纯 C 冒烟：验证 v3.0 新增 8 个函数的返回码语义。
- * 本期口径：离屏/导出/readback/撤销为 NOT_IMPLEMENTED，确定性存参返回 OK，
- * 参数化校验 handle/settingId。真实内核归 B1-7/B2-1/B3-1。 */
+/* B1-6 + B2-1 纯 C 冒烟：验证 v3.0 新增函数的返回码语义。
+ *
+ * B2-1 起离屏/导出/readback 由后端能力决定：
+ *   - Vulkan 后端激活（supportsOffscreen=true）→ 返回 OK；
+ *   - Null 后端（DGCPAIN_RENDER_VULKAN=OFF）→ 返回 NOT_IMPLEMENTED。
+ * 本测试用运行时能力探测（先调 dgcSetOffscreenSurface 看返回）兼容两种配置。
+ * 撤销仍 NOT_IMPLEMENTED；确定性存参返回 OK；参数化校验 handle/settingId。 */
 #include "dgc_paint_c_api.h"
 
 #include <stdio.h>
+#include <string.h>
 
 static int failures = 0;
 
@@ -18,13 +23,35 @@ static int failures = 0;
 int main(void) {
     DgcContext* ctx = dgcCreate();
 
-    /* 离屏 / 导出 / readback / 撤销：本期仅声明 + NOT_IMPLEMENTED。 */
-    CHECK(dgcSetOffscreenSurface(ctx, 64, 64) == DGC_ERR_NOT_IMPLEMENTED,
-          "offscreen -> NOT_IMPLEMENTED");
-    CHECK(dgcExportPNG(ctx, "/tmp/out.png") == DGC_ERR_NOT_IMPLEMENTED,
-          "exportPNG -> NOT_IMPLEMENTED");
-    CHECK(dgcReadbackPixels(ctx, NULL) == DGC_ERR_NOT_IMPLEMENTED,
-          "readback -> NOT_IMPLEMENTED");
+    /* 离屏 / 导出 / readback：按后端能力分支。 */
+    int offscreenRc = dgcSetOffscreenSurface(ctx, 64, 64);
+    if (offscreenRc == DGC_OK) {
+        /* Vulkan 后端：三函数真实实现，返回 OK。 */
+        unsigned char buf[64 * 64 * 4];
+        memset(buf, 0, sizeof(buf));
+        CHECK(dgcReadbackPixels(ctx, buf) == DGC_OK, "readback -> OK (vulkan)");
+        CHECK(dgcExportPNG(ctx, "/tmp/dgc_b2_1_test.png") == DGC_OK,
+              "exportPNG -> OK (vulkan)");
+        /* 非法参数校验：null buffer → INVALID_ARG。 */
+        CHECK(dgcReadbackPixels(ctx, NULL) == DGC_ERR_INVALID_ARG,
+              "readback(NULL) -> INVALID_ARG");
+    } else {
+        /* Null 后端：三函数保持 NOT_IMPLEMENTED（合法参数）。 */
+        unsigned char buf[1];
+        CHECK(offscreenRc == DGC_ERR_NOT_IMPLEMENTED,
+              "offscreen -> NOT_IMPLEMENTED (null backend)");
+        CHECK(dgcExportPNG(ctx, "/tmp/out.png") == DGC_ERR_NOT_IMPLEMENTED,
+              "exportPNG -> NOT_IMPLEMENTED (null backend)");
+        CHECK(dgcReadbackPixels(ctx, buf) == DGC_ERR_NOT_IMPLEMENTED,
+              "readback -> NOT_IMPLEMENTED (null backend)");
+    }
+
+    /* 负尺寸 / 空 path 非法参数校验（独立于后端能力）。 */
+    CHECK(dgcSetOffscreenSurface(ctx, -1, 64) == DGC_ERR_INVALID_ARG,
+          "offscreen(-1) -> INVALID_ARG");
+    CHECK(dgcExportPNG(ctx, NULL) == DGC_ERR_INVALID_ARG, "exportPNG(NULL) -> INVALID_ARG");
+
+    /* 撤销：仍 NOT_IMPLEMENTED（撤销栈归后续任务）。 */
     CHECK(dgcUndo(ctx) == DGC_ERR_NOT_IMPLEMENTED, "undo -> NOT_IMPLEMENTED");
 
     /* 确定性：存参返回 OK。 */
@@ -49,6 +76,8 @@ int main(void) {
           "NULL ctx setBrushSetting -> NULL_CONTEXT");
     CHECK(dgcSetOffscreenSurface(NULL, 64, 64) == DGC_ERR_NULL_CONTEXT,
           "NULL ctx offscreen -> NULL_CONTEXT");
+    CHECK(dgcReadbackPixels(NULL, NULL) == DGC_ERR_NULL_CONTEXT,
+          "NULL ctx readback -> NULL_CONTEXT");
 
     dgcDestroy(ctx);
 

@@ -7,8 +7,8 @@
 #include "core/interfaces/i_paint_kernel.h"
 #include "core/interfaces/i_render_backend.h"
 #include "core/null/null_paint_kernel.h"
-#include "core/null/null_render_backend.h"
 #include "core/types.h"
+#include "render/render_backend_factory.h"
 
 // DgcContext 为不透明句柄，内部定义不对外暴露。kernel/backend 用基类指针持有，
 // 便于 B2-1/B3-1 落地真实后端/内核时替换（现为 Null 桩）。
@@ -51,7 +51,7 @@ DgcContext* dgcCreate(void) {
     g_last_error = DGC_OK;
     DgcContext* ctx = new DgcContext();
     ctx->kernel  = new NullPaintKernel();
-    ctx->backend = new NullRenderBackend();
+    ctx->backend = CreateDefaultRenderBackend();
     ctx->engine  = new Engine(ctx->kernel, ctx->backend);
     ctx->engine->start();
     return ctx;
@@ -218,37 +218,62 @@ const char* dgcGetLastError(void) {
     return errorMessage(g_last_error);
 }
 
-/* ── v3.0：离屏 / 导出 / 像素读回（真实实现归 B2-1，本期 NOT_IMPLEMENTED）── */
+/* ── v3.0：离屏 / 导出 / 像素读回（B2-1 接真实后端）── */
 
 int dgcSetOffscreenSurface(DgcContext* ctx, int w, int h) {
-    (void)w;
-    (void)h;
     if (ctx == nullptr) {
         g_last_error = DGC_ERR_NULL_CONTEXT;
         return DGC_ERR_NULL_CONTEXT;
     }
-    g_last_error = DGC_ERR_NOT_IMPLEMENTED;
-    return DGC_ERR_NOT_IMPLEMENTED;
+    if (w < 0 || h < 0) {
+        g_last_error = DGC_ERR_INVALID_ARG;
+        return DGC_ERR_INVALID_ARG;
+    }
+    if (!ctx->backend->supportsOffscreen()) {
+        g_last_error = DGC_ERR_NOT_IMPLEMENTED;
+        return DGC_ERR_NOT_IMPLEMENTED;
+    }
+    ctx->backend->initOffscreen(w, h);
+    ctx->w = w;
+    ctx->h = h;
+    g_last_error = DGC_OK;
+    return DGC_OK;
 }
 
 int dgcExportPNG(DgcContext* ctx, const char* path) {
-    (void)path;
     if (ctx == nullptr) {
         g_last_error = DGC_ERR_NULL_CONTEXT;
         return DGC_ERR_NULL_CONTEXT;
     }
-    g_last_error = DGC_ERR_NOT_IMPLEMENTED;
-    return DGC_ERR_NOT_IMPLEMENTED;
+    if (path == nullptr) {
+        g_last_error = DGC_ERR_INVALID_ARG;
+        return DGC_ERR_INVALID_ARG;
+    }
+    if (!ctx->backend->supportsOffscreen()) {
+        g_last_error = DGC_ERR_NOT_IMPLEMENTED;
+        return DGC_ERR_NOT_IMPLEMENTED;
+    }
+    ctx->backend->exportPNG(path);
+    g_last_error = DGC_OK;
+    return DGC_OK;
 }
 
 int dgcReadbackPixels(DgcContext* ctx, void* rgbaOut) {
-    (void)rgbaOut;  // 本期不写 rgbaOut
     if (ctx == nullptr) {
         g_last_error = DGC_ERR_NULL_CONTEXT;
         return DGC_ERR_NULL_CONTEXT;
     }
-    g_last_error = DGC_ERR_NOT_IMPLEMENTED;
-    return DGC_ERR_NOT_IMPLEMENTED;
+    if (rgbaOut == nullptr) {
+        g_last_error = DGC_ERR_INVALID_ARG;
+        return DGC_ERR_INVALID_ARG;
+    }
+    if (!ctx->backend->supportsOffscreen()) {
+        g_last_error = DGC_ERR_NOT_IMPLEMENTED;
+        return DGC_ERR_NOT_IMPLEMENTED;
+    }
+    ctx->backend->readback(rgbaOut);
+    g_last_error = DGC_OK;
+    return DGC_OK;
 }
 
 /* ── v3.0：确定性（本期仅存参；ReplayRandom/固定步进内核归 B1-7）── */

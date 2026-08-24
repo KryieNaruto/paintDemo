@@ -1,3 +1,9 @@
+# 运行期找到共享 libshaderc.so.1（自定义前缀场景，如提取的 .deb）。
+# SHADERC_LIBRARY_DIR 由 render/vulkan/CMakeLists.txt 上抛到父作用域。
+if(DEFINED SHADERC_LIBRARY_DIR AND SHADERC_LIBRARY_DIR)
+    list(APPEND CMAKE_BUILD_RPATH "${SHADERC_LIBRARY_DIR}")
+endif()
+
 add_executable(compile_null compile_null.cpp)
 target_include_directories(compile_null PRIVATE ${CMAKE_SOURCE_DIR}) # 让 #include "core/..." 生效（复用既有冒烟源）
 target_link_libraries(compile_null PRIVATE dgc_paint)
@@ -18,7 +24,15 @@ add_executable(test_c_api_header test_c_api_header.c)
 target_link_libraries(test_c_api_header PRIVATE dgc_paint)
 add_test(NAME test_c_api_header COMMAND test_c_api_header)
 
-# 纯 C 冒烟：B1-6 新增 8 个 v3.0 函数的返回码语义。
+# 纯 C 冒烟：B1-6 新增 8 个 v3.0 函数的返回码语义（B2-1 接线离屏三函数）。
 add_executable(test_c_api_b1_6 test_c_api_b1_6.c)
 target_link_libraries(test_c_api_b1_6 PRIVATE dgc_paint)
 add_test(NAME test_c_api_b1_6 COMMAND test_c_api_b1_6)
+
+# B2-1：真实 Vulkan 离屏合成验证（host lavapipe headless）。
+if(DGCPAIN_RENDER_VULKAN AND EXISTS ${CMAKE_SOURCE_DIR}/render/vulkan/CMakeLists.txt)
+    add_executable(test_offscreen test_offscreen.cpp)
+    target_include_directories(test_offscreen PRIVATE ${CMAKE_SOURCE_DIR})
+    target_link_libraries(test_offscreen PRIVATE dgc_paint)
+    add_test(NAME test_offscreen COMMAND test_offscreen)
+endif()
