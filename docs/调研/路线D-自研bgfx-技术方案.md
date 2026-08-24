@@ -274,11 +274,11 @@ endforeach()
 
 **Canvas 布局**：bgfx 内部管理 image layout（Vulkan 的 GENERAL vs SHADER_READ_ONLY 切换由 `Access::ReadWrite` 自动插入 barrier），无需像原生那样手动 transition。这是「少控制」的双面：省心，但也无法做原生级的布局优化。
 
-### 3.e 输入层（Jetpack Ink）
+### 3.e 输入层（Ink Stroke Modeler）
 
 与原生路线**完全一致**（输入层不在本路线的差异范围）。要点沿用规划 §4.6：
-- `androidx.ink:ink-strokes`（纯数据层 `StrokeInputBatch`，含时间戳/压力/倾斜/方向）+ `ink-geometry` + `ink-brush`，**不引入** `ink-rendering`（渲染由 bgfx 替代）。
-- 预测点：`isPredicted` 标记 + 速度外推（~30 行自研）或 `MotionEvent` 历史事件；真实点到达后以真实 stamp 重合成。
+- 白盒移植 `ink-stroke-modeler` 进 `core/stroke_predictor`（纯 C++，Apache-2.0），`StrokeModeler::Update` 取点流（含时间戳/压力/倾斜/方向），`StrokeModeler::Predict` 产出预测点，**不引入**任何 Android-only 输入管线（渲染由 bgfx 替代）。
+- 预测点：`isPredicted` 标记；真实点到达后以真实 stamp 重合成。
 - PC 用 GLFW 鼠标/数位笔，走同一 `StrokePoint` 点流，统一进 `core/ring_buffer.h`。
 
 ---
@@ -287,7 +287,7 @@ endforeach()
 
 ```
 触控笔按下（t=0）
-  → Jetpack Ink 建模 InkStroke（压力/倾斜/时间戳）            ~1–2ms   [输入管线]
+  → Ink Stroke Modeler 平滑预测（压力/倾斜/时间戳）           ~1–2ms   [输入管线]
   → 预测外推（速度外推，标 isPredicted）                     ~0.1ms
   → push 无锁 SPSC ring_buffer                               ~0.01ms
   ── Brush Thread ─────────────────────────────────────────────
@@ -461,7 +461,7 @@ void BgfxBackend::shutdown()            { bgfx::shutdown(); }
 | **D2 · bgfx 合成** | `cs_brush_composite` + `cs_clear_canvas` + offscreen `createFrameBuffer`；固定 stamp 合成出痕迹 | host offscreen 用固定 stamp 合成出笔刷痕迹，CPU 读回 golden 比对通过 |
 | **D3 · 自研内核** | 完成 dab 移植（MVP 核心设置）+ `nlohmann/json` 解析 `.myb`；实现 `IPaintKernel` | JNI 调内核生成 stamp，送入 bgfx compute 可画（offscreen） |
 | **D4 · 平台 + UI** | Android TextureView + ANativeWindow → `platformData.nwh`；PC GLFW；Compose/ImGui UI | 双平台看到 bgfx 画布，UI 切笔刷/颜色 |
-| **D5 · 输入集成** | Jetpack Ink 点流 + 预测覆盖 + PC 输入统一进 ring buffer | 双平台笔迹跟随良好，无感知延迟 |
+| **D5 · 输入集成** | Ink Stroke Modeler 平滑预测 + 预测覆盖 + PC 输入统一进 ring buffer | 双平台笔迹跟随良好，无感知延迟 |
 | **D6 · 全链路 + 性能** | 压测 + AGI/RenderDoc/高速摄影测 §3.3 全部指标；产出性能报告 | 满足 §3.3；输出「D vs E」渲染后端实测对比 |
 
 > 阶段 D0–D3 与路线 E 高度重叠（dab 移植共享），**若两线并行，dab 移植可复用同一份代码**——这再次说明 D 与 E 的边界只在渲染层。

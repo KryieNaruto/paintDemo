@@ -14,8 +14,8 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  输入层 · Jetpack Ink（低延迟点流 / 预测，CPU）                        │
-│  MotionEvent → StrokeInputBatch → 预测 → ring_buffer(StrokePoint)     │
+│  输入层 · Ink Stroke Modeler（平滑预测 / 预测，CPU）                   │
+│  MotionEvent → Update/Predict → 预测 → ring_buffer(StrokePoint)       │
 └──────────────────────────────┬───────────────────────────────────────┘
                                │ StrokePoint {x,y,pressure,tilt_x,tilt_y,t}
                                ▼
@@ -308,8 +308,8 @@ StrokePoint {x, y, pressure, tilt_x, tilt_y, t_us, is_predicted}
 
 ```
 触控笔接触（t=0）
-  → MotionEvent 进入 Ink（含 pressure/tilt/t）
-  → Jetpack Ink 建模 InkStroke + 预测点流          ▸ ~8–12ms（Android 输入管线，预测压低观感）
+  → MotionEvent 进入 Ink Stroke Modeler（含 pressure/tilt/t）
+  → StrokeModeler::Update/Predict 平滑预测点流    ▸ ~8–12ms（输入管线，预测压低观感）
   → StrokePoint push ring_buffer                    ▸ ~0.05ms（无锁 SPSC）
   → 参数层生成 DabVertex 流（形态一 CPU / 形态二 GPU）▸ <0.1ms（每点几个 float）
   → DabVertex 写入 SSBO（一次 memcpy）               ▸ <0.1ms（原始属性远小于 stamp 纹理）

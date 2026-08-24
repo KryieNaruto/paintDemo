@@ -1,7 +1,7 @@
 # 环境搭建说明书（SDK 编译环境）
 
 > 适用范围：本仓库 `libdgc_paint` SDK 的 **host 编译环境**（Linux host + Windows VS2026）。
-> 不含消费者（Compose / GLFW / ImGui / Jetpack Ink / JDK）的安装——那些属于 UI 层，本 SDK 不依赖。
+> 不含消费者（Compose / GLFW / ImGui / JDK）的安装——那些属于 UI 层，本 SDK 不依赖（输入平滑已下沉到 SDK 内核 `core/stroke_predictor`）。
 > 依据：`DGCPaint_技术规划.md` §1、§2；`docs/调研/路线整理.md` §7；任务书 `docs/tasks/detail/环境搭建与项目骨架.md` E0-1。
 > 换机后照本文档即可搭好 SDK 编译环境。本文档不建工程，不新增任何 `CMakeLists.txt`。
 

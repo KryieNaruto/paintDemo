@@ -13,7 +13,7 @@
 
 DGCamp Paint 工具的完整需求中，绘画功能是核心。本阶段剔除社交/社区、项目管理、图层、文件读写，只做**绘画原型机**，用于验证一个关键技术假设：
 
-> **libmypaint（笔刷引擎）+ Jetpack Ink（低延迟输入）+ Vulkan Compute Shader（GPU 笔刷合成）三者组合，能否达到 Procreate 级别的绘画手感。**
+> **libmypaint（笔刷引擎）+ Ink Stroke Modeler（平滑预测）+ Vulkan Compute Shader（GPU 笔刷合成）三者组合，能否达到 Procreate 级别的绘画手感。**
 
 目标平台为 **Android 平板**。这是一个"技术验证型原型"，不是产品 MVP——核心交付物是「能画 + 能测延迟/帧率」的最小闭环，用于评估技术路线的可行性，而非完成产品功能。
 
@@ -40,7 +40,7 @@ DGCamp Paint 工具的完整需求中，绘画功能是核心。本阶段剔除�
 | 平台 | **Android 平板 + PC（双平台）** | 平台无关核心 + 平台层插拔 |
 | UI（Android Pad） | Jetpack Compose | 平板优先，横向布局 |
 | UI（PC） | **ImGui**（GLFW 窗口） | 轻量，直接贴 Vulkan 渲染结果 |
-| 输入（Android） | Jetpack Ink（`androidx.ink` 1.0.0 stable） | 低延迟输入/预测，底层 graphics-core |
+| 输入（Android） | Ink Stroke Modeler（白盒移植 C++） | 平滑预测，跨平台，纯 C++ 内核 |
 | 输入（PC） | GLFW 鼠标 / 数位笔 | 走同一输入点流 |
 | 笔刷引擎 | **路线 E：白盒移植 libmypaint（自研 C++，CPU dab）** | 实现 `IPaintKernel`，**可插拔** |
 | 渲染 | **Vulkan 原生** | 实现 `IRenderBackend`，**可插拔** |
@@ -136,7 +136,7 @@ DGCPaintPrototype/
 │   │   └── i_platform.h
 │   ├── types.h                         # StrokePoint / BrushParams / StampData
 │   ├── engine.h/.cpp                   # 3 线程模型编排
-│   ├── stroke_predictor.h/.cpp         # 速度外推预测
+│   ├── stroke_predictor.h/.cpp         # 白盒移植 Ink Stroke Modeler 平滑预测
 │   ├── ring_buffer.h                   # 无锁 SPSC 队列
 │   └── determinism.h/.cpp              # v3.0：seed 注入 + 固定时间戳（确定性）
 │
@@ -199,7 +199,7 @@ DGCPaintPrototype/
 │       ├── java/com/dgcamp/paint/
 │       │   ├── MainActivity.kt
 │       │   ├── ui/                     # CanvasView / BrushPanel / ColorPicker
-│       │   └── input/InkHandler.kt
+│       │   └── input/InputHandler.kt
 │       └── res/
 │
 ├── shaders/                            # 各路线 shader 来源
@@ -507,7 +507,7 @@ v3.0 在 §4.0 之上加一层 **C API 边界**，UI 与 CLI 统一走 C API：
 ```
 ┌───────────────────────┐   ┌───────────────────────┐   ┌───────────────────────┐
 │  Android UI           │   │  PC ImGui UI          │   │  cli/dgc_cli（新增）    │
-│  Compose + Ink        │   │  （GLFW 窗口）         │   │  JSON 脚本 → C API      │
+│  Compose + InputHandler │   │  （GLFW 窗口）         │   │  JSON 脚本 → C API      │
 │  ↓ JNI 调 C API       │   │  ↓ 直调 C API         │   │  → 离屏 → PNG           │
 ├───────────────────────┴───┴───────────────────────┴───┴───────────────────────┤
 │                      dgc_paint SDK（C API 边界）                               │
@@ -699,8 +699,8 @@ JSON 脚本示例：
 │                   Native 层（3 线程模型）                       │
 │  ┌────────────────┐  ┌────────────────┐  ┌─────────────────┐  │
 │  │ Input Thread   │  │ Brush Thread   │  │ Render Thread   │  │
-│  │ Jetpack Ink    │→│ 自研 C++ 内核   │→│ Vulkan          │  │
-│  │ 预测点流        │  │ strokeTo       │  │ compute 合成     │  │
+│  │ Ink Stroke     │→│ 自研 C++ 内核   │→│ Vulkan          │  │
+│  │ Modeler 平滑预测│  │ strokeTo       │  │ compute 合成     │  │
 │  │ (ring buffer)  │  │ (ring buffer)  │  │ → present       │  │
 │  └────────────────┘  └────────────────┘  └─────────────────┘  │
 └────────────────────────────────────────────────────────────────┘
@@ -710,7 +710,7 @@ JSON 脚本示例：
 
 ```
 触控笔按下 (MotionEvent)
-  → InkHandler 接收 → Jetpack Ink 建模 InkStroke
+  → InputHandler 接收 → Ink Stroke Modeler 平滑预测 → 预测点流
   → 预测点流 push 到 ring_buffer（含预测点，标 isPredicted）
   → Brush Thread 取点 → 自研内核 Brush::strokeTo(x,y,pressure,tilt)
   → 生成 StampData {x,y,radius,opacity,color,hardness}
@@ -721,9 +721,9 @@ JSON 脚本示例：
   → vkQueuePresent → 屏幕
 ```
 
-### 4.3 Compose 集成 Vulkan
+### 4.3 输入集成与线程模型
 
-- **TextureView**（非 SurfaceView）：与 Compose 通过 SurfaceFlinger 合成，集成简单，原型够用。
+- **TextureView**（非 SurfaceView）：接收 MotionEvent 后走 InputHandler → Ink Stroke Modeler 预测，再入 ring buffer。
 - `onSurfaceTextureAvailable` 时创建 Render Thread，`onSurfaceTextureDestroyed` 时销毁。
 - Vulkan surface 用 `VK_KHR_android_surface`（从 `ANativeWindow_fromSurface` 获取）。
 
@@ -788,15 +788,18 @@ void main() {
 - workgroup 8×8，覆盖 stamp 包围盒；只 dispatch 包围盒范围。
 - 大 canvas（如 4K）时分 tile dispatch。
 
-### 4.6 Jetpack Ink 集成
+### 4.6 Ink Stroke Modeler 集成（白盒移植）
 
-| 模块 | 包名 | 是否使用 | 说明 |
-|---|---|---|---|
-| strokes | `androidx.ink.strokes` | ✅ 核心 | **纯输入数据层**：`StrokeInputBatch` |
-| geometry | `androidx.ink.geometry` | ✅ 依赖 | `PartitionedMesh` 等几何 |
-| brush | `androidx.ink.brush` | ✅ 仅类型 | `Brush`/`BrushFamily` 类型定义 |
-| authoring | `androidx.ink.authoring` | ⚠️ 可选 | `InProgressStrokesView` |
-| rendering | `androidx.ink.rendering` | ❌ **不用** | 由我们的 Vulkan 渲染替代 |
+白盒移植 `ink-stroke-modeler` 的平滑预测算法进 `core/stroke_predictor`：
+
+| 模块 | 来源 | 替代方案 |
+|---|---|---|
+| wobble smoothing | `ink_stroke_modeler::WobbleSmoother` | 移植到 `core/stroke_predictor`，低通滤波 → 时间变权移动平均 |
+| 重采样 | `ink_stroke_modeler::SamplingParams` | 移植到 `core/stroke_predictor`，固定 `min_output_rate` 上采样 |
+| 位置模型 | `ink_stroke_modeler::PositionModeler` | 移植到 `core/stroke_predictor`，弹簧质点 + 欧拉积分 |
+| 预测器 | `ink_stroke_modeler::KalmanPredictor` / `StrokeEndPredictor` | 移植到 `core/stroke_predictor`，绘画场景调参 |
+| 依赖 | Abseil（`absl::StatusOr`） | 白盒替换为 `std::expected` 或自研轻量替代 |
+| 确定性 | 固定步长欧拉积分，**无随机** | 天然适配 B1-7 `dgcSetRandomSeed`/`dgcSetFixedTime` |
 
 ### 4.7 线程模型与同步
 
@@ -819,7 +822,7 @@ void main() {
 
 | 组 | 路线 | 共享中间层 | 差异点 | 切换成本 |
 |----|------|-----------|--------|---------|
-| **组1** | **A ↔ E** | L0-L4+L6 全共享（含 render/vulkan/） | 仅 L5 内核：`kernels/mypaint/` ↔ `kernels/brush/` | **极低**：CMake option |
+| **组1** | **A ↔ E** | L0-L4+L6 全共享（含 render/vulkan/ + stroke_predictor） | 仅 L5 内核：`kernels/mypaint/` ↔ `kernels/brush/` | **极低**：CMake option |
 | 组2 | C | L0-L3+L6 共享 | L4: `render/skia/` + L5: `kernels/mypaint/` | 低 |
 | 组3 | D | L0-L3+L6 共享 | L4: `render/bgfx/` + L5: `kernels/brush/` | 低 |
 | 组4 | B | L0-L3+L6 共享 | L4 适配 + L5: `kernels/gpu/` + **需 IGpuContext 中间层** | 高 |
@@ -843,7 +846,7 @@ void main() {
 ```
 第一期（主线）：
   共享底座（L0-L3+L6） + 路线 E（kernels/brush/ + render/vulkan/）
-  → 验证「libmypaint 算法 + Ink + Vulkan compute」能否达 Procreate 级别手感
+  → 验证「libmypaint 算法 + Ink Stroke Modeler 平滑预测 + Vulkan compute」能否达 Procreate 级别手感
 
 第二期（备选）：
   路线 A 的 host 版作对照测试工具（仅用于 E 的移植正确性验证）
@@ -860,7 +863,7 @@ void main() {
 
 ### 阶段 0 · 技术风险 spike（最高优先，先做）
 
-**目标**：验证两大项——(a) Jetpack Ink 预测点获取方式；(b) 白盒移植核心 `stroke_to` 算法的手感基线。
+**目标**：验证两大项——(a) Ink Stroke Modeler 预测参数调优（绘画场景 vs 手写）；(b) 白盒移植核心 `stroke_to` 算法的手感基线。
 
 - 交付：结论文档（预测点来源：自研外推 vs MotionEvent 历史）+ **host oracle 对照测试框架**（libmypaint host 版 dump dab 参数序列，与自研 C++ 内核 diff）
 - **验收**：两篇结论各自成立；单 dab / 单段 / 整条 stroke 三级对照测试 diff ≤ 1e-5 全绿（`ctest`）
@@ -895,8 +898,8 @@ void main() {
 
 ### 阶段 5 · 输入集成
 
-- Android Jetpack Ink 点流 + PC 鼠标/数位笔输入，统一进 ring buffer
-- 预测点覆盖策略（`isPredicted` 标记 + 真实点重合成）
+- Android 原始 MotionEvent 点流 + PC 鼠标/数位笔输入，统一进 ring buffer → Ink Stroke Modeler 预测
+- Ink Stroke Modeler 预测参数调优（spring_mass / drag / Kalman confidence 按绘画场景标定）
 - **验收**：双平台笔迹跟随良好，无明显可感知延迟
 
 ### 阶段 6 · 全链路 + 性能测试
@@ -936,7 +939,7 @@ void main() {
 |---|---|---|
 | 移植正确性（浮点/随机偏差）——路线 E 最大风险 | 中 | host oracle 对照 diff dab 参数序列，CI 自动回归 |
 | CPU dab 性能不达 P5 <3ms | 中 | LUT 预计算 / 冗余 dab 合并 / SIMD / 帧预算上限 |
-| Jetpack Ink 预测点未暴露独立 API | 低 | 自研速度外推或 MotionEvent 历史 |
+| Ink Stroke Modeler 绘画场景调参（手写平滑→绘画保真） | 中 | 白盒移植后参数可调：spring_mass / drag / Kalman confidence |
 | TextureView 多一次合成拷贝导致延迟超标 | 中 | 阶段 5 评估 SurfaceView 独立 surface |
 | Compute 在低端 Mali GPU 性能不足 | 中 | 包围盒 dispatch + tile 化；baseline 先锁 Adreno |
 | 预测点与真实点合成冲突产生拖影 | 中 | 预测 stamp 标记 isPredicted，真实点重合成覆盖 |
@@ -961,7 +964,7 @@ void main() {
 
 ## 9. 参考资源
 
-- [Jetpack Ink 官方文档（Android Developers）](https://developer.android.com/develop/ui/compose/touch-input/stylus-input/about-ink-api)
+- [Ink Stroke Modeler（GitHub）](https://github.com/google/ink-stroke-modeler) — C++ 平滑预测库，Apache-2.0
 - [mypaint_ffi（libmypaint Android 移植参考实现）](https://pub.dev/packages/mypaint_ffi)
 - [MyPaint 社区：How to make it for Android](https://community.mypaint.app/t/how-to-make-it-for-android/3965)
 - [LunarG Vulkan SDK](https://vulkan.lunarg.com/)

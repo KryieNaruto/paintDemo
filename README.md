@@ -70,7 +70,7 @@ cmake --build --preset android-arm64  # 构建 → build/android-arm64/libdgc_pa
 - **SDK 测试在消费仓库须关掉**：SDK `tests/` 用 `CMAKE_SOURCE_DIR` 指消费仓库根，被 `add_subdirectory(sdk)` 消费时 include 会失效。消费仓库构建加 `-DDGCPAIN_BUILD_TESTS=OFF`（已写入两个消费者 README）。
 - **Android 构建需 `ANDROID_NDK_HOME`**：开发服务器 NDK 在 `/usr/lib/android-sdk/ndk/28.2.13676358`，需 `export` 后才能 `cmake --preset android-arm64`。
 - **submodule 钉 commit 禁漂 main**：消费仓库 sdk/ 钉 `43500e5`；SDK main 后续推进不自动同步，更新需显式重钉。
-- **技术规划在途改动**：`DGCPaint_技术规划.md` 有一处未提交修订（输入方案 Jetpack Ink → Ink Stroke Modeler 白盒移植，对齐 B1-5），提交前需人工确认。
+- **输入方案已定**：输入平滑预测采用 **Ink Stroke Modeler 白盒移植**（`core/stroke_predictor`，对齐 B1-5），不再依赖 Jetpack Ink（Android-only 输入管线）。全仓库文档已同步。
 
 ---
 
