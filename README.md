@@ -43,6 +43,37 @@ cmake --build --preset android-arm64  # 构建 → build/android-arm64/libdgc_pa
 
 ---
 
+## 工作进度快照（其他会话先看这节）
+
+> 更新：2026-08-23。任务状态以 `.exec/taskline.py status` 为准；本节为「会话交接」快照。
+
+### 任务线：6 完成 / 3 可领 / 0 执行中
+
+| 状态 | 任务 | 说明 |
+|------|------|------|
+| ✅ 已完成 | E0-1 / E0-2 / E0-3 / G0-1 / B1-1 / B1-3 | 环境说明、setup-env.sh、CMake 骨架、git 拓扑、内部类型+接口+Null 桩、engine 三线程+ring_buffer |
+| 🟡 可申领 | **B1-4**（C API 封装 engine+Null）、**B1-5**（stroke_predictor+单测）、**B3-1**（自研笔刷内核） | 依赖均已满足，可立即领 |
+
+驱动流水线：`/paint-dev`（5 阶段 agent：claim→plan→execute→test→finish，收尾后停下等人工）。
+
+### 本会话已完成的工作
+
+1. **构建验证（PC + Android 实测通过）**：host-linux 编出 `libdgc_paint.a` + ctest 3/3；android-arm64 用 NDK r28 交叉编译通过。命令见上方「快速构建」。
+2. **消费仓库已建并接入 submodule**（public，见 [docs/git/README.md](docs/git/README.md)）：
+   - `KryieNaruto/paint-pc` → `sdk/` 钉 **43500e5**
+   - `KryieNaruto/paint-android` → `sdk/` 钉 **43500e5**
+   - 两者均为模板骨架（`add_subdirectory(sdk)` + 链接 `dgc_paint`），窗口/输入/JNI 留待消费者任务。
+3. **README 更新**：新增「快速构建（已验证）」。
+
+### 其他会话须知（坑与约定）
+
+- **SDK 测试在消费仓库须关掉**：SDK `tests/` 用 `CMAKE_SOURCE_DIR` 指消费仓库根，被 `add_subdirectory(sdk)` 消费时 include 会失效。消费仓库构建加 `-DDGCPAIN_BUILD_TESTS=OFF`（已写入两个消费者 README）。
+- **Android 构建需 `ANDROID_NDK_HOME`**：开发服务器 NDK 在 `/usr/lib/android-sdk/ndk/28.2.13676358`，需 `export` 后才能 `cmake --preset android-arm64`。
+- **submodule 钉 commit 禁漂 main**：消费仓库 sdk/ 钉 `43500e5`；SDK main 后续推进不自动同步，更新需显式重钉。
+- **技术规划在途改动**：`DGCPaint_技术规划.md` 有一处未提交修订（输入方案 Jetpack Ink → Ink Stroke Modeler 白盒移植，对齐 B1-5），提交前需人工确认。
+
+---
+
 ## 文档索引
 
 | 文档 | 说明 |
