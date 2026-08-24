@@ -36,6 +36,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_library(dgc_paint
     core/null/null_paint_kernel.cpp
     core/null/null_render_backend.cpp
+    core/engine.cpp
 )
 target_include_directories(dgc_paint
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/sdk_api   # 唯一对外 include（B1-4 才放头）
