@@ -259,9 +259,19 @@ main() {
   fi
 
   if ! is_linux; then
-    warn "当前非 Linux 主机（$(uname -s)）。本脚本主战场为 Linux host，跨平台自动安装不属本任务范围。"
-    info "Windows 请打开「Developer Command Prompt for VS 2026」按 docs/env/env-setup.md §3 手动探测/安装。"
-    exit 1
+    case "$(uname -s)" in
+      MINGW*|MSYS*)
+        warn "当前为 Windows（$(uname -s)）。本脚本主战场为 Linux host。"
+        info "请在 Git Bash 内运行 scripts/setup-env-win.sh 一键搭建（自动注入 MSVC 环境）；"
+        info "或按 docs/env/env-setup.md §3 手动探测/安装。"
+        exit 1
+        ;;
+      *)
+        warn "当前非 Linux 主机（$(uname -s)）。本脚本主战场为 Linux host，跨平台自动安装不属本任务范围。"
+        info "Windows 请用 scripts/setup-env-win.sh；其他系统请按 docs/env/env-setup.md 手动。"
+        exit 1
+        ;;
+    esac
   fi
 
   probe_all

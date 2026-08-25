@@ -16,13 +16,20 @@
 
 #include <stdint.h>
 
-/* ── 符号导出宏（B5-1 可见性收紧）──
+/* ── 符号导出宏（B5-1 可见性收紧 + Windows 支持）──
  * 共享库（Android .so / Windows DLL）配合 -fvisibility=hidden，只导出标记 DGC_API 的 C ABI 符号；
- * 头文件仍不暴露任何内部 C++ 类型。host 静态库下宏展开为 visibility("default")（无害，默认即 default）。 */
-#if defined(_WIN32) && defined(DGC_PAINT_BUILDING)
-#  define DGC_API __declspec(dllexport)
-#elif defined(_WIN32)
-#  define DGC_API __declspec(dllimport)
+ * 头文件仍不暴露任何内部 C++ 类型。
+ *   - Windows + DGCPAIN_SHARED：库构建者（DGC_PAINT_BUILDING）→ dllexport，消费者 → dllimport。
+ *   - Windows 静态库（无 DGCPAIN_SHARED）：DGC_API 展开为空，无导入/导出。
+ *   - GCC/Clang（Linux/Android）：visibility("default")（host 静态库下无害，默认即 default）。 */
+#if defined(_WIN32)
+#  if defined(DGCPAIN_SHARED) && defined(DGC_PAINT_BUILDING)
+#    define DGC_API __declspec(dllexport)
+#  elif defined(DGCPAIN_SHARED)
+#    define DGC_API __declspec(dllimport)
+#  else
+#    define DGC_API
+#  endif
 #elif defined(__GNUC__) || defined(__clang__)
 #  define DGC_API __attribute__((visibility("default")))
 #else
