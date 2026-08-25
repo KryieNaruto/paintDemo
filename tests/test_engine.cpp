@@ -1,12 +1,37 @@
 // engine start/stop 冒烟：注入 Null 桩，入队若干点，限时 stop 断言返回（覆盖「不卡死」）。
+// 另含 B5-2 flush drain 屏障单测：提交 N 个 StrokePoint 后 flush()，断言渲染线程
+// composite 轮数追平 N（验证「flush 返回时所有已提交输入已合成」）。
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <thread>
+#include <vector>
 
 #include "core/engine.h"
 #include "core/null/null_paint_kernel.h"
 #include "core/null/null_render_backend.h"
+
+namespace {
+
+// 计数后端：记录 composite 调用轮数（B5-2 flush 屏障单测用）。
+class CountingBackend : public IRenderBackend {
+public:
+    void init(PlatformSurface, int, int) override {}
+    void resize(int, int) override {}
+    void beginFrame() override {}
+    void composite(const std::vector<StampData>&) override { ++composites; }
+    void clearCanvas() override {}
+    void present() override {}
+    void shutdown() override {}
+    void initOffscreen(int, int) override {}
+    void readback(void*) override {}
+    void exportPNG(const char*) override {}
+
+    std::atomic<int> composites{0};
+};
+
+}  // namespace
 
 int main() {
     NullPaintKernel  kernel;
@@ -53,6 +78,32 @@ int main() {
     assert(e.running());
     e.stop();
     assert(!e.running());
+
+    // B5-2：flush drain 屏障。NullPaintKernel 每 StrokePoint 仍 push 一个空 stamp 批，
+    // 故每个 StrokePoint → 一次 composite。flush 应阻塞至 composite 轮数追平提交数。
+    {
+        NullPaintKernel  kernel2;
+        CountingBackend  backend2;
+        Engine e2(&kernel2, &backend2);
+        e2.start();
+
+        StrokePoint p{};
+        p.x = 3.0f;
+        p.y = 4.0f;
+        p.pressure = 0.25f;
+
+        constexpr int kPoints = 256;
+        assert(e2.submitInput({StrokeEventType::BeginStroke, p}));
+        for (int i = 0; i < kPoints; ++i) {
+            assert(e2.submitInput({StrokeEventType::StrokePoint, p}));
+        }
+        assert(e2.submitInput({StrokeEventType::EndStroke, p}));
+
+        e2.flush();  // 阻塞至全部 kPoints 个 StrokePoint 合成完毕。
+        assert(backend2.composites.load() == kPoints);
+
+        e2.stop();
+    }
 
     return 0;
 }

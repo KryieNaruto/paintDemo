@@ -97,6 +97,11 @@ int dgcSetBrushColor(DgcContext* ctx, DgcBrush brush, float r, float g, float b,
 /* ── v3.0：撤销（留接口不实现，撤销栈归后续任务）── */
 int dgcUndo(DgcContext* ctx);
 
+/* ── v3.0：flush/drain 屏障（B5-2 第 23 函数，additive）──
+ * 阻塞至所有已提交笔画输入已被渲染线程合成完毕，供离屏「入队 → export」的同步读回。
+ * 引擎未运行时无需等待，直接返回 DGC_OK；ctx 为 NULL 返回 DGC_ERR_NULL_CONTEXT。 */
+int dgcFlush(DgcContext* ctx);
+
 #ifdef __cplusplus
 }
 #endif

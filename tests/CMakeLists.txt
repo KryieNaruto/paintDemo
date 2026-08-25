@@ -47,3 +47,16 @@ add_executable(test_determinism test_determinism.cpp)
 target_include_directories(test_determinism PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(test_determinism PRIVATE dgc_paint)
 add_test(NAME test_determinism COMMAND test_determinism)
+
+# B5-2：CLI 集成测试（shell 调 dgc_cli 二进制，不编译 script_runner.cpp 进本目标）。
+# 需 dgc_cli 已建（DGCPAIN_BUILD_CLI=ON 且顶层 add_subdirectory(cli) 先于 tests）。
+if(DGCPAIN_BUILD_CLI AND TARGET dgc_cli)
+    add_executable(test_cli test_cli.cpp)
+    target_include_directories(test_cli PRIVATE ${CMAKE_SOURCE_DIR})
+    target_link_libraries(test_cli PRIVATE dgc_paint)
+    target_compile_definitions(test_cli PRIVATE
+        DGC_CLI_PATH="$<TARGET_FILE:dgc_cli>"
+        DGC_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+    add_dependencies(test_cli dgc_cli)
+    add_test(NAME test_cli COMMAND test_cli)
+endif()
