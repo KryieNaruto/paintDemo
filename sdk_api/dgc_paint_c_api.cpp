@@ -4,6 +4,7 @@
 #include <memory>
 #include <unordered_map>
 
+#include "core/determinism.h"
 #include "core/engine.h"
 #include "core/interfaces/i_paint_kernel.h"
 #include "core/interfaces/i_render_backend.h"
@@ -28,10 +29,13 @@ struct DgcContext::Impl {
     std::unique_ptr<Engine>         engine;
     int w = 0;
     int h = 0;
-    // B1-6 新增：确定性 + 参数化存参（真实内核/渲染机制归 B1-7/B2-1/B3-1）。
-    uint64_t random_seed    = 0;
-    double   fixed_time_us  = 0.0;
-    bool     fixed_time_set = false;  // 对齐 §4.0.3 override_time
+    // B1-7 新增：确定性机制（core/determinism.h）。B1-6 的随机种子/固定时间存参已收敛
+    // 到 DeterminismState（seed/fixed_time_us/override_time）。rng 由 unique_ptr 持有，
+    // determinism/time_stepper 为值成员；声明序在 engine 之后（rng 为纯值型随机源，
+    // 与线程无交互，析构顺序无敏感点）。
+    std::unique_ptr<IRandomSource> rng;         // RAII 持有；dgcSetRandomSeed 重建/重播种
+    DeterminismState determinism;               // §4.0.3 值成员
+    FixedTimeStepper  time_stepper;             // 固定时间步进
     std::unordered_map<DgcBrush, std::array<double, DGC_SETTING_COUNT>> brush_settings;
     std::unordered_map<DgcBrush, std::array<float, 4>>                  brush_colors;
 };
@@ -69,6 +73,7 @@ DgcContext* dgcCreate(void) {
     impl->kernel  = std::make_unique<NullPaintKernel>();
     impl->backend = CreateDefaultRenderBackend();  // unique_ptr<IRenderBackend>
     impl->engine  = std::make_unique<Engine>(impl->kernel.get(), impl->backend.get());
+    impl->rng     = std::make_unique<Mt19937Random>(0);  // 默认 seed 0
     impl->engine->start();
     ctx->impl_ = std::move(impl);
     return ctx.release();
@@ -130,6 +135,10 @@ int dgcBeginStroke(DgcContext* ctx, float x, float y, float pressure, float tilt
         g_last_error = DGC_ERR_QUEUE_FULL;
         return DGC_ERR_QUEUE_FULL;
     }
+    // B1-7：每笔画开始把固定时间步进器归零（仅在 C API 调用线程推进，与引擎三线程
+    // 无共享；fixed_time_us/override_time 在此读一次快照）。
+    ctx->impl_->time_stepper.beginStroke(ctx->impl_->determinism.fixed_time_us,
+                                         ctx->impl_->determinism.override_time);
     g_last_error = DGC_OK;
     return DGC_OK;
 }
@@ -139,7 +148,8 @@ int dgcStrokeTo(DgcContext* ctx, float x, float y, float pressure, float tiltX, 
         g_last_error = DGC_ERR_NULL_CONTEXT;
         return DGC_ERR_NULL_CONTEXT;
     }
-    StrokePoint p{x, y, pressure, tiltX, tiltY, 0, (isPredicted != 0)};
+    // B1-7：t_us 由固定时间步进器产出（override 时 n*step，否则 0）。
+    StrokePoint p{x, y, pressure, tiltX, tiltY, ctx->impl_->time_stepper.next(), (isPredicted != 0)};
     StrokeEvent ev{StrokeEventType::StrokePoint, p};
     if (!ctx->impl_->engine->submitInput(ev)) {
         g_last_error = DGC_ERR_QUEUE_FULL;
@@ -292,14 +302,15 @@ int dgcReadbackPixels(DgcContext* ctx, void* rgbaOut) {
     return DGC_OK;
 }
 
-/* ── v3.0：确定性（本期仅存参；ReplayRandom/固定步进内核归 B1-7）── */
+/* ── v3.0：确定性（B1-7 接线：注入/重播种 Mt19937Random + 固定时间步进）── */
 
 int dgcSetRandomSeed(DgcContext* ctx, uint64_t seed) {
     if (ctx == nullptr) {
         g_last_error = DGC_ERR_NULL_CONTEXT;
         return DGC_ERR_NULL_CONTEXT;
     }
-    ctx->impl_->random_seed = seed;
+    ctx->impl_->determinism.seed = seed;
+    ctx->impl_->rng = std::make_unique<Mt19937Random>(seed);  // 重建（旧 unique_ptr 自动释放）
     g_last_error = DGC_OK;
     return DGC_OK;
 }
@@ -309,8 +320,8 @@ int dgcSetFixedTime(DgcContext* ctx, double t_us) {
         g_last_error = DGC_ERR_NULL_CONTEXT;
         return DGC_ERR_NULL_CONTEXT;
     }
-    ctx->impl_->fixed_time_us  = t_us;
-    ctx->impl_->fixed_time_set = true;
+    ctx->impl_->determinism.fixed_time_us = t_us;
+    ctx->impl_->determinism.override_time = true;
     g_last_error = DGC_OK;
     return DGC_OK;
 }
