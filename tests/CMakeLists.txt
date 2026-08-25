@@ -36,3 +36,8 @@ if(DGCPAIN_RENDER_VULKAN AND EXISTS ${CMAKE_SOURCE_DIR}/render/vulkan/CMakeLists
     target_link_libraries(test_offscreen PRIVATE dgc_paint)
     add_test(NAME test_offscreen COMMAND test_offscreen)
 endif()
+
+# B1-8 所有权压力测试：多轮 create/destroy 无泄漏、无崩溃（ASan/LSan 兜底）。
+add_executable(test_ownership_loop test_ownership_loop.c)
+target_link_libraries(test_ownership_loop PRIVATE dgc_paint)
+add_test(NAME test_ownership_loop COMMAND test_ownership_loop)

@@ -1,6 +1,7 @@
 #include "sdk_api/dgc_paint_c_api.h"
 
 #include <array>
+#include <memory>
 #include <unordered_map>
 
 #include "core/engine.h"
@@ -10,14 +11,23 @@
 #include "core/types.h"
 #include "render/render_backend_factory.h"
 
-// DgcContext 为不透明句柄，内部定义不对外暴露。kernel/backend 用基类指针持有，
+// DgcContext 为不透明句柄，内部定义不对外暴露。经典 Pimpl：唯一数据成员是
+// std::unique_ptr<Impl>，Impl 定义留在本 cpp 内。kernel/backend 用 unique_ptr 持有，
 // 便于 B2-1/B3-1 落地真实后端/内核时替换（现为 Null 桩）。
 struct DgcContext {
-    IPaintKernel*   kernel  = nullptr;
-    IRenderBackend* backend = nullptr;
-    Engine*         engine  = nullptr;
-    int             w = 0;
-    int             h = 0;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+    ~DgcContext();
+};
+
+struct DgcContext::Impl {
+    // 声明序 = kernel → backend → engine：C++ 逆声明序析构 = engine（先 stop/join 三线程，
+    // 仍持有 kernel/backend 存活）→ backend → kernel，与既有释放顺序一致。
+    std::unique_ptr<IPaintKernel>   kernel;
+    std::unique_ptr<IRenderBackend> backend;
+    std::unique_ptr<Engine>         engine;
+    int w = 0;
+    int h = 0;
     // B1-6 新增：确定性 + 参数化存参（真实内核/渲染机制归 B1-7/B2-1/B3-1）。
     uint64_t random_seed    = 0;
     double   fixed_time_us  = 0.0;
@@ -25,6 +35,10 @@ struct DgcContext {
     std::unordered_map<DgcBrush, std::array<double, DGC_SETTING_COUNT>> brush_settings;
     std::unordered_map<DgcBrush, std::array<float, 4>>                  brush_colors;
 };
+
+// 析构器必须在 Impl 完整后定义（unique_ptr<Impl> + 不完整类型，否则隐式析构在声明处
+// 实例化会因 incomplete type 编译失败）。
+DgcContext::~DgcContext() = default;
 
 namespace {
 
@@ -49,25 +63,27 @@ extern "C" {
 
 DgcContext* dgcCreate(void) {
     g_last_error = DGC_OK;
-    DgcContext* ctx = new DgcContext();
-    ctx->kernel  = new NullPaintKernel();
-    ctx->backend = CreateDefaultRenderBackend();
-    ctx->engine  = new Engine(ctx->kernel, ctx->backend);
-    ctx->engine->start();
-    return ctx;
+    // 全部用 unique_ptr 栈上构建：任一构造/start() 抛异常时已建对象自动析构，零泄漏。
+    auto ctx  = std::make_unique<DgcContext>();
+    auto impl = std::make_unique<DgcContext::Impl>();
+    impl->kernel  = std::make_unique<NullPaintKernel>();
+    impl->backend = CreateDefaultRenderBackend();  // unique_ptr<IRenderBackend>
+    impl->engine  = std::make_unique<Engine>(impl->kernel.get(), impl->backend.get());
+    impl->engine->start();
+    ctx->impl_ = std::move(impl);
+    return ctx.release();
 }
 
 void dgcDestroy(DgcContext* ctx) {
     if (ctx == nullptr) {
         return;
     }
-    if (ctx->engine != nullptr) {
-        ctx->engine->stop();
-        delete ctx->engine;
+    // 经 unique_ptr 析构器自动释放；engine->stop() 幂等，impl_.reset() 幂等。
+    std::unique_ptr<DgcContext> guard(ctx);
+    if (guard->impl_ && guard->impl_->engine) {
+        guard->impl_->engine->stop();
     }
-    delete ctx->backend;
-    delete ctx->kernel;
-    delete ctx;
+    guard->impl_.reset();
 }
 
 int dgcSetSurface(DgcContext* ctx, void* nativeWindow, int w, int h) {
@@ -79,10 +95,10 @@ int dgcSetSurface(DgcContext* ctx, void* nativeWindow, int w, int h) {
         g_last_error = DGC_ERR_INVALID_ARG;
         return DGC_ERR_INVALID_ARG;
     }
-    ctx->w = w;
-    ctx->h = h;
+    ctx->impl_->w = w;
+    ctx->impl_->h = h;
     // Null 后端接受 nativeWindow == NULL（headless）。
-    ctx->backend->init(nativeWindow, w, h);
+    ctx->impl_->backend->init(nativeWindow, w, h);
     g_last_error = DGC_OK;
     return DGC_OK;
 }
@@ -96,9 +112,9 @@ int dgcResize(DgcContext* ctx, int w, int h) {
         g_last_error = DGC_ERR_INVALID_ARG;
         return DGC_ERR_INVALID_ARG;
     }
-    ctx->w = w;
-    ctx->h = h;
-    ctx->backend->resize(w, h);
+    ctx->impl_->w = w;
+    ctx->impl_->h = h;
+    ctx->impl_->backend->resize(w, h);
     g_last_error = DGC_OK;
     return DGC_OK;
 }
@@ -110,7 +126,7 @@ int dgcBeginStroke(DgcContext* ctx, float x, float y, float pressure, float tilt
     }
     StrokePoint p{x, y, pressure, tiltX, tiltY, 0, false};
     StrokeEvent ev{StrokeEventType::BeginStroke, p};
-    if (!ctx->engine->submitInput(ev)) {
+    if (!ctx->impl_->engine->submitInput(ev)) {
         g_last_error = DGC_ERR_QUEUE_FULL;
         return DGC_ERR_QUEUE_FULL;
     }
@@ -125,7 +141,7 @@ int dgcStrokeTo(DgcContext* ctx, float x, float y, float pressure, float tiltX, 
     }
     StrokePoint p{x, y, pressure, tiltX, tiltY, 0, (isPredicted != 0)};
     StrokeEvent ev{StrokeEventType::StrokePoint, p};
-    if (!ctx->engine->submitInput(ev)) {
+    if (!ctx->impl_->engine->submitInput(ev)) {
         g_last_error = DGC_ERR_QUEUE_FULL;
         return DGC_ERR_QUEUE_FULL;
     }
@@ -140,7 +156,7 @@ int dgcEndStroke(DgcContext* ctx) {
     }
     StrokePoint p{};
     StrokeEvent ev{StrokeEventType::EndStroke, p};
-    if (!ctx->engine->submitInput(ev)) {
+    if (!ctx->impl_->engine->submitInput(ev)) {
         g_last_error = DGC_ERR_QUEUE_FULL;
         return DGC_ERR_QUEUE_FULL;
     }
@@ -209,7 +225,7 @@ int dgcClear(DgcContext* ctx, float r, float g, float b, float a) {
         g_last_error = DGC_ERR_NULL_CONTEXT;
         return DGC_ERR_NULL_CONTEXT;
     }
-    ctx->backend->clearCanvas();
+    ctx->impl_->backend->clearCanvas();
     g_last_error = DGC_OK;
     return DGC_OK;
 }
@@ -229,13 +245,13 @@ int dgcSetOffscreenSurface(DgcContext* ctx, int w, int h) {
         g_last_error = DGC_ERR_INVALID_ARG;
         return DGC_ERR_INVALID_ARG;
     }
-    if (!ctx->backend->supportsOffscreen()) {
+    if (!ctx->impl_->backend->supportsOffscreen()) {
         g_last_error = DGC_ERR_NOT_IMPLEMENTED;
         return DGC_ERR_NOT_IMPLEMENTED;
     }
-    ctx->backend->initOffscreen(w, h);
-    ctx->w = w;
-    ctx->h = h;
+    ctx->impl_->backend->initOffscreen(w, h);
+    ctx->impl_->w = w;
+    ctx->impl_->h = h;
     g_last_error = DGC_OK;
     return DGC_OK;
 }
@@ -249,11 +265,11 @@ int dgcExportPNG(DgcContext* ctx, const char* path) {
         g_last_error = DGC_ERR_INVALID_ARG;
         return DGC_ERR_INVALID_ARG;
     }
-    if (!ctx->backend->supportsOffscreen()) {
+    if (!ctx->impl_->backend->supportsOffscreen()) {
         g_last_error = DGC_ERR_NOT_IMPLEMENTED;
         return DGC_ERR_NOT_IMPLEMENTED;
     }
-    ctx->backend->exportPNG(path);
+    ctx->impl_->backend->exportPNG(path);
     g_last_error = DGC_OK;
     return DGC_OK;
 }
@@ -267,11 +283,11 @@ int dgcReadbackPixels(DgcContext* ctx, void* rgbaOut) {
         g_last_error = DGC_ERR_INVALID_ARG;
         return DGC_ERR_INVALID_ARG;
     }
-    if (!ctx->backend->supportsOffscreen()) {
+    if (!ctx->impl_->backend->supportsOffscreen()) {
         g_last_error = DGC_ERR_NOT_IMPLEMENTED;
         return DGC_ERR_NOT_IMPLEMENTED;
     }
-    ctx->backend->readback(rgbaOut);
+    ctx->impl_->backend->readback(rgbaOut);
     g_last_error = DGC_OK;
     return DGC_OK;
 }
@@ -283,7 +299,7 @@ int dgcSetRandomSeed(DgcContext* ctx, uint64_t seed) {
         g_last_error = DGC_ERR_NULL_CONTEXT;
         return DGC_ERR_NULL_CONTEXT;
     }
-    ctx->random_seed = seed;
+    ctx->impl_->random_seed = seed;
     g_last_error = DGC_OK;
     return DGC_OK;
 }
@@ -293,8 +309,8 @@ int dgcSetFixedTime(DgcContext* ctx, double t_us) {
         g_last_error = DGC_ERR_NULL_CONTEXT;
         return DGC_ERR_NULL_CONTEXT;
     }
-    ctx->fixed_time_us  = t_us;
-    ctx->fixed_time_set = true;
+    ctx->impl_->fixed_time_us  = t_us;
+    ctx->impl_->fixed_time_set = true;
     g_last_error = DGC_OK;
     return DGC_OK;
 }
@@ -314,7 +330,7 @@ int dgcSetBrushSetting(DgcContext* ctx, DgcBrush brush, int settingId, double va
         g_last_error = DGC_ERR_INVALID_HANDLE;
         return DGC_ERR_INVALID_HANDLE;
     }
-    ctx->brush_settings[brush][settingId] = value;
+    ctx->impl_->brush_settings[brush][settingId] = value;
     g_last_error = DGC_OK;
     return DGC_OK;
 }
@@ -328,7 +344,7 @@ int dgcSetBrushColor(DgcContext* ctx, DgcBrush brush, float r, float g, float b,
         g_last_error = DGC_ERR_INVALID_HANDLE;
         return DGC_ERR_INVALID_HANDLE;
     }
-    ctx->brush_colors[brush] = {r, g, b, a};
+    ctx->impl_->brush_colors[brush] = {r, g, b, a};
     g_last_error = DGC_OK;
     return DGC_OK;
 }
