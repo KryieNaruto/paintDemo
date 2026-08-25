@@ -16,12 +16,15 @@
  *   5) 离屏能力探测：Null 后端（无 Vulkan）时跳过离屏相关断言，其余仍测。
  *   6) 测试卫生：所有脚本统一 --out /tmp/...，测试结束清理，不在 worktree 根留 result.png。
  */
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -114,6 +117,16 @@ bool offscreenAvailable() {
     int rc = dgcSetOffscreenSurface(ctx, 64, 64);
     dgcDestroy(ctx);
     return rc == DGC_OK;
+}
+
+// 读整个文件为字节串；失败返回空。B5-3 用「两 PNG 逐字节 ==」做确定性断言。
+std::vector<uint8_t> readFileBytes(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return {};
+    }
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
 }
 
 }  // namespace
@@ -233,6 +246,23 @@ int main() {
         CHECK(err.find("未知 setting") == std::string::npos,
               "full script radius_logarithmic mapped (no unknown-setting)");
         ::remove(outPng.c_str());
+
+        // B5-3 验收标准 3：同脚本同 seed 两次 dgc_cli run → 两 PNG 逐字节一致（§阶段7）。
+        const std::string detScriptPath = fixture("determinism_script.json");
+        const std::string detA = "/tmp/b5_3_cli_a.png";
+        const std::string detB = "/tmp/b5_3_cli_b.png";
+        ::remove(detA.c_str());
+        ::remove(detB.c_str());
+        rc = runCli("run \"" + detScriptPath + "\" --out " + detA, &err);
+        CHECK(rc == 0, "determinism script run A exits 0");
+        rc = runCli("run \"" + detScriptPath + "\" --out " + detB, &err);
+        CHECK(rc == 0, "determinism script run B exits 0");
+        const std::vector<uint8_t> detBytesA = readFileBytes(detA);
+        const std::vector<uint8_t> detBytesB = readFileBytes(detB);
+        CHECK(!detBytesA.empty() && detBytesA == detBytesB,
+              "same script+seed two runs byte-identical");
+        ::remove(detA.c_str());
+        ::remove(detB.c_str());
     } else {
         std::fprintf(stderr,
                      "[test_cli] SKIP offscreen-dependent assertions (offscreen unsupported)\n");

@@ -59,9 +59,12 @@ target_link_libraries(test_ownership_loop PRIVATE dgc_paint)
 add_test(NAME test_ownership_loop COMMAND test_ownership_loop)
 
 # B1-7 确定性机制单测：同 seed 同序列 / 不同 seed 异 / Replay 回放 / 固定步进 / C API 冒烟。
+# B5-3 扩展：端到端「同 seed 像素级一致」+ golden PNG 逐字节 diff（定位 fixtures/）。
 add_executable(test_determinism test_determinism.cpp)
 target_include_directories(test_determinism PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(test_determinism PRIVATE dgc_paint)
+target_compile_definitions(test_determinism PRIVATE
+    DGC_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 add_test(NAME test_determinism COMMAND test_determinism)
 
 # B1-5 白盒移植 Ink Stroke Modeler → core/stroke_predictor：平滑 / 预测 + is_predicted /
