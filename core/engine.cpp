@@ -53,8 +53,38 @@ bool Engine::submitInput(const StrokeEvent& ev) {
         return false;
     }
     pending_input_.push_back(ev);
+    // B5-2：仅 StrokePoint 事件同步递增 submitted_（与渲染线程 composite 轮数一一对应；
+    // Begin/End 不产 stamp 批，不计入，否则 flush 屏障永远追不平）。
+    if (ev.type == StrokeEventType::StrokePoint) {
+        submitted_.fetch_add(1, std::memory_order_relaxed);
+    }
     input_cv_.notify_one();
     return true;
+}
+
+void Engine::flush() {
+    // drain 屏障（B5-2）：把三线程异步时序压成确定性 drain。仅在引擎三线程之外调用。
+    //
+    // 1) 等 pending_input_ 排空：短锁检查 + 解锁 + yield 轮询。绝不持 input_mutex_ 自旋，
+    //    否则与 inputLoop 抢锁可能死锁（review 反馈 1）。
+    while (true) {
+        {
+            std::lock_guard<std::mutex> lock(input_mutex_);
+            if (pending_input_.empty()) {
+                break;
+            }
+        }
+        std::this_thread::yield();
+    }
+    // 2) 等两段 SPSC 排空（事件从 pending_input_ → input_to_brush_ → brush_to_render_ 走完）。
+    while (!input_to_brush_.empty() || !brush_to_render_.empty()) {
+        std::this_thread::yield();
+    }
+    // 3) 等渲染线程把每个已提交 StrokePoint 的 stamp 批都 composite 完（epoch 屏障）。
+    while (composited_.load(std::memory_order_acquire) !=
+           submitted_.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
 }
 
 void Engine::inputLoop() {
@@ -129,5 +159,7 @@ void Engine::renderLoop() {
         }
         backend_->composite(stamps);
         backend_->present();
+        // B5-2：每 composite 一轮后递增 composited_（release，供 flush 屏障 acquire 追平）。
+        composited_.fetch_add(1, std::memory_order_release);
     }
 }

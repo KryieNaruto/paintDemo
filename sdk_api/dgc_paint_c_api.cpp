@@ -371,4 +371,19 @@ int dgcUndo(DgcContext* ctx) {
     return DGC_ERR_NOT_IMPLEMENTED;
 }
 
+/* ── v3.0：flush/drain 屏障（B5-2）── */
+
+int dgcFlush(DgcContext* ctx) {
+    if (ctx == nullptr) {
+        g_last_error = DGC_ERR_NULL_CONTEXT;
+        return DGC_ERR_NULL_CONTEXT;
+    }
+    // 引擎未运行（dgcCreate 已 start；stop 后不再 running）时无需等待，直接返回。
+    if (ctx->impl_->engine->running()) {
+        ctx->impl_->engine->flush();
+    }
+    g_last_error = DGC_OK;
+    return DGC_OK;
+}
+
 }  // extern "C"
