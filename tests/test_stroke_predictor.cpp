@@ -52,6 +52,12 @@ bool SamePoint(const StrokePoint& a, const StrokePoint& b) {
            a.t_us == b.t_us && a.is_predicted == b.is_predicted;
 }
 
+// 仅比较位置坐标（不比较 is_predicted/t_us），用于「覆盖」断言里区分
+// 「真实点坐标」与「预测点外推坐标」。
+bool SameXY(const StrokePoint& a, const StrokePoint& b) {
+    return a.x == b.x && a.y == b.y;
+}
+
 }  // namespace
 
 int main() {
@@ -105,7 +111,7 @@ int main() {
         CHECK(increasing, "predict: predicted t_us strictly increasing");
     }
 
-    // ── 验收 3：真实点覆盖预测点 ────────────────────────────────────────────
+    // ── 验收 3：真实点覆盖预测点（位置覆盖，非仅 t_us 排序） ────────────────
     {
         StrokeModeler m;
         const auto in = MakeWobblyLine(30, 1000, 0.5f, 0.0f, 0.0f);
@@ -115,35 +121,63 @@ int main() {
         }
         std::vector<StrokePoint> pred;
         m.Predict(&pred);
+        CHECK(!pred.empty(), "coverage: predict non-empty before coverage point");
 
-        // 下一真实点（t_us 继续推进）到达：Update 输出不应再含上一轮预测点。
+        // 构造一个真实点，其 t_us 恰落在上一轮 Predict 产出的某个预测点
+        // pred[0].t_us 上；位置沿 +x 继续但 +y 抬升，使「真实点坐标」与
+        // 「预测点外推坐标」（y=0 直线外推）可区分。
+        const std::uint64_t target_t = pred[0].t_us;
         StrokePoint next{};
-        next.x = float(in.size()) * 0.5f;
-        next.y = 0.0f;
+        next.x = 0.5f * float(target_t) / 1000.0f;   // 沿 +x 继续（≈500mm/s）
+        next.y = 5.0f;                                // 偏离直线（y=0）→ 可区分
         next.pressure = 0.5f;
-        next.t_us = std::uint64_t(in.size()) * 1000;
+        next.tilt_x = 0.3f;
+        next.tilt_y = -0.1f;
+        next.t_us = target_t;
         next.is_predicted = false;
 
         std::vector<StrokePoint> after;
         m.Update(next, &after);
 
-        bool any_overlap = false;
+        // 断言：target_t 处输出的是真实点（is_predicted=false、坐标为真实点坐标），
+        //       不是预测点；且输出无重复 t_us。
+        bool real_at_t = false;
+        bool pred_at_t = false;
+        bool dup = false;
+        bool position_overwritten = false;
+        std::vector<std::uint64_t> seen;
+        seen.reserve(after.size());
         for (const auto& p : after) {
-            if (p.is_predicted) { any_overlap = true; break; }
-            for (const auto& q : pred) {
-                if (p.t_us == q.t_us) { any_overlap = true; break; }
+            if (p.t_us == target_t) {
+                if (p.is_predicted) {
+                    pred_at_t = true;
+                } else {
+                    real_at_t = true;
+                    position_overwritten = !SameXY(p, pred[0]);
+                }
             }
+            for (std::uint64_t s : seen) {
+                if (s == p.t_us) { dup = true; break; }
+            }
+            seen.push_back(p.t_us);
         }
-        CHECK(!any_overlap, "coverage: predicted points overwritten by real point");
+        CHECK(real_at_t, "coverage: real point emitted at predicted t_us (is_predicted=false)");
+        CHECK(!pred_at_t, "coverage: no predicted point remains at that t_us");
+        CHECK(position_overwritten, "coverage: coords are real-point coords, not predicted extrapolation");
+        CHECK(!dup, "coverage: no duplicate t_us in output");
 
-        // 再次 Predict：应基于最新真实点外推（t_us 全部大于新真实点）。
+        // 再次 Predict：应基于新真实点外推（t_us 全大于新真实点，且 x 沿 +x 推进，
+        // 证明模型器状态确实推进到新真实点，而非停在旧点）。
         std::vector<StrokePoint> pred2;
         m.Predict(&pred2);
         bool fresh = !pred2.empty();
         for (const auto& p : pred2) {
-            if (p.t_us <= next.t_us) { fresh = false; }
+            if (p.t_us <= target_t) { fresh = false; }
         }
         CHECK(fresh, "coverage: re-predict extrapolates beyond new real point");
+
+        bool advancing = !pred2.empty() && !after.empty() && pred2[0].x > after.back().x;
+        CHECK(advancing, "coverage: re-predict extrapolates x beyond new real point (state advanced)");
     }
 
     // ── 验收 4：固定步长欧拉积分（无随机）确定性 ────────────────────────────
@@ -171,9 +205,14 @@ int main() {
         CHECK(same_pred, "determinism: two instances produce identical predictions");
     }
 
-    // ── 工程约束：构造/Update/Predict/析构泄漏循环（ASan/LSan 兜底） ────────
+    // ── 工程约束：构造/Update/Predict/析构泄漏循环（由 ASan/LSan 兜底） ────────
+    // 此块无显式断言：泄漏是否为零由 host-linux-sanitize（ASan/LSan）在进程退出时
+    // 汇总判定（LSan 兜底），而非用恒真的 CHECK 标记。循环体仍产生真实输出，
+    // 覆盖 impl_（unique_ptr）与内部 std::vector 的构造/析构释放路径。
     {
         const auto in = MakeWobblyLine(8, 1000, 0.5f, 2.0f, 50.0f);
+        std::size_t total_real = 0;
+        std::size_t total_pred = 0;
         for (int r = 0; r < 2000; ++r) {
             auto m = std::make_unique<StrokeModeler>();
             std::vector<StrokePoint> real, pred;
@@ -181,8 +220,10 @@ int main() {
                 m->Update(p, &real);
             }
             m->Predict(&pred);
+            total_real += real.size();
+            total_pred += pred.size();
         }
-        CHECK(true, "leak loop: 2000 rounds create/update/predict/destroy");
+        CHECK(total_real > 0 && total_pred > 0, "leak loop: 2000 rounds actually produce output");
     }
 
     return failures == 0 ? 0 : 1;

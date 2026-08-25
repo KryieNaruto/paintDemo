@@ -316,8 +316,8 @@ struct StrokeModeler::Impl {
     KalmanPredictor kalman_;
     StrokeEndPredictor end_pred_;
 
-    // 预测点缓冲（覆盖语义载体）：Update 时清空，保证「真实点到达即覆盖同段预测点」。
-    std::vector<StrokePoint> pending_predicted_;
+    // 覆盖语义由结构显式承载（无挂起预测缓冲）：Update 只发真实点并推进
+    // last_output_，Predict 只从 last_output_ 重外推，故「真实点到达即覆盖同段预测点」。
     bool has_output_ = false;
     StrokePoint last_output_{};  // 最近一次 Update 产出的真实点（Predict 外推基准）
 };
@@ -340,7 +340,6 @@ void StrokeModeler::Reset() {
     impl_->position_.Reset();
     impl_->kalman_.Reset();
     impl_->end_pred_.Reset();
-    impl_->pending_predicted_.clear();
     impl_->has_output_ = false;
     impl_->last_output_ = {};
 }
@@ -359,9 +358,6 @@ void StrokeModeler::Update(const StrokePoint& raw, std::vector<StrokePoint>* out
         impl_->has_output_ = true;
         out->push_back(pos);
     }
-
-    // 覆盖语义：以真实输入为准重做平滑，清空上一轮 Predict 挂起的预测点缓冲。
-    impl_->pending_predicted_.clear();
 }
 
 void StrokeModeler::Predict(std::vector<StrokePoint>* out) {
@@ -386,7 +382,6 @@ void StrokeModeler::Predict(std::vector<StrokePoint>* out) {
         p.t_us = last.t_us + std::uint64_t(k * period_us);
         p.is_predicted = true;
         out->push_back(p);
-        impl_->pending_predicted_.push_back(p);
     }
 
     // 末端：StrokeEndPredictor 的停笔点（落在均匀外推点之后）。
@@ -395,6 +390,5 @@ void StrokeModeler::Predict(std::vector<StrokePoint>* out) {
         StrokePoint p = end.value;
         p.t_us = last.t_us + std::uint64_t(interval_us);
         out->push_back(p);
-        impl_->pending_predicted_.push_back(p);
     }
 }

@@ -71,8 +71,9 @@ public:
     void Reset();
 
     // 输入一个原始真实点（is_predicted=false），追加平滑后的真实点到 *out
-    // （is_predicted=false）。每次 Update 以真实输入为准重做平滑，并清空上一轮
-    // Predict 挂起的预测点缓冲，实现「真实点到达即覆盖同段预测点」。
+    // （is_predicted=false）。每次 Update 以真实输入为准重做平滑并推进
+    // last_output_（Predict 的外推基准），使「真实点到达即覆盖同段预测点」由
+    // 结构显式承载：Update 只发真实点，Predict 只从最近真实点外推。
     void Update(const StrokePoint& raw, std::vector<StrokePoint>* out);
 
     // 沿当前速度外推未来点，追加预测点到 *out（is_predicted=true）。
