@@ -1,0 +1,13 @@
+{
+  "canvas": { "w": 128, "h": 128, "background": [1, 1, 1, 1] },
+  "seed": 42,
+  "fixed-time": 1000000,
+  "ops": [
+    { "op": "stroke", "points": [
+      { "x": 16, "y": 16, "p": 0.5, "tiltX": 0.0, "tiltY": 0.0 },
+      { "x": 64, "y": 64, "p": 0.7, "tiltX": 0.2, "tiltY": -0.1 },
+      { "x": 112, "y": 112, "p": 0.9, "tiltX": 0.3, "tiltY": -0.2 }
+    ]},
+    { "op": "export", "path": "result.png" }
+  ]
+}
