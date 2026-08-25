@@ -125,24 +125,26 @@ echo %ANDROID_NDK_HOME%   rem 无则警告，仅 android-arm64 preset 需要
 
 > VS2026 用 `CMakePresets.json`（E0-3 落地）一键切换 host / android 配置：打开项目根目录即自动识别 presets，无需手动配 toolchain。
 
-### 3.4 Windows 一键搭建（Git Bash / `setup-env-win.sh`）
+### 3.4 Windows 一键搭建（PowerShell / `setup-env.ps1`）
 
-在 **Git Bash（MSYS2 / MINGW64）** 内运行 `scripts/setup-env-win.sh`（不必手动开 Developer Command Prompt）：
+在 **PowerShell 5.1+ / PowerShell Core 7+** 内运行 `scripts/setup-env.ps1`（原生，免装 Git Bash；无头可跑）：
 
-```bash
-sh scripts/setup-env-win.sh            # 探测 + 配置 host-windows + 构建 + ctest
-sh scripts/setup-env-win.sh --check    # 只探测不安装，输出缺项清单
-sh scripts/setup-env-win.sh --android  # 探测 + 编 android-arm64 libdgc_paint.so（需 %ANDROID_NDK_HOME%）
-sh scripts/setup-env-win.sh --help
+```powershell
+.\scripts\setup-env.ps1              # 探测 + 补缺指引 + 拉取 paint-pc + 构建 + 离屏 PNG 验证
+.\scripts\setup-env.ps1 --check      # 只探测不安装，输出缺项清单
+.\scripts\setup-env.ps1 -SkipBuild   # 探测 + 拉取，跳过构建/验证
+.\scripts\setup-env.ps1 -Help        # 打印帮助
 ```
 
-脚本行为：
-- 用 `vswhere` 定位 VS2026 的 `vcvarsall.bat`，经 `cmd` 抓取 MSVC 环境变量（PATH/INCLUDE/LIB）注入当前 bash 会话 → `cl.exe`/`cmake`/`ninja` 直接可用。
-- 探测 cmake / ninja / MSVC(cl) / Vulkan / NDK / glslc，硬/软分级与 §0 总表一致。
-- 默认模式探测到 `%VULKAN_SDK%`（LunarG Vulkan SDK）→ 开 Vulkan 后端（`DGCPAIN_RENDER_VULKAN=ON`，Windows 走 `vulkan-1.lib`/`shaderc_combined.lib`）；否则回退 `OFF`（Null 后端跑通 host 测试）。
-- `--android` 需要 `%ANDROID_NDK_HOME%`（如 `C:\Users\<user>\AppData\Local\Android\Sdk\ndk\28.x`）。
+脚本行为（W1）：
+- 用 `vswhere` 定位 VS2026 安装与 `vcvars64.bat`；探测 cmake / ninja / MSVC(cl) / git / Vulkan SDK（`$env:VULKAN_SDK`）/ glslc，硬/软分级与 §0 总表一致。
+- **paint-pc 离屏渲染走真实 `VkBackend` → Vulkan SDK 为硬依赖**（链接 `vulkan-1.lib` 必败），与 §0「SDK Null 后端软依赖」口径不同——这是「消费者真实绘制」与「SDK 编译」的分界。
+- 硬依赖缺失给精确安装指引（VS installer `modify --add` 补工作负载 / LunarG Vulkan SDK 下载页 / git 安装）并非零退出；软依赖（glslc）仅警告。
+- 拉取：`git clone --recurse-submodules` paint-pc + submodule 钉 `9e6eefb`（含 B3-1 真实内核）。
+- 构建：`vcvars64` 环境内 `cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DDGCPAIN_BUILD_TESTS=OFF -DDGCPAIN_BUILD_CLI=OFF` + `cmake --build`（与 paint-pc 现有口径一致）。
+- 验证：`build\paint_pc.exe --headless out.png` + **System.Drawing 读 PNG 断言真实笔迹像素**（四角众数背景 + 隔 3 采样，`dark>50` 判 PASS）。此逻辑已对真实内核 PNG（`dark=973`）与空笔迹反例（`dark=0`）交叉验证一致。
 
-> 前置：VS2026 + 「使用 C++ 的桌面开发」工作负载（含 MSVC/CMake/Ninja）；Vulkan 与 NDK 均为软依赖，缺失时脚本仅警告并回退。
+> 前置：VS2026 + 「使用 C++ 的桌面开发」+「C++ CMake tools for Windows」工作负载；Vulkan SDK（硬，paint-pc 真实绘制）；git。本机为 Linux 时脚本会退出（仅 Windows 平台有意义）。
 
 ---
 
