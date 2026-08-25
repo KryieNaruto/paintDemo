@@ -48,6 +48,13 @@ target_include_directories(test_determinism PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(test_determinism PRIVATE dgc_paint)
 add_test(NAME test_determinism COMMAND test_determinism)
 
+# B1-5 白盒移植 Ink Stroke Modeler → core/stroke_predictor：平滑 / 预测 + is_predicted /
+# 覆盖 / 确定性 / 泄漏循环。
+add_executable(test_stroke_predictor test_stroke_predictor.cpp)
+target_include_directories(test_stroke_predictor PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_stroke_predictor PRIVATE dgc_paint)
+add_test(NAME test_stroke_predictor COMMAND test_stroke_predictor)
+
 # B5-2：CLI 集成测试（shell 调 dgc_cli 二进制，不编译 script_runner.cpp 进本目标）。
 # 需 dgc_cli 已建（DGCPAIN_BUILD_CLI=ON 且顶层 add_subdirectory(cli) 先于 tests）。
 if(DGCPAIN_BUILD_CLI AND TARGET dgc_cli)

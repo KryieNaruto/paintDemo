@@ -4,6 +4,7 @@
 
 #include "core/interfaces/i_paint_kernel.h"
 #include "core/interfaces/i_render_backend.h"
+#include "core/stroke_predictor.h"
 
 namespace {
 
@@ -45,6 +46,10 @@ void Engine::stop() {
     if (brush_thread_.joinable())  brush_thread_.join();
     if (render_thread_.joinable()) render_thread_.join();
     running_.store(false, std::memory_order_release);
+}
+
+void Engine::setPredictor(std::unique_ptr<StrokeModeler> predictor) {
+    predictor_ = std::move(predictor);
 }
 
 bool Engine::submitInput(const StrokeEvent& ev) {
@@ -90,6 +95,17 @@ void Engine::flush() {
 void Engine::inputLoop() {
     // 输入线程：从线程安全的 pending_input_（mutex + condvar）取事件，
     // 搬进无锁 SPSC 段 input_to_brush_，保证其仍是单生产者 × 单消费者。
+    // B1-5 设计预留：predictor_ 非空时，对真实 StrokePoint 走 Update/Predict
+    // 产出平滑 + 预测点；Begin/End 触发 Reset。默认 nullptr 保持原样透传。
+    auto pushEvent = [this](const StrokeEvent& ev) {
+        while (!input_to_brush_.try_push(ev)) {
+            if (stop_.load(std::memory_order_acquire)) {
+                return false;
+            }
+            std::this_thread::yield();
+        }
+        return true;
+    };
     while (true) {
         StrokeEvent ev{};
         {
@@ -103,11 +119,26 @@ void Engine::inputLoop() {
             ev = pending_input_.front();
             pending_input_.pop_front();
         }
-        while (!input_to_brush_.try_push(ev)) {
-            if (stop_.load(std::memory_order_acquire)) {
-                return;
+
+        if (predictor_) {
+            if (ev.type == StrokeEventType::BeginStroke ||
+                ev.type == StrokeEventType::EndStroke) {
+                predictor_->Reset();
+            } else if (ev.type == StrokeEventType::StrokePoint) {
+                std::vector<StrokePoint> out;
+                predictor_->Update(ev.point, &out);
+                predictor_->Predict(&out);
+                for (const StrokePoint& p : out) {
+                    if (!pushEvent(StrokeEvent{StrokeEventType::StrokePoint, p})) {
+                        return;
+                    }
+                }
+                continue;  // 原始真实点已含于 out（平滑点），不再重复透传。
             }
-            std::this_thread::yield();
+        }
+
+        if (!pushEvent(ev)) {
+            return;
         }
     }
 }
