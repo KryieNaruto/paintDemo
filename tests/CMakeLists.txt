@@ -37,6 +37,22 @@ if(DGCPAIN_RENDER_VULKAN AND EXISTS ${CMAKE_SOURCE_DIR}/render/vulkan/CMakeLists
     add_test(NAME test_offscreen COMMAND test_offscreen)
 endif()
 
+# B3-1：自研 C++ 笔刷内核主链（host 无条件，无 Vulkan 依赖）。
+if(DGCPAIN_KERNEL_BRUSH AND EXISTS ${CMAKE_SOURCE_DIR}/kernels/brush/CMakeLists.txt)
+    add_executable(test_brush_kernel test_brush_kernel.cpp)
+    target_include_directories(test_brush_kernel PRIVATE ${CMAKE_SOURCE_DIR})
+    target_link_libraries(test_brush_kernel PRIVATE dgc_paint)
+    add_test(NAME test_brush_kernel COMMAND test_brush_kernel)
+
+    # B3-1：离屏集成（C API 端到端 + 颜色烘焙），需 Vulkan。
+    if(DGCPAIN_RENDER_VULKAN AND EXISTS ${CMAKE_SOURCE_DIR}/render/vulkan/CMakeLists.txt)
+        add_executable(test_brush_offscreen test_brush_offscreen.cpp)
+        target_include_directories(test_brush_offscreen PRIVATE ${CMAKE_SOURCE_DIR})
+        target_link_libraries(test_brush_offscreen PRIVATE dgc_paint)
+        add_test(NAME test_brush_offscreen COMMAND test_brush_offscreen)
+    endif()
+endif()
+
 # B1-8 所有权压力测试：多轮 create/destroy 无泄漏、无崩溃（ASan/LSan 兜底）。
 add_executable(test_ownership_loop test_ownership_loop.c)
 target_link_libraries(test_ownership_loop PRIVATE dgc_paint)
