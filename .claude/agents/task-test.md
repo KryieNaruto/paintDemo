@@ -17,6 +17,7 @@ model: haiku
 2. 在 worktree 里跑对应构建/测试：
    - host 侧：`cmake --build` + `ctest`（在 plan 指定的 preset 下）。
    - Android 侧：能编出 `.so` 就编；阶段 0/1 的 spike 按 plan 指定的命令跑。
+   - **泄漏检查（SDK 任务必跑）**：若 plan 指定 `DGCPAIN_SANITIZE`，用 ASan/LSan 构建并跑 ctest，把泄漏报告摘进 EVIDENCE；无法跑时说明原因。
 3. 把命令输出关键结论摘进回报：编译结果、测试通过数、**验收标准逐条是否满足**。
 
 ## 回报格式

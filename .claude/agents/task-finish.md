@@ -9,11 +9,11 @@ model: haiku
 
 ## 输入
 
-`TASK=<ID>` · `WORKTREE=<绝对路径>` · `BRANCH=<分支名>` · `PLAN=<plan 路径>` · 测试回报。
+`TASK=<ID>` · `WORKTREE=<绝对路径>` · `BRANCH=<分支名>` · `PLAN=<plan 路径>` · 测试回报 · 门禁分数（plan-review/test-review 的 `SCORE=`，可选）。
 
 ## 你做
 
-1. **前台阻塞**派一个 `task-review` 评审 agent（`subagent_type: task-review`），给它 `TASK`/`WORKTREE`/`BRANCH`/`PLAN` + 测试回报。
+1. **前台阻塞**派一个 `task-review` 评审 agent（`subagent_type: task-review`），给它 `TASK`/`WORKTREE`/`BRANCH`/`PLAN` + 测试回报 + 已通过的门禁分数（plan-review `SCORE=`、test-review `SCORE=`）。
 2. 读评审返回的 `VERDICT=`：
    - `通过` → `python3 .exec/taskline.py finish <ID> --audit 通过`（合并分支回目标 + 置「已完成/已通过」+ 删 worktree）。
    - `打回` → `python3 .exec/taskline.py finish <ID> --audit 打回`（置「执行中/打回」，保留 worktree 供重做）。
