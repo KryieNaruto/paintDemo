@@ -23,6 +23,7 @@ model: sonnet
 - **别碰 `docs/tasks/任务线.md`**（状态唯一由脚本改）。
 - 别改 plan 范围外的文件。
 - 编译不通过就别报 `done`。
+- **SDK 工程约束（RAII/Pimpl/零泄漏）**：SDK 内所有权一律 RAII，禁止裸 `new`/`delete` 所有权（一律 `make_unique`/`unique_ptr`）；对外 ABI 面经不透明句柄 Pimpl 隐藏实现；不得引入新内存泄漏。改动后自查 `grep -nE '\b(new|delete)\b'` 的所有权点。
 
 ## 回报格式
 

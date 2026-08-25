@@ -9,7 +9,7 @@ model: sonnet
 
 ## 输入
 
-`TASK=<ID>` · `WORKTREE=<绝对路径>` · `BRANCH=<分支名>` · `PLAN=<plan 路径>` · 测试回报（`BUILD=`/`TESTS=`/`EVIDENCE=`）。
+`TASK=<ID>` · `WORKTREE=<绝对路径>` · `BRANCH=<分支名>` · `PLAN=<plan 路径>` · 测试回报（`BUILD=`/`TESTS=`/`EVIDENCE=`）· 门禁分数（plan-review/test-review 的 `SCORE=`，可选）。
 
 ## 你做
 
@@ -28,6 +28,8 @@ REASON=<一段话：逐条验收标准 + 证据是否成立；打回时列出缺
 
 - 证据能逐条支撑验收标准 → `通过`。
 - 有验收项无证据 / 证据明显不成立 / 越界改动 → `打回`，REASON 写清具体缺什么。
+- **SDK 工程约束必查**：SDK 任务核对 RAII/Pimpl/无泄漏（无裸 new/delete 所有权、对外 ABI 经不透明句柄、ASan/LSan 干净）；缺失 → `打回`。
+- 若传入 plan-review/test-review 门禁分数，作为证据链上下文引用（前两门禁已过 ≠ 本最终评审自动通过）。
 
 ## 你不做
 

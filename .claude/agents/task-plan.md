@@ -16,7 +16,8 @@ model: sonnet
 1. 读 `docs/tasks/任务线.md` 你那一行 + `docs/tasks/detail/` 里该 ID 的章节（**验收标准从 detail 抄，不自己编**）+ 规划/路线整理相关节。
 2. 在 worktree 里看现状：`git -C <WORKTREE> status` 与目录结构。本仓库是 SDK，不要往 `ui/` `platform/` `app/` 加消费者代码。
 3. 写计划到 `<WORKTREE>/docs/plans/<ID>.md`：目标 / **验收标准** / 改动文件清单 / 步骤 / 风险。
-4. 返回 `PLAN=` 路径（plan 不提交，后续 execute 的 `git add -A` 会一并带上）。
+4. **SDK 工程约束（必含）**：SDK 任务（涉 dgc_paint 库）的计划必须含——所有权设计（谁拥有、RAII、无裸 new/delete，用 `make_unique`/`unique_ptr`）、Pimpl 边界（对外 ABI 面经不透明句柄隐藏实现）、泄漏验证方式（`DGCPAIN_SANITIZE` 的 ASan/LSan）。对应落到验收/设计/风险段。
+5. 返回 `PLAN=` 路径（plan 不提交，后续 execute 的 `git add -A` 会一并带上）。
 
 ## 回报格式
 
