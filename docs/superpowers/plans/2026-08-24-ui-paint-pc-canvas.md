@@ -100,10 +100,24 @@ struct GlCanvas {
 // src/gl_canvas.cpp
 #include "gl_canvas.h"
 
-#include <GL/glew.h>
+// GL 函数指针加载：复用 ImGui 自带的内嵌 gl3w（imgl3w），零新增依赖。
+// 该头在 CMake 的 FetchContent 拉取的 imgui-src/backends/ 下，
+// 由 paint_imgui target 的 PUBLIC include 路径提供。
+// 需在声明 GL 函数前 #define GL3W_CALLBACK 由本 TU 提供 gl3wGetProcAddress 实现，
+// 或直接依赖 imgl3wInit 内部用 glfwGetProcAddress 加载（见 imgui_impl_opengl3.cpp）。
+// 本实现采用 imgl3w：include 该 loader 头后调用 imgl3wInit()。
+#include <imgui_impl_opengl3_loader.h>
 #include <cstdio>
 
 namespace paint {
+
+static bool g_glLoaded = false;
+static void EnsureGlLoaded() {
+    if (!g_glLoaded) {
+        if (imgl3wInit() != 0) { std::fprintf(stderr, "[gl_canvas] imgl3wInit failed\n"); return; }
+        g_glLoaded = true;
+    }
+}
 
 static const char* kVS = R"(#version 330 core
 layout(location=0) in vec2 aPos;
@@ -137,6 +151,7 @@ static GLuint Link(GLuint vs, GLuint fs) {
 }
 
 GlCanvas::GlCanvas(int w, int h) : canvas_w(w), canvas_h(h) {
+    EnsureGlLoaded();  // imgl3w：用 glfwGetProcAddress 加载 GL 函数指针
     unsigned vs = Compile(GL_VERTEX_SHADER, kVS), fs = Compile(GL_FRAGMENT_SHADER, kFS);
     prog_ = Link(vs, fs);
     glDeleteShader(vs); glDeleteShader(fs);
@@ -186,9 +201,9 @@ void GlCanvas::destroy() {
 }  // namespace paint
 ```
 
-- [ ] **Step 3: 改 CMakeLists 加源 + 接 GLEW**
+- [ ] **Step 3: 改 CMakeLists 加源**
 
-在 `add_executable(paint_pc ...)` 里加 `src/gl_canvas.cpp`，并确保 `find_package(OpenGL REQUIRED)` 已存在。GLEW 不新引入——直接用 GL 3.3 core + `gl3w` 风格内建函数即可（GLFW 提供 context，OpenGL 3.3 函数指针用 `<GL/gl.h>` + `glfwGetProcAddress` 展开；为最小化依赖，本项目用 GLFW 已带的核心函数，不额外接 glew）。若头文件缺失则改用 `#include <GL/gl3w.h>` 并 FetchContent gl3w（见风险）。本计划按「GLFW + 系统 OpenGL 头」路径，编译期验证。
+在 `add_executable(paint_pc ...)` 里加 `src/gl_canvas.cpp`，并确保 `find_package(OpenGL REQUIRED)` 已存在。GL 函数指针由 ImGui 自带 `imgui_impl_opengl3_loader.h`（imgl3w）提供——`paint_imgui` target 的 PUBLIC include 已含 `backends/`，`gl_canvas.cpp` 直接 `#include <imgui_impl_opengl3_loader.h>` 即可，**零新增依赖**（不必引入 GLEW/gl3w）。链接仍 `OpenGL::GL`。
 
 ```cmake
 # CMakeLists.txt —— 加 gl_canvas 源
