@@ -7,14 +7,23 @@
 set(DGCPAIN_DEPS_ROOT "" CACHE PATH
     "Custom prefix for Vulkan/shaderc (e.g. extracted debs); empty = system default")
 
-find_path(VULKAN_INCLUDE_DIR NAMES vulkan/vulkan.h
-    HINTS ${DGCPAIN_DEPS_ROOT}/include)
-find_library(VULKAN_LIBRARY NAMES vulkan
-    HINTS ${DGCPAIN_DEPS_ROOT}/lib ${DGCPAIN_DEPS_ROOT}/lib/x86_64-linux-gnu)
+if(WIN32)
+    # ── Windows：LunarG Vulkan SDK 布局（%VULKAN_SDK%\Include / %VULKAN_SDK%\Lib）──
+    # vulkan-1.lib / shaderc_combined.lib 为 Windows 命名（非 Linux 的 vulkan / shaderc）。
+    find_path(VULKAN_INCLUDE_DIR NAMES vulkan/vulkan.h
+        HINTS ${DGCPAIN_DEPS_ROOT}/include $ENV{VULKAN_SDK}/Include)
+    find_library(VULKAN_LIBRARY NAMES vulkan-1
+        HINTS ${DGCPAIN_DEPS_ROOT}/lib $ENV{VULKAN_SDK}/Lib)
+else()
+    find_path(VULKAN_INCLUDE_DIR NAMES vulkan/vulkan.h
+        HINTS ${DGCPAIN_DEPS_ROOT}/include)
+    find_library(VULKAN_LIBRARY NAMES vulkan
+        HINTS ${DGCPAIN_DEPS_ROOT}/lib ${DGCPAIN_DEPS_ROOT}/lib/x86_64-linux-gnu)
+endif()
 
 if(NOT VULKAN_INCLUDE_DIR OR NOT VULKAN_LIBRARY)
     message(FATAL_ERROR
-        "Vulkan not found: install libvulkan-dev or set DGCPAIN_DEPS_ROOT")
+        "Vulkan not found: install libvulkan-dev / LunarG Vulkan SDK or set DGCPAIN_DEPS_ROOT")
 endif()
 
 # Vulkan 头/loader 为两条路径共用（NDK sysroot 自带 vulkan/vulkan.h 与 libvulkan.so，
@@ -62,14 +71,22 @@ if(DGCPAIN_ANDROID)
     target_compile_definitions(dgc_paint PRIVATE DGCPAIN_PRECOMPILED_SPV=1)
 else()
     # ── host：运行时 shaderc 编译（B2-1 不变）──
-    find_path(SHADERC_INCLUDE_DIR NAMES shaderc/shaderc.hpp
-        HINTS ${DGCPAIN_DEPS_ROOT}/include)
-    find_library(SHADERC_LIBRARY NAMES shaderc
-        HINTS ${DGCPAIN_DEPS_ROOT}/lib ${DGCPAIN_DEPS_ROOT}/lib/x86_64-linux-gnu)
+    if(WIN32)
+        # Windows：LunarG SDK 提供 shaderc_combined.lib（非 Linux 的 shaderc）。
+        find_path(SHADERC_INCLUDE_DIR NAMES shaderc/shaderc.hpp
+            HINTS ${DGCPAIN_DEPS_ROOT}/include $ENV{VULKAN_SDK}/Include)
+        find_library(SHADERC_LIBRARY NAMES shaderc_combined
+            HINTS ${DGCPAIN_DEPS_ROOT}/lib $ENV{VULKAN_SDK}/Lib)
+    else()
+        find_path(SHADERC_INCLUDE_DIR NAMES shaderc/shaderc.hpp
+            HINTS ${DGCPAIN_DEPS_ROOT}/include)
+        find_library(SHADERC_LIBRARY NAMES shaderc
+            HINTS ${DGCPAIN_DEPS_ROOT}/lib ${DGCPAIN_DEPS_ROOT}/lib/x86_64-linux-gnu)
+    endif()
 
     if(NOT SHADERC_INCLUDE_DIR OR NOT SHADERC_LIBRARY)
         message(FATAL_ERROR
-            "shaderc not found: install libshaderc-dev or set DGCPAIN_DEPS_ROOT")
+            "shaderc not found: install libshaderc-dev / LunarG Vulkan SDK or set DGCPAIN_DEPS_ROOT")
     endif()
 
     # GLSL → 内嵌头（单一权威源是 brush_composite.comp；运行时 shaderc 编译，构建期不调 glslc）。

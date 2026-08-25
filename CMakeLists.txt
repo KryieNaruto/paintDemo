@@ -60,16 +60,20 @@ set(DGCPAIN_CORE_SOURCES
 )
 if(DGCPAIN_BUILD_SHARED)
     add_library(dgc_paint SHARED ${DGCPAIN_CORE_SOURCES})
-    # B5-1 符号可见性收紧（原 R6 非目标 → 本轮落地）：只导出标记 DGC_API 的 C ABI 符号，
-    # 隐藏内部 C++ 符号（Engine/VkBackend/StrokeModeler 等 mangled 符号不再对外可见）。
+    # B5-1 符号可见性收紧：只导出标记 DGC_API 的 C ABI 符号，隐藏内部 C++ 符号。
     set_target_properties(dgc_paint PROPERTIES
         CXX_VISIBILITY_PRESET hidden
         C_VISIBILITY_PRESET  hidden
         VISIBILITY_INLINES_HIDDEN ON
     )
-    target_compile_definitions(dgc_paint PRIVATE DGC_PAINT_BUILDING)
+    # DGCPAIN_SHARED 经 PUBLIC 传给本目标与消费者：Windows 上据此切 dllexport/dllimport；
+    # DGC_PAINT_BUILDING 标记本目标为库构建者（Windows 上 dllexport）。
+    target_compile_definitions(dgc_paint
+        PUBLIC DGCPAIN_SHARED=1
+        PRIVATE DGC_PAINT_BUILDING)
 else()
     add_library(dgc_paint STATIC ${DGCPAIN_CORE_SOURCES})
+    # 静态库：不定义 DGCPAIN_SHARED，Windows 下 DGC_API 展开为空（无 dllimport/dllexport）。
 endif()
 target_include_directories(dgc_paint
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/sdk_api   # 唯一对外 include（B1-4 才放头）

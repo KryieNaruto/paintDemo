@@ -125,6 +125,25 @@ echo %ANDROID_NDK_HOME%   rem 无则警告，仅 android-arm64 preset 需要
 
 > VS2026 用 `CMakePresets.json`（E0-3 落地）一键切换 host / android 配置：打开项目根目录即自动识别 presets，无需手动配 toolchain。
 
+### 3.4 Windows 一键搭建（Git Bash / `setup-env-win.sh`）
+
+在 **Git Bash（MSYS2 / MINGW64）** 内运行 `scripts/setup-env-win.sh`（不必手动开 Developer Command Prompt）：
+
+```bash
+sh scripts/setup-env-win.sh            # 探测 + 配置 host-windows + 构建 + ctest
+sh scripts/setup-env-win.sh --check    # 只探测不安装，输出缺项清单
+sh scripts/setup-env-win.sh --android  # 探测 + 编 android-arm64 libdgc_paint.so（需 %ANDROID_NDK_HOME%）
+sh scripts/setup-env-win.sh --help
+```
+
+脚本行为：
+- 用 `vswhere` 定位 VS2026 的 `vcvarsall.bat`，经 `cmd` 抓取 MSVC 环境变量（PATH/INCLUDE/LIB）注入当前 bash 会话 → `cl.exe`/`cmake`/`ninja` 直接可用。
+- 探测 cmake / ninja / MSVC(cl) / Vulkan / NDK / glslc，硬/软分级与 §0 总表一致。
+- 默认模式探测到 `%VULKAN_SDK%`（LunarG Vulkan SDK）→ 开 Vulkan 后端（`DGCPAIN_RENDER_VULKAN=ON`，Windows 走 `vulkan-1.lib`/`shaderc_combined.lib`）；否则回退 `OFF`（Null 后端跑通 host 测试）。
+- `--android` 需要 `%ANDROID_NDK_HOME%`（如 `C:\Users\<user>\AppData\Local\Android\Sdk\ndk\28.x`）。
+
+> 前置：VS2026 + 「使用 C++ 的桌面开发」工作负载（含 MSVC/CMake/Ninja）；Vulkan 与 NDK 均为软依赖，缺失时脚本仅警告并回退。
+
 ---
 
 ## 4. 换机步骤（clone → 探测 → 补缺）
