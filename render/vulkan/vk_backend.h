@@ -15,6 +15,8 @@
 //
 // 窗口/swapchain 路径本期不做（init 收到非空 surface 时记录未实现）。
 // 内部用 std::mutex 串行化 GPU 提交与读回，避免 engine 渲染线程与 C API 线程竞态。
+// Vulkan 句柄由 Impl 内最小 RAII 守卫（VkTopHandle/VkDeviceHandle）持有，按
+// 「子对象 → device → instance」逆声明序析构；shutdown() 幂等（重复调用安全）。
 class VkBackend : public IRenderBackend {
 public:
     VkBackend();

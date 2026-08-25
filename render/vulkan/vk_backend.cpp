@@ -218,46 +218,140 @@ std::vector<uint8_t> MakeSoftCircleStamp(const StampData& s, uint32_t* outSize) 
     return px;
 }
 
+// ── 最小手写 RAII 守卫（B1-8，不引入 vk::raii）：值语义、禁拷贝、可移动、
+//    reset()/析构幂等。 ──
+
+// 顶层对象：vkDestroyInstance / vkDestroyDevice（2 参，无 parent device）。
+template <typename H, void (*Destroy)(H, const VkAllocationCallbacks*)>
+struct VkTopHandle {
+    H h = VK_NULL_HANDLE;
+
+    VkTopHandle() = default;
+    VkTopHandle(const VkTopHandle&) = delete;
+    VkTopHandle& operator=(const VkTopHandle&) = delete;
+    VkTopHandle(VkTopHandle&& other) noexcept : h(other.h) { other.h = VK_NULL_HANDLE; }
+    VkTopHandle& operator=(VkTopHandle&& other) noexcept {
+        if (this != &other) {
+            reset();
+            h = other.h;
+            other.h = VK_NULL_HANDLE;
+        }
+        return *this;
+    }
+    ~VkTopHandle() { reset(); }
+
+    H get() const { return h; }
+    operator H() const { return h; }
+
+    void reset() {
+        if (h != VK_NULL_HANDLE) {
+            Destroy(h, nullptr);
+            h = VK_NULL_HANDLE;
+        }
+    }
+    H release() {
+        H t = h;
+        h = VK_NULL_HANDLE;
+        return t;
+    }
+    // 收编新裸句柄：先销毁旧值，再记录新值。
+    VkTopHandle& operator=(H handle) {
+        reset();
+        h = handle;
+        return *this;
+    }
+};
+
+// 子对象：vkDestroyXxx / vkFreeMemory（3 参，需 device）。
+// commandBuffer / descriptorSet 属 commandPool / descriptorPool 子句柄，随池守卫析构
+// 隐式释放，无需独立守卫（仍以裸句柄存于 Impl）。
+template <typename H, void (*Destroy)(VkDevice, H, const VkAllocationCallbacks*)>
+struct VkDeviceHandle {
+    VkDevice dev = VK_NULL_HANDLE;
+    H h = VK_NULL_HANDLE;
+
+    VkDeviceHandle() = default;
+    VkDeviceHandle(const VkDeviceHandle&) = delete;
+    VkDeviceHandle& operator=(const VkDeviceHandle&) = delete;
+    VkDeviceHandle(VkDeviceHandle&& other) noexcept : dev(other.dev), h(other.h) {
+        other.h = VK_NULL_HANDLE;
+    }
+    VkDeviceHandle& operator=(VkDeviceHandle&& other) noexcept {
+        if (this != &other) {
+            reset();
+            dev = other.dev;
+            h = other.h;
+            other.h = VK_NULL_HANDLE;
+        }
+        return *this;
+    }
+    ~VkDeviceHandle() { reset(); }
+
+    H get() const { return h; }
+    operator H() const { return h; }
+
+    void reset() {
+        if (h != VK_NULL_HANDLE) {
+            Destroy(dev, h, nullptr);
+            h = VK_NULL_HANDLE;
+        }
+    }
+    H release() {
+        H t = h;
+        h = VK_NULL_HANDLE;
+        return t;
+    }
+    // 收编新句柄：先销毁旧句柄，再记录设备与新句柄。
+    void assign(VkDevice d, H handle) {
+        reset();
+        dev = d;
+        h = handle;
+    }
+};
+
 }  // namespace
 
 struct VkBackend::Impl {
-    VkInstance instance = VK_NULL_HANDLE;
+    // 声明序 = instance → device → 全部子对象：逆声明序析构 = 子对象 → device → instance，
+    // 即 Vulkan 释放顺序正确。commandBuffer/descriptorSet 属池子句柄，不独立守卫。
+    VkTopHandle<VkInstance, vkDestroyInstance> instance;
+    VkTopHandle<VkDevice, vkDestroyDevice> device;
+
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
-    VkDevice device = VK_NULL_HANDLE;
     uint32_t queueFamily = 0;
     VkQueue queue = VK_NULL_HANDLE;
-    VkCommandPool commandPool = VK_NULL_HANDLE;
+
+    VkDeviceHandle<VkCommandPool, vkDestroyCommandPool> commandPool;
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 
-    VkSampler sampler = VK_NULL_HANDLE;
-    VkDescriptorSetLayout descriptorLayout = VK_NULL_HANDLE;
-    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
-    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDeviceHandle<VkFence, vkDestroyFence> fence;
+    VkDeviceHandle<VkSampler, vkDestroySampler> sampler;
+    VkDeviceHandle<VkDescriptorSetLayout, vkDestroyDescriptorSetLayout> descriptorLayout;
+    VkDeviceHandle<VkPipelineLayout, vkDestroyPipelineLayout> pipelineLayout;
+    VkDeviceHandle<VkPipeline, vkDestroyPipeline> pipeline;
 
-    VkImage canvasImage = VK_NULL_HANDLE;
-    VkDeviceMemory canvasMemory = VK_NULL_HANDLE;
-    VkImageView canvasView = VK_NULL_HANDLE;
+    VkDeviceHandle<VkImage, vkDestroyImage> canvasImage;
+    VkDeviceHandle<VkDeviceMemory, vkFreeMemory> canvasMemory;
+    VkDeviceHandle<VkImageView, vkDestroyImageView> canvasView;
     int width = 0;
     int height = 0;
 
-    VkImage stampImage = VK_NULL_HANDLE;
-    VkDeviceMemory stampMemory = VK_NULL_HANDLE;
-    VkImageView stampView = VK_NULL_HANDLE;
+    VkDeviceHandle<VkImage, vkDestroyImage> stampImage;
+    VkDeviceHandle<VkDeviceMemory, vkFreeMemory> stampMemory;
+    VkDeviceHandle<VkImageView, vkDestroyImageView> stampView;
     uint32_t stampSize = 0;
     VkImageLayout stampLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+    VkDeviceHandle<VkDescriptorPool, vkDestroyDescriptorPool> descriptorPool;
     VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
 
-    VkBuffer stagingBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    VkDeviceHandle<VkBuffer, vkDestroyBuffer> stagingBuffer;
+    VkDeviceHandle<VkDeviceMemory, vkFreeMemory> stagingMemory;
     VkDeviceSize stagingSize = 0;
 
-    VkBuffer readbackBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory readbackMemory = VK_NULL_HANDLE;
+    VkDeviceHandle<VkBuffer, vkDestroyBuffer> readbackBuffer;
+    VkDeviceHandle<VkDeviceMemory, vkFreeMemory> readbackMemory;
     VkDeviceSize readbackSize = 0;
-
-    VkFence fence = VK_NULL_HANDLE;
 
     bool deviceReady = false;
     bool canvasReady = false;
@@ -279,10 +373,12 @@ struct VkBackend::Impl {
         VkInstanceCreateInfo instanceInfo{};
         instanceInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
         instanceInfo.pApplicationInfo = &appInfo;
-        if (vkCreateInstance(&instanceInfo, nullptr, &instance) != VK_SUCCESS) {
+        VkInstance inst = VK_NULL_HANDLE;
+        if (vkCreateInstance(&instanceInfo, nullptr, &inst) != VK_SUCCESS) {
             std::fprintf(stderr, "[VkBackend] vkCreateInstance failed\n");
             return;
         }
+        instance = inst;
 
         uint32_t count = 0;
         vkEnumeratePhysicalDevices(instance, &count, nullptr);
@@ -331,20 +427,24 @@ struct VkBackend::Impl {
         deviceInfo.queueCreateInfoCount = 1;
         deviceInfo.pQueueCreateInfos = &queueInfo;
         // storage image 写入是 core，无需额外 feature（shader 用 rgba8 显式格式）。
-        if (vkCreateDevice(physicalDevice, &deviceInfo, nullptr, &device) != VK_SUCCESS) {
+        VkDevice dev = VK_NULL_HANDLE;
+        if (vkCreateDevice(physicalDevice, &deviceInfo, nullptr, &dev) != VK_SUCCESS) {
             std::fprintf(stderr, "[VkBackend] vkCreateDevice failed\n");
             return;
         }
+        device = dev;
         vkGetDeviceQueue(device, queueFamily, 0, &queue);
 
         VkCommandPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
         poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         poolInfo.queueFamilyIndex = queueFamily;
-        if (vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool) != VK_SUCCESS) {
+        VkCommandPool cmdPool = VK_NULL_HANDLE;
+        if (vkCreateCommandPool(device, &poolInfo, nullptr, &cmdPool) != VK_SUCCESS) {
             std::fprintf(stderr, "[VkBackend] vkCreateCommandPool failed\n");
             return;
         }
+        commandPool.assign(device, cmdPool);
 
         VkCommandBufferAllocateInfo cbInfo{};
         cbInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -356,7 +456,9 @@ struct VkBackend::Impl {
         VkFenceCreateInfo fenceInfo{};
         fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-        vkCreateFence(device, &fenceInfo, nullptr, &fence);
+        VkFence fenceH = VK_NULL_HANDLE;
+        vkCreateFence(device, &fenceInfo, nullptr, &fenceH);
+        fence.assign(device, fenceH);
 
         VkSamplerCreateInfo samplerInfo{};
         samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -367,7 +469,9 @@ struct VkBackend::Impl {
         samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         samplerInfo.maxLod = 0.0f;
-        vkCreateSampler(device, &samplerInfo, nullptr, &sampler);
+        VkSampler samplerH = VK_NULL_HANDLE;
+        vkCreateSampler(device, &samplerInfo, nullptr, &samplerH);
+        sampler.assign(device, samplerH);
 
         std::array<VkDescriptorSetLayoutBinding, 2> bindings{};
         bindings[0].binding = 0;
@@ -382,7 +486,9 @@ struct VkBackend::Impl {
         layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         layoutInfo.bindingCount = (uint32_t)bindings.size();
         layoutInfo.pBindings = bindings.data();
-        vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorLayout);
+        VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+        vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &dsl);
+        descriptorLayout.assign(device, dsl);
 
         VkPushConstantRange pcRange{};
         pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -391,10 +497,13 @@ struct VkBackend::Impl {
         VkPipelineLayoutCreateInfo plInfo{};
         plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         plInfo.setLayoutCount = 1;
-        plInfo.pSetLayouts = &descriptorLayout;
+        VkDescriptorSetLayout setLayouts[] = {descriptorLayout};
+        plInfo.pSetLayouts = setLayouts;
         plInfo.pushConstantRangeCount = 1;
         plInfo.pPushConstantRanges = &pcRange;
-        vkCreatePipelineLayout(device, &plInfo, nullptr, &pipelineLayout);
+        VkPipelineLayout pl = VK_NULL_HANDLE;
+        vkCreatePipelineLayout(device, &plInfo, nullptr, &pl);
+        pipelineLayout.assign(device, pl);
 
         std::string err;
         std::vector<uint32_t> spv = CompileBrushShader(&err);
@@ -420,59 +529,36 @@ struct VkBackend::Impl {
         pipeInfo.stage.module = module;
         pipeInfo.stage.pName = "main";
         pipeInfo.layout = pipelineLayout;
-        if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &pipeline) !=
+        VkPipeline pipe = VK_NULL_HANDLE;
+        if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &pipe) !=
             VK_SUCCESS) {
             std::fprintf(stderr, "[VkBackend] vkCreateComputePipelines failed\n");
         }
+        pipeline.assign(device, pipe);
         vkDestroyShaderModule(device, module, nullptr);
 
         deviceReady = true;
     }
 
     void DestroyStampTexture() {
-        if (stampView != VK_NULL_HANDLE) {
-            vkDestroyImageView(device, stampView, nullptr);
-            stampView = VK_NULL_HANDLE;
-        }
-        if (stampImage != VK_NULL_HANDLE) {
-            vkDestroyImage(device, stampImage, nullptr);
-            stampImage = VK_NULL_HANDLE;
-        }
-        if (stampMemory != VK_NULL_HANDLE) {
-            vkFreeMemory(device, stampMemory, nullptr);
-            stampMemory = VK_NULL_HANDLE;
-        }
+        // RAII 守卫 reset()：幂等，重复调用安全；析构顺序由声明序保证（子对象 → device）。
+        stampView.reset();
+        stampImage.reset();
+        stampMemory.reset();
         stampSize = 0;
         stampLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     }
 
     void DestroyCanvas() {
-        if (descriptorPool != VK_NULL_HANDLE) {
-            vkDestroyDescriptorPool(device, descriptorPool, nullptr);
-            descriptorPool = VK_NULL_HANDLE;
-        }
+        // descriptorPool 销毁 → 隐式释放 descriptorSet（池子句柄，无独立守卫）。
+        descriptorPool.reset();
         descriptorSet = VK_NULL_HANDLE;
         DestroyStampTexture();
-        if (canvasView != VK_NULL_HANDLE) {
-            vkDestroyImageView(device, canvasView, nullptr);
-            canvasView = VK_NULL_HANDLE;
-        }
-        if (canvasImage != VK_NULL_HANDLE) {
-            vkDestroyImage(device, canvasImage, nullptr);
-            canvasImage = VK_NULL_HANDLE;
-        }
-        if (canvasMemory != VK_NULL_HANDLE) {
-            vkFreeMemory(device, canvasMemory, nullptr);
-            canvasMemory = VK_NULL_HANDLE;
-        }
-        if (readbackBuffer != VK_NULL_HANDLE) {
-            vkDestroyBuffer(device, readbackBuffer, nullptr);
-            readbackBuffer = VK_NULL_HANDLE;
-        }
-        if (readbackMemory != VK_NULL_HANDLE) {
-            vkFreeMemory(device, readbackMemory, nullptr);
-            readbackMemory = VK_NULL_HANDLE;
-        }
+        canvasView.reset();
+        canvasImage.reset();
+        canvasMemory.reset();
+        readbackBuffer.reset();
+        readbackMemory.reset();
         width = height = 0;
         readbackSize = 0;
         canvasReady = false;
@@ -490,21 +576,29 @@ struct VkBackend::Impl {
         height = h;
         // Canvas storage image：usage 含 STORAGE|SAMPLED|TRANSFER_DST|TRANSFER_SRC，
         // 布局常驻 GENERAL（§4.0.5/§4.4）。
+        VkImage img = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
         CreateImage(device, physicalDevice, (uint32_t)w, (uint32_t)h, kCanvasFormat,
                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                    VK_IMAGE_LAYOUT_GENERAL, canvasImage, canvasMemory);
-        canvasView = CreateImageView(device, canvasImage, kCanvasFormat);
-        if (canvasImage == VK_NULL_HANDLE || canvasView == VK_NULL_HANDLE) {
+                    VK_IMAGE_LAYOUT_GENERAL, img, mem);
+        canvasImage.assign(device, img);
+        canvasMemory.assign(device, mem);
+        canvasView.assign(device, CreateImageView(device, img, kCanvasFormat));
+        if (img == VK_NULL_HANDLE || canvasView == VK_NULL_HANDLE) {
             std::fprintf(stderr, "[VkBackend] canvas creation failed\n");
             return;
         }
 
         readbackSize = (VkDeviceSize)w * (VkDeviceSize)h * 4;
+        VkBuffer rbuf = VK_NULL_HANDLE;
+        VkDeviceMemory rmem = VK_NULL_HANDLE;
         CreateBuffer(device, physicalDevice, readbackSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                     readbackBuffer, readbackMemory);
-        if (readbackBuffer == VK_NULL_HANDLE) {
+                     rbuf, rmem);
+        readbackBuffer.assign(device, rbuf);
+        readbackMemory.assign(device, rmem);
+        if (rbuf == VK_NULL_HANDLE) {
             std::fprintf(stderr, "[VkBackend] readback buffer creation failed\n");
             return;
         }
@@ -519,13 +613,16 @@ struct VkBackend::Impl {
         poolInfo.maxSets = 1;
         poolInfo.poolSizeCount = (uint32_t)poolSizes.size();
         poolInfo.pPoolSizes = poolSizes.data();
-        vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool);
+        VkDescriptorPool dpool = VK_NULL_HANDLE;
+        vkCreateDescriptorPool(device, &poolInfo, nullptr, &dpool);
+        descriptorPool.assign(device, dpool);
 
         VkDescriptorSetAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         allocInfo.descriptorPool = descriptorPool;
         allocInfo.descriptorSetCount = 1;
-        allocInfo.pSetLayouts = &descriptorLayout;
+        VkDescriptorSetLayout setLayouts[] = {descriptorLayout};
+        allocInfo.pSetLayouts = setLayouts;
         vkAllocateDescriptorSets(device, &allocInfo, &descriptorSet);
 
         VkDescriptorImageInfo canvasInfo{};
@@ -549,20 +646,26 @@ struct VkBackend::Impl {
         }
         DestroyStampTexture();
         stampSize = size;
+        VkImage img = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
         CreateImage(device, physicalDevice, size, size, kStampFormat,
                     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                    VK_IMAGE_LAYOUT_UNDEFINED, stampImage, stampMemory);
-        stampView = CreateImageView(device, stampImage, kStampFormat);
+                    VK_IMAGE_LAYOUT_UNDEFINED, img, mem);
+        stampImage.assign(device, img);
+        stampMemory.assign(device, mem);
+        stampView.assign(device, CreateImageView(device, img, kStampFormat));
 
         VkDeviceSize need = (VkDeviceSize)size * size * 4;
         if (need > stagingSize) {
-            if (stagingBuffer != VK_NULL_HANDLE) {
-                vkDestroyBuffer(device, stagingBuffer, nullptr);
-                vkFreeMemory(device, stagingMemory, nullptr);
-            }
+            stagingBuffer.reset();
+            stagingMemory.reset();
+            VkBuffer buf = VK_NULL_HANDLE;
+            VkDeviceMemory bmem = VK_NULL_HANDLE;
             CreateBuffer(device, physicalDevice, need, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                         stagingBuffer, stagingMemory);
+                         buf, bmem);
+            stagingBuffer.assign(device, buf);
+            stagingMemory.assign(device, bmem);
             stagingSize = need;
         }
 
@@ -586,7 +689,7 @@ struct VkBackend::Impl {
             std::fprintf(stderr, "[VkBackend] vkEndCommandBuffer failed\n");
             return;
         }
-        vkResetFences(device, 1, &fence);
+        vkResetFences(device, 1, &fence.h);
         VkSubmitInfo submit{};
         submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submit.commandBufferCount = 1;
@@ -595,7 +698,7 @@ struct VkBackend::Impl {
             std::fprintf(stderr, "[VkBackend] vkQueueSubmit failed\n");
             return;
         }
-        vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+        vkWaitForFences(device, 1, &fence.h, VK_TRUE, UINT64_MAX);
     }
 
     void BeginCommands() {
@@ -719,49 +822,22 @@ struct VkBackend::Impl {
         }
         vkDeviceWaitIdle(device);
         DestroyCanvas();
-        if (stagingBuffer != VK_NULL_HANDLE) {
-            vkDestroyBuffer(device, stagingBuffer, nullptr);
-            stagingBuffer = VK_NULL_HANDLE;
-        }
-        if (stagingMemory != VK_NULL_HANDLE) {
-            vkFreeMemory(device, stagingMemory, nullptr);
-            stagingMemory = VK_NULL_HANDLE;
-        }
-        if (fence != VK_NULL_HANDLE) {
-            vkDestroyFence(device, fence, nullptr);
-            fence = VK_NULL_HANDLE;
-        }
-        if (pipeline != VK_NULL_HANDLE) {
-            vkDestroyPipeline(device, pipeline, nullptr);
-            pipeline = VK_NULL_HANDLE;
-        }
-        if (pipelineLayout != VK_NULL_HANDLE) {
-            vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
-            pipelineLayout = VK_NULL_HANDLE;
-        }
-        if (descriptorLayout != VK_NULL_HANDLE) {
-            vkDestroyDescriptorSetLayout(device, descriptorLayout, nullptr);
-            descriptorLayout = VK_NULL_HANDLE;
-        }
-        if (sampler != VK_NULL_HANDLE) {
-            vkDestroySampler(device, sampler, nullptr);
-            sampler = VK_NULL_HANDLE;
-        }
-        if (commandPool != VK_NULL_HANDLE) {
-            vkDestroyCommandPool(device, commandPool, nullptr);
-            commandPool = VK_NULL_HANDLE;
-        }
-        vkDestroyDevice(device, nullptr);
-        device = VK_NULL_HANDLE;
-        if (instance != VK_NULL_HANDLE) {
-            vkDestroyInstance(instance, nullptr);
-            instance = VK_NULL_HANDLE;
-        }
+        stagingBuffer.reset();
+        stagingMemory.reset();
+        fence.reset();
+        pipeline.reset();
+        pipelineLayout.reset();
+        descriptorLayout.reset();
+        sampler.reset();
+        commandPool.reset();
+        commandBuffer = VK_NULL_HANDLE;
+        device.reset();
+        instance.reset();
         deviceReady = false;
     }
 };
 
-VkBackend::VkBackend() : impl_(new Impl()) {}
+VkBackend::VkBackend() : impl_(std::make_unique<Impl>()) {}
 
 VkBackend::~VkBackend() {
     shutdown();
