@@ -103,12 +103,16 @@ struct GlCanvas {
 // src/gl_canvas.cpp
 #include "gl_canvas.h"
 
+// 必须先 include <GLFW/glfw3.h>：imgui 过滤版 loader 缺 GL 枚举
+// （GL_TRIANGLE_FAN / GL_CLAMP_TO_EDGE / GL_RGBA8 / GL_NEAREST /
+//  GL_TEXTURE_WRAP_S/T / GL_STATIC_DRAW）与 glDrawArrays 声明，
+// 这些由 GLFW/OpenGL 头补齐；链接用已有的 OpenGL::GL。
+#include <GLFW/glfw3.h>
+
 // GL 函数指针加载：复用 ImGui 自带的内嵌 gl3w（imgl3w），零新增依赖。
 // 该头在 CMake 的 FetchContent 拉取的 imgui-src/backends/ 下，
 // 由 paint_imgui target 的 PUBLIC include 路径提供。
-// 需在声明 GL 函数前 #define GL3W_CALLBACK 由本 TU 提供 gl3wGetProcAddress 实现，
-// 或直接依赖 imgl3wInit 内部用 glfwGetProcAddress 加载（见 imgui_impl_opengl3.cpp）。
-// 本实现采用 imgl3w：include 该 loader 头后调用 imgl3wInit()。
+// 本实现采用 imgl3w：include 该 loader 头后调用 imgl3wInit()（内部用 glfwGetProcAddress 加载）。
 #include <imgui_impl_opengl3_loader.h>
 #include <cstdio>
 
@@ -315,6 +319,9 @@ Expected: 编译通过。
         if (impl->sdk) {
             int rc = dgcSetOffscreenSurface(impl->sdk, w, h);
             if (rc != 0) std::fprintf(stderr, "[paint-pc] resize offscreen: %s\n", dgcGetLastError());
+            // 同步画布尺寸与读回缓冲，避免 resize 后 readback 缓冲不匹配。
+            impl->canvasW = w; impl->canvasH = h;
+            impl->rgba.resize((size_t)w * h * 4);
         }
     }
 ```
@@ -525,3 +532,7 @@ git add tests/smoke.sh && git commit -m "test: paint-pc headless 冒烟（构建
   - F4 画布 quad 绘制移到 `ImGui::Render()` 之前，避免盖住 FPS 浮层（Task 3 Step 4）。
   - F5 读回/离屏/clear 检查返回值 + 记 `dgcGetLastError`；输入越界裁剪；headless 无 Vulkan 设备给明确错误（Task 3/4）。
   - F12 两 Task 1 注明 `508da64` 远程可达前提 + 离线处理。
+- **复审通过（2026-08-24，86.6/100）**：执行注意 3 条已并入计划：
+  - `gl_canvas.cpp` 先 `#include <GLFW/glfw3.h>`（imgui 过滤 loader 缺 GL 枚举与 `glDrawArrays`）。
+  - headless 依赖本机 Vulkan 设备（lavapipe 可用）；smoke `[ -s "$out" ]` 为唯一防线，保留。
+  - `OnFramebufferSize` 同步 `canvasW/H` + `rgba.resize(w*h*4)`。
