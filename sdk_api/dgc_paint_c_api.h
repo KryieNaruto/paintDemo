@@ -84,9 +84,10 @@ int dgcSetOffscreenSurface(DgcContext* ctx, int w, int h);
 int dgcExportPNG(DgcContext* ctx, const char* path);
 int dgcReadbackPixels(DgcContext* ctx, void* rgbaOut);
 
-/* ── v3.0：确定性（本期仅存参；ReplayRandom/固定步进内核归 B1-7）── */
+/* ── v3.0：确定性（B1-7 接线：注入/重播种 Mt19937Random + 固定时间步进）── */
 int dgcSetRandomSeed(DgcContext* ctx, uint64_t seed);
-/* fixed_time_us 为固定时间戳（微秒）；负值语义未定义，本期仅存参不校验。 */
+/* fixed_time_us 为固定时间步长（微秒）：override 后每点 t_us = n * fixed_time_us，
+ * 每笔画 dgcBeginStroke 归零递增（首点 0、次点 step、再点 2*step …）；负值语义未定义，不校验。 */
 int dgcSetFixedTime(DgcContext* ctx, double t_us);
 
 /* ── v3.0：参数化（对齐 DgcBrushSetting）── */
