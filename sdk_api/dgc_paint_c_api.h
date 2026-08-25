@@ -16,6 +16,19 @@
 
 #include <stdint.h>
 
+/* ── 符号导出宏（B5-1 可见性收紧）──
+ * 共享库（Android .so / Windows DLL）配合 -fvisibility=hidden，只导出标记 DGC_API 的 C ABI 符号；
+ * 头文件仍不暴露任何内部 C++ 类型。host 静态库下宏展开为 visibility("default")（无害，默认即 default）。 */
+#if defined(_WIN32) && defined(DGC_PAINT_BUILDING)
+#  define DGC_API __declspec(dllexport)
+#elif defined(_WIN32)
+#  define DGC_API __declspec(dllimport)
+#elif defined(__GNUC__) || defined(__clang__)
+#  define DGC_API __attribute__((visibility("default")))
+#else
+#  define DGC_API
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -45,30 +58,30 @@ typedef enum {
 } DgcError;
 
 /* 创建/销毁上下文。失败返回 NULL（当前无失败路径）。 */
-DgcContext* dgcCreate(void);
-void        dgcDestroy(DgcContext* ctx);
+DGC_API DgcContext* dgcCreate(void);
+DGC_API void        dgcDestroy(DgcContext* ctx);
 
 /* 表面/尺寸。Null 后端下 nativeWindow 可为 NULL（headless）。 */
-int dgcSetSurface(DgcContext* ctx, void* nativeWindow, int w, int h);
-int dgcResize(DgcContext* ctx, int w, int h);
+DGC_API int dgcSetSurface(DgcContext* ctx, void* nativeWindow, int w, int h);
+DGC_API int dgcResize(DgcContext* ctx, int w, int h);
 
 /* 笔画事件流。isPredicted 非 0 表示预测点。 */
-int dgcBeginStroke(DgcContext* ctx, float x, float y, float pressure, float tiltX, float tiltY);
-int dgcStrokeTo(DgcContext* ctx, float x, float y, float pressure, float tiltX, float tiltY, int isPredicted);
-int dgcEndStroke(DgcContext* ctx);
+DGC_API int dgcBeginStroke(DgcContext* ctx, float x, float y, float pressure, float tiltX, float tiltY);
+DGC_API int dgcStrokeTo(DgcContext* ctx, float x, float y, float pressure, float tiltX, float tiltY, int isPredicted);
+DGC_API int dgcEndStroke(DgcContext* ctx);
 
 /* 笔刷管理。myb 加载本期未实现（无 L5），返回 DGC_INVALID_BRUSH + 错误码。 */
-DgcBrush dgcCreateBrush(DgcContext* ctx, const DgcBrushParams* params);
-DgcBrush dgcLoadBrushFromMyb(DgcContext* ctx, const char* mybJson);
-int      dgcDestroyBrush(DgcContext* ctx, DgcBrush brush);
-int      dgcSetBrush(DgcContext* ctx, DgcBrush brush);
+DGC_API DgcBrush dgcCreateBrush(DgcContext* ctx, const DgcBrushParams* params);
+DGC_API DgcBrush dgcLoadBrushFromMyb(DgcContext* ctx, const char* mybJson);
+DGC_API int      dgcDestroyBrush(DgcContext* ctx, DgcBrush brush);
+DGC_API int      dgcSetBrush(DgcContext* ctx, DgcBrush brush);
 
 /* 渲染/清屏。 */
-int dgcRender(DgcContext* ctx);
-int dgcClear(DgcContext* ctx, float r, float g, float b, float a);
+DGC_API int dgcRender(DgcContext* ctx);
+DGC_API int dgcClear(DgcContext* ctx, float r, float g, float b, float a);
 
 /* 最近一次错误描述（线程局部）：有错误返回静态描述串，无错误返回 NULL。 */
-const char* dgcGetLastError(void);
+DGC_API const char* dgcGetLastError(void);
 
 /* 笔刷参数化 settingId 常量（C API 层自定；真实内核语义归 B3-1）。 */
 typedef enum {
@@ -80,27 +93,27 @@ typedef enum {
 } DgcBrushSetting;
 
 /* ── v3.0：离屏 / 导出 / 像素读回（真实实现归 B2-1，本期 NOT_IMPLEMENTED）── */
-int dgcSetOffscreenSurface(DgcContext* ctx, int w, int h);
-int dgcExportPNG(DgcContext* ctx, const char* path);
-int dgcReadbackPixels(DgcContext* ctx, void* rgbaOut);
+DGC_API int dgcSetOffscreenSurface(DgcContext* ctx, int w, int h);
+DGC_API int dgcExportPNG(DgcContext* ctx, const char* path);
+DGC_API int dgcReadbackPixels(DgcContext* ctx, void* rgbaOut);
 
 /* ── v3.0：确定性（B1-7 接线：注入/重播种 Mt19937Random + 固定时间步进）── */
-int dgcSetRandomSeed(DgcContext* ctx, uint64_t seed);
+DGC_API int dgcSetRandomSeed(DgcContext* ctx, uint64_t seed);
 /* fixed_time_us 为固定时间步长（微秒）：override 后每点 t_us = n * fixed_time_us，
  * 每笔画 dgcBeginStroke 归零递增（首点 0、次点 step、再点 2*step …）；负值语义未定义，不校验。 */
-int dgcSetFixedTime(DgcContext* ctx, double t_us);
+DGC_API int dgcSetFixedTime(DgcContext* ctx, double t_us);
 
 /* ── v3.0：参数化（对齐 DgcBrushSetting）── */
-int dgcSetBrushSetting(DgcContext* ctx, DgcBrush brush, int settingId, double value);
-int dgcSetBrushColor(DgcContext* ctx, DgcBrush brush, float r, float g, float b, float a);
+DGC_API int dgcSetBrushSetting(DgcContext* ctx, DgcBrush brush, int settingId, double value);
+DGC_API int dgcSetBrushColor(DgcContext* ctx, DgcBrush brush, float r, float g, float b, float a);
 
 /* ── v3.0：撤销（留接口不实现，撤销栈归后续任务）── */
-int dgcUndo(DgcContext* ctx);
+DGC_API int dgcUndo(DgcContext* ctx);
 
 /* ── v3.0：flush/drain 屏障（B5-2 第 23 函数，additive）──
  * 阻塞至所有已提交笔画输入已被渲染线程合成完毕，供离屏「入队 → export」的同步读回。
  * 引擎未运行时无需等待，直接返回 DGC_OK；ctx 为 NULL 返回 DGC_ERR_NULL_CONTEXT。 */
-int dgcFlush(DgcContext* ctx);
+DGC_API int dgcFlush(DgcContext* ctx);
 
 #ifdef __cplusplus
 }
