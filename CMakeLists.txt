@@ -21,6 +21,18 @@ option(DGCPAIN_RENDER_BGFX    "Route D: bgfx"                       OFF)
 # 通用选项
 option(DGCPAIN_BUILD_TESTS    "Build host unit tests"               ON)
 
+# 所有权/内存安全验证：ASan + LSan（host GCC/Clang 调试构建；Android 下不适用，勿加）。
+option(DGCPAIN_SANITIZE "Enable AddressSanitizer + LeakSanitizer (host debug)" OFF)
+if(DGCPAIN_SANITIZE)
+    # Android NDK 的编译器 ID 也是 Clang，但 -fsanitize=leak 在 Android 上不可用，故显式排除。
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT DGCPAIN_ANDROID)
+        add_compile_options(-fsanitize=address,leak -fno-omit-frame-pointer)
+        add_link_options(-fsanitize=address,leak)
+    else()
+        message(WARNING "DGCPAIN_SANITIZE only supported on host GCC/Clang (skipped)")
+    endif()
+endif()
+
 # ── 合法性检查（抄自 路线整理.md「顶层 CMake 选项设计」，与 §2.3 口径一致）──
 if(DGCPAIN_KERNEL_GPU AND NOT DGCPAIN_RENDER_VULKAN)
     message(FATAL_ERROR "Route B (GPU kernel) requires Vulkan renderer")
