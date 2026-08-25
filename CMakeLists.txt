@@ -50,6 +50,7 @@ add_library(dgc_paint
     core/null/null_paint_kernel.cpp
     core/null/null_render_backend.cpp
     core/engine.cpp
+    core/stroke_predictor.cpp
     sdk_api/dgc_paint_c_api.cpp
     render/render_backend_factory.cpp
 )

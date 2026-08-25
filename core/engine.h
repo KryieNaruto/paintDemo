@@ -3,6 +3,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -12,6 +13,7 @@
 
 class IPaintKernel;
 class IRenderBackend;
+class StrokeModeler;
 
 // 输入事件：内核线程的 beginStroke/endStroke 有状态，必须在内核线程执行，
 // 故输入队列元素是完整事件（含 Begin/Point/End）而非裸 StrokePoint。
@@ -44,6 +46,11 @@ public:
     // 外部入队口（B1-4 从这里接 C API）。满则返回 false（调用方可重试/丢弃）。
     bool submitInput(const StrokeEvent& ev);
 
+    // 可注入预测器槽（B1-5 设计预留）：默认 nullptr = passthrough（inputLoop 原样透传）。
+    // 非空时输入线程对真实 StrokePoint 走 Update/Predict 产出平滑 + 预测点；Begin/End 触发 Reset。
+    // B1-5 交付保持默认 nullptr，真实接线归 B2/B3。
+    void setPredictor(std::unique_ptr<StrokeModeler> predictor);
+
     // drain 屏障（B5-2）：阻塞至「所有已提交输入已合成完毕」。仅在引擎三线程之外
     // （C API 调用线程）调用；纯等待 + 原子读，无新堆所有权。
     void flush();
@@ -55,6 +62,9 @@ private:
 
     IPaintKernel*  kernel_;
     IRenderBackend* backend_;
+
+    // 预测器槽（B1-5 设计预留）：RAII 持有，默认 nullptr = passthrough。
+    std::unique_ptr<StrokeModeler> predictor_;
 
     // 两段无锁 SPSC 队列
     RingBuffer<StrokeEvent, 1024>            input_to_brush_;
