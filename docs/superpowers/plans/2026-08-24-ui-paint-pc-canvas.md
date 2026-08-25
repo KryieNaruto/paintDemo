@@ -40,6 +40,7 @@ cd /home/qiansenwei/workspace/paint-pc
 cd sdk && git fetch origin && git checkout 508da64 && cd ..
 git add sdk && git commit -m "chore: 前移 SDK submodule 到 508da64（含 B1-7/B1-8/B2-1/B5-2）"
 ```
+> 前提：submodule origin（`https://github.com/KryieNaruto/paintDemo.git`）可达且含 `508da64`（已验证在远程 main 上，fetch 即可得）。离线/网络失败时：先 `git -C sdk fetch origin 508da64` 或改用本地含该 commit 的引用。
 
 - [ ] **Step 2: 验证头文件含新函数**
 
@@ -51,9 +52,11 @@ Expected: 4 行都出现（含 `dgcFlush`）。
 - [ ] **Step 3: 干净构建确认 C API 编译**
 
 ```bash
-rm -rf build && cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug && cmake --build build -j
+rm -rf build && cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug -DDGCPAIN_BUILD_TESTS=OFF -DDGCPAIN_BUILD_CLI=OFF && cmake --build build -j
 ```
 Expected: 编译通过，产物 `build/paint_pc` 存在。
+
+> 注：必须带 `-DDGCPAIN_BUILD_TESTS=OFF`（SDK 默认 ON，且消费者根下 tests 因 `CMAKE_SOURCE_DIR` 错位会失效——与 paint-pc 现有 build/CMakeCache 及 android build.gradle 注释口径一致）。`-DDGCPAIN_BUILD_CLI=OFF` 避免 host 下 SDK 侧 CLI 参与构建。
 
 ---
 
@@ -234,123 +237,147 @@ Expected: 编译通过。
 - Consumes: `dgc_paint_c_api.h` 全函数；`GlCanvas`（Task 2）
 - Produces: `App::init(width,height,title)` 签名不变；`App` 增加成员 `DgcContext* ctx_`、`GlCanvas* canvas_`、`int canvasW_/canvasH_`、`std::vector<uint8_t> pixels_`、FPS 计时字段。
 
-- [ ] **Step 1: app.h 加成员**
+> **本 Task 基于 `app.cpp` 现状（`App::Impl` 定义在 app.cpp，Pimpl 持有 `Impl* m`）。所有改动落在 `app.cpp` 内的 `App::Impl` 结构体与其成员函数中，不在 app.h 定义 Impl（避免 ODR 重定义）。**
 
+- [ ] **Step 1: app.cpp include 区 + `App::Impl` 增成员**
+
+`app.cpp` 顶部 include 追加：
 ```cpp
-// src/app.h —— 追加（保持 App 接口不变）
 #include "dgc_paint_c_api.h"
-#include <cstdint>
+#include "gl_canvas.h"
 #include <vector>
-struct GlCanvas;
-
-namespace paint {
-struct App::Impl {  // 在 Impl 内追加
+#include <cstdint>
+```
+`struct App::Impl`（app.cpp 内）追加成员（保持既有成员不动）：
+```cpp
+    // SDK C API + 画布贴图（新增）
     DgcContext* sdk = nullptr;
     GlCanvas* canvas = nullptr;
     int canvasW = 1280, canvasH = 800;
-    std::vector<uint8_t> rgba;  // RGBA8, canvasW*canvasH*4
-
-    // FPS 统计
-    double lastTick = 0.0; int frames = 0; double fps = 0.0;
-    double lastReadMs = 0.0;
-
+    std::vector<uint8_t> rgba;        // RGBA8, canvasW*canvasH*4
+    double lastReadMs = 0.0;          // 读回耗时
     bool strokeActive = false;
-    bool headless = false;
-};
-}
 ```
 
-- [ ] **Step 2: app.cpp init 接 SDK**
+- [ ] **Step 2: init() 接 SDK（glfwSet*Callback 之后、ImGui 初始化之后）**
 
 ```cpp
-// init() 内、glfwInit() 成功之后：
-#include "dgc_paint_c_api.h"
-#include "gl_canvas.h"
-// （放在文件顶部 include 区）
-
-// init() 里：
-impl->sdk = dgcCreate();
-if (!impl->sdk) { std::fprintf(stderr, "[paint-pc] dgcCreate failed\n"); return false; }
-dgcSetOffscreenSurface(impl->sdk, impl->canvasW, impl->canvasH);
-dgcClear(impl->sdk, 0.96f, 0.95f, 0.91f, 1.0f);  // 纸白
-impl->rgba.assign((size_t)impl->canvasW * impl->canvasH * 4, 255);
-impl->canvas = new GlCanvas(impl->canvasW, impl->canvasH);
+    impl->sdk = dgcCreate();
+    if (!impl->sdk) {
+        std::fprintf(stderr, "[paint-pc] dgcCreate failed\n");
+        shutdown();
+        return false;
+    }
+    int rc = dgcSetOffscreenSurface(impl->sdk, impl->canvasW, impl->canvasH);
+    if (rc != 0) { std::fprintf(stderr, "[paint-pc] offscreen surface: %s\n", dgcGetLastError()); shutdown(); return false; }
+    rc = dgcClear(impl->sdk, 0.96f, 0.95f, 0.91f, 1.0f);
+    if (rc != 0) { std::fprintf(stderr, "[paint-pc] clear: %s\n", dgcGetLastError()); }
+    impl->rgba.assign((size_t)impl->canvasW * impl->canvasH * 4, 255);
+    impl->canvas = new GlCanvas(impl->canvasW, impl->canvasH);
 ```
 
-- [ ] **Step 3: 输入回调接 C API（替换 TODO 桩）**
+- [ ] **Step 3: 就地改既有回调成员函数（不新增同名自由函数）**
 
+在 `App::Impl::OnMouseButton` 成员函数内填充（替换 `// TODO` 注释）：
 ```cpp
-static void OnMouseButton(GLFWwindow* window, int button, int action, int mods) {
-    (void)mods;
-    auto* impl = static_cast<Impl*>(glfwGetWindowUserPointer(window));
-    if (!impl || !impl->sdk) return;
-    if (button == GLFW_MOUSE_BUTTON_LEFT) {
-        impl->strokeActive = (action == GLFW_PRESS);
-        double x, y; glfwGetCursorPos(window, &x, &y);
-        if (impl->strokeActive) {
-            dgcBeginStroke(impl->sdk, (float)x, (float)y, 0.5f, 0.f, 0.f);
-        } else {
-            dgcEndStroke(impl->sdk);
+    static void OnMouseButton(GLFWwindow* window, int button, int action, int mods) {
+        (void)mods;
+        auto* impl = static_cast<Impl*>(glfwGetWindowUserPointer(window));
+        if (!impl || !impl->sdk) return;
+        if (button == GLFW_MOUSE_BUTTON_LEFT) {
+            double x, y; glfwGetCursorPos(window, &x, &y);
+            // 越界裁剪（spec §6）：超出画布则丢弃该点，避免负坐标进 SDK。
+            if (x < 0 || y < 0 || x >= impl->canvasW || y >= impl->canvasH) { impl->strokeActive = false; return; }
+            impl->strokeActive = (action == GLFW_PRESS);
+            if (impl->strokeActive) {
+                int rc = dgcBeginStroke(impl->sdk, (float)x, (float)y, 0.5f, 0.f, 0.f);
+                if (rc != 0) std::fprintf(stderr, "[paint-pc] beginStroke: %s\n", dgcGetLastError());
+            } else {
+                int rc = dgcEndStroke(impl->sdk);
+                if (rc != 0) std::fprintf(stderr, "[paint-pc] endStroke: %s\n", dgcGetLastError());
+            }
         }
     }
-}
 
-static void OnCursorPos(GLFWwindow* window, double x, double y) {
-    auto* impl = static_cast<Impl*>(glfwGetWindowUserPointer(window));
-    if (!impl || !impl->sdk || !impl->strokeActive) return;
-    dgcStrokeTo(impl->sdk, (float)x, (float)y, 0.5f, 0.f, 0.f, 0);
-}
+    static void OnCursorPos(GLFWwindow* window, double x, double y) {
+        auto* impl = static_cast<Impl*>(glfwGetWindowUserPointer(window));
+        if (!impl || !impl->sdk || !impl->strokeActive) return;
+        if (x < 0 || y < 0 || x >= impl->canvasW || y >= impl->canvasH) return;  // 越界丢弃
+        int rc = dgcStrokeTo(impl->sdk, (float)x, (float)y, 0.5f, 0.f, 0.f, 0);
+        if (rc != 0) std::fprintf(stderr, "[paint-pc] strokeTo: %s\n", dgcGetLastError());
+    }
+
+    static void OnFramebufferSize(GLFWwindow* window, int w, int h) {
+        auto* impl = static_cast<Impl*>(glfwGetWindowUserPointer(window));
+        if (!impl) return;
+        glViewport(0, 0, w, h);
+        impl->width = w; impl->height = h;
+        if (impl->sdk) {
+            int rc = dgcSetOffscreenSurface(impl->sdk, w, h);
+            if (rc != 0) std::fprintf(stderr, "[paint-pc] resize offscreen: %s\n", dgcGetLastError());
+        }
+    }
 ```
 
-- [ ] **Step 4: 每帧读回 + 贴图 + FPS**
+- [ ] **Step 4: run() 主循环 —— 画布贴图在 ImGui 之前（修复浮层被盖）**
 
+`run()` 循环内，把画布贴图绘制放在 **ImGui::Render() 之前**（紧跟 glClear 之后），否则全屏 quad 会盖住 ImGui FPS 浮层：
 ```cpp
-// run() 渲染循环内，ImGui 绘制后、glfwSwapBuffers 前：
-// 1) readback（仅当有输入变化或每帧都读——本期每帧读，方便打点）
-auto t0 = glfwGetTime();
-if (impl->sdk) {
-    dgcReadbackPixels(impl->sdk, impl->rgba.data());
-}
-impl->lastReadMs = (glfwGetTime() - t0) * 1000.0;
-if (impl->canvas) impl->canvas->upload(impl->rgba.data(), impl->canvasW, impl->canvasH);
+    while (!glfwWindowShouldClose(m->window)) {
+        glfwPollEvents();
 
-// 2) FPS 统计（每 0.5s 刷新一次显示值）
-impl->frames++;
-double now = glfwGetTime();
-if (now - impl->lastTick >= 0.5) { impl->fps = impl->frames / (now - impl->lastTick); impl->frames = 0; impl->lastTick = now; }
+        // 画布底色 + 读回贴图（必须先于 ImGui，避免全屏 quad 盖住浮层）
+        glViewport(0, 0, m->width, m->height);
+        glClearColor(m->clearColor[0], m->clearColor[1], m->clearColor[2], m->clearColor[3]);
+        glClear(GL_COLOR_BUFFER_BIT);
 
-// 3) ImGui 浮层
-ImGui::Begin("Performance");
-ImGui::Text("FPS: %.1f", impl->fps);
-ImGui::Text("Frame: %.2f ms", 1000.0 / (impl->fps > 0 ? impl->fps : 1.0));
-ImGui::Text("Readback: %.2f ms", impl->lastReadMs);
-ImGui::Text("Canvas: %dx%d", impl->canvasW, impl->canvasH);
-ImGui::End();
+        if (m->sdk) {
+            auto t0 = glfwGetTime();
+            int rc = dgcReadbackPixels(m->sdk, m->rgba.data());   // 检查返回值
+            m->lastReadMs = (glfwGetTime() - t0) * 1000.0;
+            if (rc != 0) {
+                std::fprintf(stderr, "[paint-pc] readback: %s\n", dgcGetLastError());
+            } else if (m->canvas) {
+                m->canvas->upload(m->rgba.data(), m->canvasW, m->canvasH);
+                m->canvas->draw(m->width, m->height);
+            }
+        }
 
-// 4) 画布贴图绘制（画布 quad 在 ImGui 之后、swap 之前）
-impl->canvas->draw(impl->width, impl->height);
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.6f);
+        ImGui::Begin("Performance", nullptr,
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                         ImGuiWindowFlags_AlwaysAutoResize);
+        ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
+        ImGui::Text("Frame: %.2f ms", 1000.0 / (ImGui::GetIO().Framerate > 0 ? ImGui::GetIO().Framerate : 1.0));
+        ImGui::Text("Readback: %.2f ms", m->lastReadMs);
+        ImGui::Text("Canvas: %dx%d", m->canvasW, m->canvasH);
+        ImGui::End();
+
+        ImGui::Render();
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        glfwSwapBuffers(m->window);
+    }
 ```
 
 - [ ] **Step 5: shutdown 释放**
 
 ```cpp
-// shutdown() 内：
-if (impl->sdk) { dgcDestroy(impl->sdk); impl->sdk = nullptr; }
-delete impl->canvas; impl->canvas = nullptr;
+    // shutdown() 内、glfwDestroyWindow 前后：
+    delete m->canvas; m->canvas = nullptr;
+    if (m->sdk) { dgcDestroy(m->sdk); m->sdk = nullptr; }
 ```
 
-- [ ] **Step 6: main.cpp 传 headless 标记**
-
-```cpp
-// main.cpp：解析 argv 含 "--headless" 时走 Task 4 的 HeadlessRun，否则正常窗口。
-```
-
-- [ ] **Step 7: 构建 + 有显示验证**
+- [ ] **Step 6: 构建 + 有显示验证**
 
 ```bash
-cmake --build build -j && ./build/paint_pc   # 有显示环境：白底画布 + FPS 浮层，拖拽有输入
+cmake --build build -j && ./build/paint_pc   # 有显示环境：纸白画布 + FPS/Readback 浮层
 ```
-Expected: 窗口显示纸白画布 + FPS/Readback 浮层，拖拽不崩（Null 内核无笔迹属预期）。
+Expected: 窗口显示纸白画布，浮层可见（FPS / Frame ms / Readback ms），拖拽不崩（Null 内核无笔迹属预期）。
 
 ---
 
@@ -383,9 +410,15 @@ namespace paint {
 
 int HeadlessRun(int w, int h, const char* outPng) {
     DgcContext* sdk = dgcCreate();
-    if (!sdk) { std::fprintf(stderr, "[headless] dgcCreate failed\n"); return 1; }
-    dgcSetOffscreenSurface(sdk, w, h);
-    dgcClear(sdk, 0.96f, 0.95f, 0.91f, 1.0f);
+    if (!sdk) {
+        // dgcCreate 默认 VkBackend，无 Vulkan 设备/ICD 时可能失败——给明确错误提示。
+        std::fprintf(stderr, "[headless] dgcCreate failed: %s\n", dgcGetLastError());
+        return 1;
+    }
+    int rc = dgcSetOffscreenSurface(sdk, w, h);
+    if (rc != 0) { std::fprintf(stderr, "[headless] offscreen: %s\n", dgcGetLastError()); dgcDestroy(sdk); return 2; }
+    rc = dgcClear(sdk, 0.96f, 0.95f, 0.91f, 1.0f);
+    if (rc != 0) { std::fprintf(stderr, "[headless] clear: %s\n", dgcGetLastError()); }
     dgcSetRandomSeed(sdk, 42);            // 确定性：固定 seed
     dgcSetFixedTime(sdk, 1000.0);          // 固定时间步：1ms
     dgcBeginStroke(sdk, 100.f, 100.f, 0.5f, 0.f, 0.f);
@@ -394,7 +427,7 @@ int HeadlessRun(int w, int h, const char* outPng) {
     }
     dgcEndStroke(sdk);
     dgcFlush(sdk);                          // 等合成完成（B5-2）
-    int rc = dgcExportPNG(sdk, outPng);
+    rc = dgcExportPNG(sdk, outPng);
     dgcDestroy(sdk);
     if (rc != 0) { std::fprintf(stderr, "[headless] export failed: %s\n", dgcGetLastError()); return 2; }
     std::printf("[headless] PNG written: %s\n", outPng);
@@ -456,7 +489,8 @@ git add -A && git commit -m "feat: paint-pc 接入 SDK C API —— 画布输入
 # tests/smoke.sh —— paint-pc 无头冒烟：构建 + headless 离屏导出 PNG
 set -euo pipefail
 cd "$(dirname "$0")/.."
-cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug
+# 必须带 -DDGCPAIN_BUILD_TESTS=OFF：消费者根下 SDK tests 因 CMAKE_SOURCE_DIR 错位会失效。
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug -DDGCPAIN_BUILD_TESTS=OFF -DDGCPAIN_BUILD_CLI=OFF
 cmake --build build -j
 out=$(mktemp /tmp/paint_pc_headless.XXXXXX.png)
 ./build/paint_pc --headless "$out"
@@ -484,3 +518,10 @@ git add tests/smoke.sh && git commit -m "test: paint-pc headless 冒烟（构建
 - **Spec 覆盖**：上屏（读回+贴图）→ Task 3/4；输入 → Task 3；FPS 浮层 → Task 3；headless 离屏 PNG → Task 4；性能依赖 B3-1 声明 → Global Constraints。✓
 - **占位符扫描**：无 TBD/TODO/「类似 Task N」。✓
 - **类型一致性**：`GlCanvas` 构造/upload/draw 签名跨 Task 2/3 一致；C API 签名从 `dgc_paint_c_api.h` 抄录（`dgcStrokeTo` 7 参含 `isPredicted`，`dgcFlush` 存在）。✓
+- **审阅打回修订（2026-08-24，71→修订）**：
+  - F1 build 命令补 `-DDGCPAIN_BUILD_TESTS=OFF -DDGCPAIN_BUILD_CLI=OFF`（Task 1 Step 3、smoke.sh）。
+  - F2 不再在 app.h 定义 `App::Impl`（ODR）——改在 app.cpp 既有 `struct App::Impl` 内加成员（Task 3 Step 1）。
+  - F3 就地改既有 `App::Impl::OnMouseButton/OnCursorPos/OnFramebufferSize` 成员（不新增同名自由函数），填充 C API 调用（Task 3 Step 3）。
+  - F4 画布 quad 绘制移到 `ImGui::Render()` 之前，避免盖住 FPS 浮层（Task 3 Step 4）。
+  - F5 读回/离屏/clear 检查返回值 + 记 `dgcGetLastError`；输入越界裁剪；headless 无 Vulkan 设备给明确错误（Task 3/4）。
+  - F12 两 Task 1 注明 `508da64` 远程可达前提 + 离线处理。
