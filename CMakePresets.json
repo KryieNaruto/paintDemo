@@ -14,6 +14,19 @@
       }
     },
     {
+      "name": "host-linux-sanitize",
+      "displayName": "Host Linux (Ninja, Debug, ASan+LSan)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/host-linux-sanitize",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "DGCPAIN_KERNEL_BRUSH": "ON",
+        "DGCPAIN_RENDER_VULKAN": "ON",
+        "DGCPAIN_BUILD_TESTS": "ON",
+        "DGCPAIN_SANITIZE": "ON"
+      }
+    },
+    {
       "name": "host-windows",
       "displayName": "Host Windows (Ninja, Debug)",
       "generator": "Ninja",
@@ -45,6 +58,10 @@
     {
       "name": "host-linux",
       "configurePreset": "host-linux"
+    },
+    {
+      "name": "host-linux-sanitize",
+      "configurePreset": "host-linux-sanitize"
     },
     {
       "name": "host-windows",
