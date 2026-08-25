@@ -53,6 +53,7 @@ add_library(dgc_paint
     core/stroke_predictor.cpp
     sdk_api/dgc_paint_c_api.cpp
     render/render_backend_factory.cpp
+    kernels/brush/brush_kernel_factory.cpp
 )
 target_include_directories(dgc_paint
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/sdk_api   # 唯一对外 include（B1-4 才放头）
