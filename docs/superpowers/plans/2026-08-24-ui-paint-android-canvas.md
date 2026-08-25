@@ -41,6 +41,7 @@ cd /home/qiansenwei/workspace/paint-android
 cd sdk && git fetch origin && git checkout 508da64 && cd ..
 git add sdk && git commit -m "chore: 前移 SDK submodule 到 508da64（含 B1-7/B1-8/B2-1/B5-2）"
 ```
+> 前提：submodule origin（`https://github.com/KryieNaruto/paintDemo.git`）可达且含 `508da64`（已验证在远程 main 上）。离线/网络失败时：先 `git -C sdk fetch origin 508da64` 或改用本地含该 commit 的引用。
 
 - [ ] **Step 2: 验证头**
 
@@ -80,16 +81,31 @@ Expected: 3 行出现。
 namespace {
 DgcContext* g_sdk = nullptr;
 int g_w = 0, g_h = 0;
+
+// 清理旧实例：nativeInit 重复调用 / 换 Activity 时先销毁，防泄漏与状态串扰。
+void ResetSdk() {
+    if (g_sdk) { dgcDestroy(g_sdk); g_sdk = nullptr; }
+    g_w = g_h = 0;
+}
+}
+
+// 保留 self-check（PaintNative.nativeHello 仍声明），避免 declared-but-unimplemented。
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_dgcamp_paint_jni_PaintNative_nativeHello(JNIEnv* env, jobject) {
+    return env->NewStringUTF("JNI OK (paint_android_jni loaded)");
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_dgcamp_paint_jni_PaintNative_nativeInit(JNIEnv* env, jobject, jint w, jint h) {
     (void)env;
+    ResetSdk();                          // 先销毁旧 g_sdk（防泄漏/串扰）
     g_sdk = dgcCreate();
     if (!g_sdk) return JNI_FALSE;
     g_w = w; g_h = h;
-    dgcSetOffscreenSurface(g_sdk, w, h);
-    dgcClear(g_sdk, 0.96f, 0.95f, 0.91f, 1.0f);
+    int rc = dgcSetOffscreenSurface(g_sdk, w, h);
+    if (rc != 0) { ResetSdk(); return JNI_FALSE; }
+    rc = dgcClear(g_sdk, 0.96f, 0.95f, 0.91f, 1.0f);
+    if (rc != 0) { ResetSdk(); return JNI_FALSE; }
     return JNI_TRUE;
 }
 
@@ -110,7 +126,8 @@ extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_dgcamp_paint_jni_PaintNative_nativeReadback(JNIEnv* env, jobject) {
     if (!g_sdk) return nullptr;
     std::vector<uint8_t> buf((size_t)g_w * g_h * 4);
-    dgcReadbackPixels(g_sdk, buf.data());
+    int rc = dgcReadbackPixels(g_sdk, buf.data());   // 检查返回值
+    if (rc != 0) return nullptr;
     jbyteArray arr = env->NewByteArray((jsize)buf.size());
     env->SetByteArrayRegion(arr, 0, (jsize)buf.size(), (const jbyte*)buf.data());
     return arr;
@@ -128,7 +145,7 @@ Java_com_dgcamp_paint_jni_PaintNative_nativeExportPng(JNIEnv* env, jobject, jstr
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_dgcamp_paint_jni_PaintNative_nativeDestroy(JNIEnv*, jobject) {
-    if (g_sdk) { dgcDestroy(g_sdk); g_sdk = nullptr; }
+    ResetSdk();
 }
 ```
 
@@ -215,8 +232,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.unit.IntSize
 import com.dgcamp.paint.jni.PaintNative
+import java.nio.ByteBuffer
 
 @Composable
 fun PaintScreen() {
@@ -226,15 +244,19 @@ fun PaintScreen() {
 
     var bitmap by remember { mutableStateOf<Bitmap?>(null) }
     var fps by remember { mutableFloatStateOf(0f) }
+    var frameMs by remember { mutableFloatStateOf(0f) }
     var readMs by remember { mutableFloatStateOf(0f) }
     var lastError by remember { mutableStateOf("") }
     val ctx = remember { PaintNative }
     val started = remember { ctx.nativeInit(cw, ch) }
     DisposableEffect(Unit) { onDispose { ctx.nativeDestroy() } }
 
-    // 每帧：readback → bitmap
+    // 复用单个 Bitmap，避免每帧 createBitmap 在主线程分配（3MB/帧）造成 GC churn。
+    val bmp = remember { Bitmap.createBitmap(cw, ch, Bitmap.Config.ARGB_8888) }
+
+    // 每帧：readback → 复用 bitmap 更新 → 计算 fps/帧时/读回耗时
     LaunchedEffect(Unit) {
-        var frames = 0; var t0 = System.nanoTime(); var last = t0
+        var frames = 0; var last = System.nanoTime(); var prev = last
         while (true) {
             withFrameNanos { now ->
                 val rb0 = System.nanoTime()
@@ -242,12 +264,15 @@ fun PaintScreen() {
                 val rb1 = System.nanoTime()
                 readMs = (rb1 - rb0) / 1_000_000f
                 if (arr != null) {
-                    bitmap = Bitmap.createBitmap(cw, ch, Bitmap.Config.ARGB_8888)
-                    bitmap?.copyPixelsFromBuffer(java.nio.ByteBuffer.wrap(arr))
+                    bmp.copyPixelsFromBuffer(ByteBuffer.wrap(arr))
+                    bitmap = bmp   // 同一实例，避免重复分配
+                } else {
+                    lastError = "readback failed"
                 }
                 frames++
                 if (now - last >= 500_000_000L) {
                     fps = frames * 1e9f / (now - last).toFloat()
+                    frameMs = 1000f / (if (fps > 0f) fps else 1f)
                     frames = 0; last = now
                 }
             }
@@ -279,7 +304,7 @@ fun PaintScreen() {
             }
             Text(
                 text = if (!started) "SDK init failed" else
-                    "FPS: ${"%.1f".format(fps)}\nReadback: ${"%.2f".format(readMs)} ms\n$lastError",
+                    "FPS: ${"%.1f".format(fps)}\nFrame: ${"%.2f".format(frameMs)} ms\nReadback: ${"%.2f".format(readMs)} ms\n$lastError",
                 color = overlayColor,
                 style = MaterialTheme.typography.bodyLarge,
                 modifier = Modifier.align(Alignment.TopStart).safeDrawingPadding().padding(12.dp),
@@ -289,7 +314,7 @@ fun PaintScreen() {
 }
 ```
 
-> 注：`withFrameNanos` 需 import `androidx.compose.runtime.withFrameNanos`；`drawImage` 的 `dstSize` 是 `androidx.compose.ui.unit.IntSize`。若 `nativeCanvas` 未用到可删 import。
+> 注：`withFrameNanos` 由 `import androidx.compose.runtime.*` 覆盖；`drawImage` 的 `dstSize` 类型为 `androidx.compose.ui.unit.IntSize`（已 import）。浮层含 FPS / Frame ms / Readback ms 三项（spec 验收 #3）。
 
 - [ ] **Step 2: 编译验证**
 
@@ -341,11 +366,18 @@ class DemoExportActivity : Activity() {
 }
 ```
 
-- [ ] **Step 2: Manifest 注册**
+- [ ] **Step 2: Manifest 注册（exported=true 供 adb 触发，离屏导出自检可达）**
 
 ```xml
-<activity android:name=".DemoExportActivity" android:exported="false" />
+<!-- exported=true：无 intent-filter，仅允许显式 intent/adb 触发，不做桌面入口。 -->
+<activity android:name=".DemoExportActivity" android:exported="true" />
 ```
+
+> 触发方式（脚本/CI/人工）：
+> ```bash
+> adb shell am start -n com.dgcamp.paint/.DemoExportActivity
+> adb logcat -s DemoExport:I    # 看 ok=true path=... size=...
+> ```
 
 - [ ] **Step 3: 编译验证**
 
@@ -382,6 +414,13 @@ git add -A && git commit -m "feat: paint-android 接入 SDK C API —— 输入/
 
 ## Self-Review 记录
 
-- **Spec 覆盖**：上屏（ImageBitmap 贴图）→ Task 4；输入 → Task 4；FPS/读回耗时 → Task 4；离屏导出（硬约束）→ Task 5；性能依赖 B3-1 → Global Constraints。✓
+- **Spec 覆盖**：上屏（ImageBitmap 贴图）→ Task 4；输入 → Task 4；FPS/帧时/读回耗时 → Task 4；离屏导出（硬约束）→ Task 5；性能依赖 B3-1 → Global Constraints。✓
 - **占位符扫描**：无 TBD/TODO/「类似 Task N」。✓
 - **类型一致性**：JNI 符号名（`Java_com_dgcamp_paint_jni_PaintNative_*`）与 Kotlin external fun 一一对应（Task 2 ↔ Task 3）；`dgcStrokeTo` 7 参（含 isPredicted）、`dgcFlush` 存在，符合 `dgc_paint_c_api.h`。✓
+- **审阅打回修订（2026-08-24，71→修订）**：
+  - F6 `DemoExportActivity` 改 `android:exported="true"`（无 intent-filter，仅显式 intent/adb 触发）+ 触发命令。
+  - F7 PaintScreen 补 `import androidx.compose.ui.unit.IntSize`。
+  - F8 JNI 补回 `nativeHello` 实现（与 Kotlin 声明一致，消除 UnsatisfiedLinkError）。
+  - F9 `nativeInit` 先 `ResetSdk()`（销毁旧 g_sdk + 重置 g_w/g_h）再创建；`nativeDestroy` 复用 `ResetSdk`。
+  - F10 浮层补「Frame ms」；F11 复用单 Bitmap + 检查 readback 返回值（避免每帧 createBitmap GC churn）。
+  - F12 Task 1 注明 `508da64` 远程可达前提 + 离线处理。
