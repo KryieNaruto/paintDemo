@@ -1,0 +1,18 @@
+{
+  "canvas": { "w": 128, "h": 128, "background": [1, 1, 1, 1] },
+  "seed": 42,
+  "fixed-time": 1000000,
+  "ops": [
+    { "op": "load-brush", "id": "b1", "path": "brushes/basic_round.myb" },
+    { "op": "set-brush",  "id": "b1" },
+    { "op": "set-color",  "r": 0.2, "g": 0.3, "b": 0.8, "a": 1.0 },
+    { "op": "set-param",  "setting": "radius_logarithmic", "value": 0.9 },
+    { "op": "stroke", "points": [
+      { "x": 10, "y": 10, "p": 0.2, "tiltX": 0.0, "tiltY": 0.0 },
+      { "x": 100, "y": 100, "p": 0.8, "tiltX": 0.3, "tiltY": -0.2 }
+    ] },
+    { "op": "clear" },
+    { "op": "undo" },
+    { "op": "export", "path": "out/result.png" }
+  ]
+}

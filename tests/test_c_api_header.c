@@ -3,7 +3,7 @@
 #include "dgc_paint_c_api.h"
 
 int main(void) {
-    /* 取全部 22 个公开函数地址，证明声明齐全且链接进库。 */
+    /* 取全部 23 个公开函数地址，证明声明齐全且链接进库。 */
     DgcContext* (*p_create)(void) = dgcCreate;
     void (*p_destroy)(DgcContext*) = dgcDestroy;
     int (*p_set_surface)(DgcContext*, void*, int, int) = dgcSetSurface;
@@ -27,6 +27,8 @@ int main(void) {
     int (*p_set_brush_setting)(DgcContext*, DgcBrush, int, double) = dgcSetBrushSetting;
     int (*p_set_brush_color)(DgcContext*, DgcBrush, float, float, float, float) = dgcSetBrushColor;
     int (*p_undo)(DgcContext*) = dgcUndo;
+    /* v3.0（B5-2）新增第 23 函数：flush/drain 屏障。 */
+    int (*p_flush)(DgcContext*) = dgcFlush;
 
     /* 保持符号被引用，避免未使用告警（-Werror 下也安全）。 */
     (void)p_create;
@@ -51,6 +53,7 @@ int main(void) {
     (void)p_set_brush_setting;
     (void)p_set_brush_color;
     (void)p_undo;
+    (void)p_flush;
 
     return 0;
 }
