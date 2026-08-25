@@ -10,9 +10,12 @@
 #include <string>
 #include <vector>
 
+#ifdef DGCPAIN_PRECOMPILED_SPV
+#include "brush_composite_spv.h"  // Android：构建期 glslc 预编译内嵌（单一权威源仍是 .comp）
+#else
 #include <shaderc/shaderc.hpp>
-
 #include "brush_composite_glsl.h"  // 由 CMake 从 brush_composite.comp 生成（单一权威源）
+#endif
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "third_party/stb/stb_image_write.h"
@@ -31,8 +34,19 @@ struct BrushPushConstant {
 };
 static_assert(sizeof(BrushPushConstant) == 6 * sizeof(float), "push constant size");
 
-// §4.5 GLSL → SPIR-V：shaderc 库在代码内编译，不 shell 调 glslc/glslangValidator。
+// §4.5 GLSL → SPIR-V：host 用 shaderc 库在代码内编译（不 shell 调 glslc/glslangValidator）；
+// Android（NDK 无 libshaderc）改走构建期 glslc 预编译的内嵌 SPIR-V（DGCPAIN_PRECOMPILED_SPV）。
 std::vector<uint32_t> CompileBrushShader(std::string* err) {
+#ifdef DGCPAIN_PRECOMPILED_SPV
+    (void)err;  // 无运行时编译错误路径
+    const size_t nbytes = sizeof(kBrushCompositeSpv);
+    // SPIR-V 指令长度按 4 字节对齐（glslc 产出天然 4 对齐）。
+    static_assert(sizeof(kBrushCompositeSpv) % sizeof(uint32_t) == 0,
+                  "embedded SPIR-V byte array must be 4-byte aligned");
+    std::vector<uint32_t> spv(nbytes / sizeof(uint32_t));
+    std::memcpy(spv.data(), kBrushCompositeSpv, nbytes);
+    return spv;
+#else
     shaderc::Compiler compiler;
     shaderc::CompileOptions options;
     options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1);
@@ -47,6 +61,7 @@ std::vector<uint32_t> CompileBrushShader(std::string* err) {
         return {};
     }
     return std::vector<uint32_t>(result.begin(), result.end());
+#endif
 }
 
 uint32_t FindMemoryType(VkPhysicalDevice phys, uint32_t typeFilter, VkMemoryPropertyFlags props) {
