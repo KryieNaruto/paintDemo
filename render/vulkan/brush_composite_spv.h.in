@@ -1,0 +1,4 @@
+#pragma once
+// 由 CMake 在 Android 构建期用 glslc 从 brush_composite.comp 生成（单一权威源仍是 .comp）。
+// 供 DGCPAIN_PRECOMPILED_SPV 下 vk_backend.cpp 直接内嵌 SPIR-V，跳过运行时 shaderc。
+static const unsigned char kBrushCompositeSpv[] = { @SPV_C_ARRAY@ };

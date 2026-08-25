@@ -46,7 +46,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ── SDK 库目标：E0-3 先立住库与内部 sources；真实内核/渲染后续任务加入 ──
-add_library(dgc_paint
+# B5-1：host 默认静态 libdgc_paint.a；Android 切 SHARED 产 libdgc_paint.so（§7.7）。
+# 单一源清单 + DGCPAIN_BUILD_SHARED 开关，避免 if/else 复制源清单分叉。
+option(DGCPAIN_BUILD_SHARED "Build dgc_paint as a shared library" ${DGCPAIN_ANDROID})
+set(DGCPAIN_CORE_SOURCES
     core/null/null_paint_kernel.cpp
     core/null/null_render_backend.cpp
     core/engine.cpp
@@ -55,6 +58,11 @@ add_library(dgc_paint
     render/render_backend_factory.cpp
     kernels/brush/brush_kernel_factory.cpp
 )
+if(DGCPAIN_BUILD_SHARED)
+    add_library(dgc_paint SHARED ${DGCPAIN_CORE_SOURCES})
+else()
+    add_library(dgc_paint STATIC ${DGCPAIN_CORE_SOURCES})
+endif()
 target_include_directories(dgc_paint
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/sdk_api   # 唯一对外 include（B1-4 才放头）
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}           # 让 #include "core/..." 生效
