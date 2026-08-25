@@ -8,8 +8,11 @@
 #include "core/engine.h"
 #include "core/interfaces/i_paint_kernel.h"
 #include "core/interfaces/i_render_backend.h"
-#include "core/null/null_paint_kernel.h"
 #include "core/types.h"
+#include "kernels/brush/brush_kernel_factory.h"
+#ifdef DGCPAIN_HAVE_BRUSH
+#include "kernels/brush/brush_kernel.h"
+#endif
 #include "render/render_backend_factory.h"
 
 // DgcContext 为不透明句柄，内部定义不对外暴露。经典 Pimpl：唯一数据成员是
@@ -70,7 +73,7 @@ DgcContext* dgcCreate(void) {
     // 全部用 unique_ptr 栈上构建：任一构造/start() 抛异常时已建对象自动析构，零泄漏。
     auto ctx  = std::make_unique<DgcContext>();
     auto impl = std::make_unique<DgcContext::Impl>();
-    impl->kernel  = std::make_unique<NullPaintKernel>();
+    impl->kernel  = CreateDefaultPaintKernel();    // BrushKernel（DGCPAIN_HAVE_BRUSH）或 Null 兜底
     impl->backend = CreateDefaultRenderBackend();  // unique_ptr<IRenderBackend>
     impl->engine  = std::make_unique<Engine>(impl->kernel.get(), impl->backend.get());
     impl->rng     = std::make_unique<Mt19937Random>(0);  // 默认 seed 0
@@ -311,6 +314,13 @@ int dgcSetRandomSeed(DgcContext* ctx, uint64_t seed) {
     }
     ctx->impl_->determinism.seed = seed;
     ctx->impl_->rng = std::make_unique<Mt19937Random>(seed);  // 重建（旧 unique_ptr 自动释放）
+    // 把 seed 贯通到真实内核 RNG（BrushKernel::SetSeed），避免内核与 context 双随机源分叉
+    // （plan-review 提醒 2：context 的 rng 是 seed 权威持有者，内核 RNG 同 seed 重播种）。
+#ifdef DGCPAIN_HAVE_BRUSH
+    if (auto* bk = dynamic_cast<BrushKernel*>(ctx->impl_->kernel.get())) {
+        bk->SetSeed(seed);
+    }
+#endif
     g_last_error = DGC_OK;
     return DGC_OK;
 }

@@ -173,8 +173,9 @@ void TransitionImageLayout(VkCommandBuffer cmd, VkImage image,
     vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
-// 程序化软圆 alpha 位图：B2-1 占位 stamp（B3-1 落地后由内核 dab 位图替换）。
-// RGB 固定为黑，A 为软圆 alpha（hardness 控边缘衰减）。
+// 程序化软圆 alpha 位图（B3-1 起按逐 dab 颜色烘焙，不再固定黑）。
+// RGB 取 s.r/s.g/s.b（straight RGB，0..1），A 为软圆 alpha（hardness 控硬核、softness 控外缘软化）。
+// softness=0 时与 B2-1 行为完全一致（hardness 内实心 → 外缘线性斜坡）。
 std::vector<uint8_t> MakeSoftCircleStamp(const StampData& s, uint32_t* outSize) {
     int d = (int)std::ceil(s.radius * 2.0f);
     if (d < 1) {
@@ -194,6 +195,25 @@ std::vector<uint8_t> MakeSoftCircleStamp(const StampData& s, uint32_t* outSize) 
     if (hardness > 0.999f) {
         hardness = 0.999f;
     }
+    float softness = s.softness;
+    if (softness < 0.0f) {
+        softness = 0.0f;
+    }
+    if (softness > 0.999f) {
+        softness = 0.999f;
+    }
+    // 有效硬核边界：softness 越大硬核越小、外缘越软；softness=0 → edge=hardness（B2-1 兼容）。
+    const float edge = hardness * (1.0f - softness);
+
+    // straight RGB → 8bit（clamp 到 [0,1]）。
+    const auto to8 = [](float c) -> uint8_t {
+        c = c < 0.0f ? 0.0f : (c > 1.0f ? 1.0f : c);
+        return (uint8_t)(c * 255.0f + 0.5f);
+    };
+    const uint8_t cr = to8(s.r);
+    const uint8_t cg = to8(s.g);
+    const uint8_t cb = to8(s.b);
+
     const float center = (float)(d - 1) * 0.5f;
     for (int y = 0; y < d; ++y) {
         for (int x = 0; x < d; ++x) {
@@ -201,18 +221,18 @@ std::vector<uint8_t> MakeSoftCircleStamp(const StampData& s, uint32_t* outSize) 
             const float dy = ((float)y + 0.5f - center) / r;
             const float dist = std::sqrt(dx * dx + dy * dy);
             float alpha = 0.0f;
-            if (dist <= hardness) {
+            if (dist <= edge) {
                 alpha = 1.0f;
             } else if (dist < 1.0f) {
-                const float t = (1.0f - dist) / (1.0f - hardness);
+                const float t = (1.0f - dist) / (1.0f - edge);
                 alpha = t * t * (3.0f - 2.0f * t);  // smoothstep
             }
             const uint8_t a = (uint8_t)(alpha * 255.0f + 0.5f);
             const size_t i = ((size_t)y * (size_t)d + (size_t)x) * 4;
-            px[i + 0] = 0;  // r（固定黑）
-            px[i + 1] = 0;  // g
-            px[i + 2] = 0;  // b
-            px[i + 3] = a;  // a
+            px[i + 0] = cr;  // r（逐 dab 颜色）
+            px[i + 1] = cg;  // g
+            px[i + 2] = cb;  // b
+            px[i + 3] = a;   // a
         }
     }
     return px;
