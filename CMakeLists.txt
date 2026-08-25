@@ -20,6 +20,7 @@ option(DGCPAIN_RENDER_BGFX    "Route D: bgfx"                       OFF)
 
 # 通用选项
 option(DGCPAIN_BUILD_TESTS    "Build host unit tests"               ON)
+option(DGCPAIN_BUILD_CLI      "Build CLI host (host only)"          ON)
 
 # 所有权/内存安全验证：ASan + LSan（host GCC/Clang 调试构建；Android 下不适用，勿加）。
 option(DGCPAIN_SANITIZE "Enable AddressSanitizer + LeakSanitizer (host debug)" OFF)
@@ -77,6 +78,11 @@ if(DGCPAIN_RENDER_SKIA AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/render/skia/CMakeL
 endif()
 if(DGCPAIN_RENDER_BGFX AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/render/bgfx/CMakeLists.txt)
     add_subdirectory(render/bgfx)
+endif()
+
+# ── CLI 宿主（host only，B5-2）：在 tests 之前，供 test_cli 以 TARGET dgc_cli 守卫引用 ──
+if(DGCPAIN_BUILD_CLI AND NOT DGCPAIN_ANDROID)
+    add_subdirectory(cli)
 endif()
 
 # ── 测试（host only）──

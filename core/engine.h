@@ -44,6 +44,10 @@ public:
     // 外部入队口（B1-4 从这里接 C API）。满则返回 false（调用方可重试/丢弃）。
     bool submitInput(const StrokeEvent& ev);
 
+    // drain 屏障（B5-2）：阻塞至「所有已提交输入已合成完毕」。仅在引擎三线程之外
+    // （C API 调用线程）调用；纯等待 + 原子读，无新堆所有权。
+    void flush();
+
 private:
     void inputLoop();             // 输入线程：pending_input_ → input_to_brush_
     void brushLoop();             // 内核线程：strokeTo → stamp 批 → brush_to_render_
@@ -60,6 +64,11 @@ private:
     std::deque<StrokeEvent> pending_input_;
     std::mutex             input_mutex_;
     std::condition_variable input_cv_;
+
+    // drain 屏障计数（B5-2）：submitted_ 在 submitInput 对 StrokePoint 事件同步递增；
+    // composited_ 由渲染线程每 composite 一轮后 fetch_add；flush 等二者追平。
+    std::atomic<std::size_t> submitted_{0};
+    std::atomic<std::size_t> composited_{0};
 
     std::atomic<bool> stop_{false};
     std::atomic<bool> running_{false};
