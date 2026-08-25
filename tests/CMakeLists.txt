@@ -29,6 +29,12 @@ add_executable(test_c_api_b1_6 test_c_api_b1_6.c)
 target_link_libraries(test_c_api_b1_6 PRIVATE dgc_paint)
 add_test(NAME test_c_api_b1_6 COMMAND test_c_api_b1_6)
 
+# B5-1 纯 C headless C API 闭环（host 无条件）：无窗口走完整 C API 会话，
+# readback 像素断言 + exportPNG；Null 后端分支跳过像素断言仍通过。
+add_executable(test_c_api_headless test_c_api_headless.c)
+target_link_libraries(test_c_api_headless PRIVATE dgc_paint)
+add_test(NAME test_c_api_headless COMMAND test_c_api_headless)
+
 # B2-1：真实 Vulkan 离屏合成验证（host lavapipe headless）。
 if(DGCPAIN_RENDER_VULKAN AND EXISTS ${CMAKE_SOURCE_DIR}/render/vulkan/CMakeLists.txt)
     add_executable(test_offscreen test_offscreen.cpp)
