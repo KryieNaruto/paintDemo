@@ -73,12 +73,13 @@ function Record($name, $level, $status, $detail) {
 
 # ---------- 探测实现 ----------
 
+# 必须带 -prerelease：vswhere 默认排除 Insiders/预览版（VS 2026 Insiders 属 prerelease），缺了会误选 release 旧版。
 # 找 Visual Studio 安装目录（vswhere 是 VS 自带官方定位器）。
 function Find-VsInstallation {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
     if (-not (Test-Path $vswhere)) { $vswhere = Join-Path $env:ProgramFiles "Microsoft Visual Studio\Installer\vswhere.exe" }
     if (-not (Test-Path $vswhere)) { return "" }
-    $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    $vs = & $vswhere -prerelease -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
     return ($vs | Select-Object -First 1).Trim()
 }
 
