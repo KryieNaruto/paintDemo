@@ -9,6 +9,7 @@ __pycache__/
 
 # 构建产物
 build/
+build-deps/
 .cxx/
 *.o
 *.a
