@@ -26,7 +26,7 @@ deps:
         url: "{mirror}/ubuntu/pool/universe/s/shaderc/glslc_{version}_amd64.deb"
     extract_to: "deps/usr"
     env_export: "DGCPAIN_DEPS_ROOT"
-    check: "lib/libshaderc_shared.so"
+    check: "lib/x86_64-linux-gnu/libshaderc.so.1"
   - name: glfw
     size_class: small
     platform: [linux, win]
