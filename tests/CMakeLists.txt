@@ -41,6 +41,12 @@ if(DGCPAIN_RENDER_VULKAN AND EXISTS ${CMAKE_SOURCE_DIR}/render/vulkan/CMakeLists
     target_include_directories(test_offscreen PRIVATE ${CMAKE_SOURCE_DIR})
     target_link_libraries(test_offscreen PRIVATE dgc_paint)
     add_test(NAME test_offscreen COMMAND test_offscreen)
+
+    # B4-1：dab 形状光栅化 GPU 化对照（CPU 参考 vs GPU compute 像素 diff）。
+    add_executable(test_gpu_dab_raster test_gpu_dab_raster.cpp)
+    target_include_directories(test_gpu_dab_raster PRIVATE ${CMAKE_SOURCE_DIR})
+    target_link_libraries(test_gpu_dab_raster PRIVATE dgc_paint)
+    add_test(NAME test_gpu_dab_raster COMMAND test_gpu_dab_raster)
 endif()
 
 # B3-1：自研 C++ 笔刷内核主链（host 无条件，无 Vulkan 依赖）。

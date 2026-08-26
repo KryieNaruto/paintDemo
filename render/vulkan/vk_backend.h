@@ -9,7 +9,8 @@
 //
 // - 无窗口 headless 离屏模式（§4.0.5）：无 surface 扩展的 VkInstance + 设备 +
 //   离屏 Canvas storage image（常驻 GENERAL），不创建 swapchain，present() no-op。
-// - composite(stamps)：批量 dispatch brush_composite.comp 把 stamp 合成到画布。
+// - composite(stamps)：批量 dispatch brush_composite.comp 把 dab 形状光栅化 + over 合成到画布
+//   （B4-1：compute 内 SDF + fwidth 覆盖，去掉 per-dab stamp 烘焙与纹理上传）。
 // - readback：vkCmdCopyImageToBuffer + map 读回 RGBA8。
 // - exportPNG：readback + stb_image_write 编码 PNG。
 //
