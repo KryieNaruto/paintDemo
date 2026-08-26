@@ -28,3 +28,7 @@ RenderDoc结果/*.rdc
 
 # Claude Code 本地个人配置（不入库）
 .claude/settings.local.json
+
+# deps 供给产物（拉取/解包大文件，不入版控）
+deps/usr/
+deps/cache/
