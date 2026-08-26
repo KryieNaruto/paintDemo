@@ -1,3 +1,10 @@
+# MSVC runtime 守卫回归（方案 A，无头可执行）：模拟 MSVC Debug 下强制 MultiThreadedDLL，
+# 直接 include 真实修复模块 cmake/msvc_runtime.cmake（经 -DGCPAIN_FIX_MODULE 传入）。
+add_test(NAME test_msvc_runtime_debug_guard
+         COMMAND ${CMAKE_COMMAND}
+                 -DGCPAIN_FIX_MODULE=${CMAKE_CURRENT_SOURCE_DIR}/../cmake/msvc_runtime.cmake
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/test_msvc_runtime_guard.cmake)
+
 # 运行期找到共享 libshaderc.so.1（自定义前缀场景，如提取的 .deb）。
 # SHADERC_LIBRARY_DIR 由 render/vulkan/CMakeLists.txt 上抛到父作用域。
 if(DEFINED SHADERC_LIBRARY_DIR AND SHADERC_LIBRARY_DIR)

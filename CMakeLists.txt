@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.22)
 project(dgc_paint LANGUAGES C CXX)
 
+# MSVC 下钉 Release /MD 运行时，匹配 LunarG shaderc_combined.lib（见 cmake/msvc_runtime.cmake）。
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/msvc_runtime.cmake)
+
 # ── 双 toolchain 分发 ──
 if(CMAKE_SYSTEM_NAME STREQUAL "Android")
     set(DGCPAIN_ANDROID ON)
