@@ -159,10 +159,17 @@ fetch_deps() {
     info "  拉取 $name ($ver)…"
     case "$name" in
       vulkan)
-        if fetch_deb "libvulkan-dev" \
-            "{mirror}/ubuntu/pool/main/v/vulkan-loader/libvulkan-dev_{version}_amd64.deb" "$ver"; then
-          extract_deb "$DEPS_CACHE/libvulkan-dev.deb" || rc=1
-        else rc=1; fi
+        local pkg ok=1
+        for pkg in libvulkan1 libvulkan-dev; do
+          fetch_deb "$pkg" \
+            "{mirror}/ubuntu/pool/main/v/vulkan-loader/${pkg}_{version}_amd64.deb" "$ver" || { ok=0; break; }
+        done
+        if [ "$ok" -eq 1 ]; then
+          for pkg in libvulkan1 libvulkan-dev; do
+            extract_deb "$DEPS_CACHE/$pkg.deb" || { ok=0; break; }
+          done
+        fi
+        [ "$ok" -eq 1 ] || rc=1
         ;;
       shaderc)
         local pkg ok=1
