@@ -1,30 +1,65 @@
 #version 450
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0, rgba8) uniform image2D u_Canvas;
-layout(set = 0, binding = 1) uniform sampler2D  u_Stamp;
 
+// B4-1：融合版——内联圆形 SDF 光栅化 + over 合成（去掉 stamp 纹理）。
+// push_constant 从「stampPos/stampSize/opacity/alphaLock」扩为 dab 参数。
+// vec3 在 push constant（std140 语义）有 16 字节对齐陷阱，故用 flat float rgb[3]。
 layout(push_constant) uniform PC {
-    vec2  stampPos;      // stamp 在画布上的像素坐标（左上）
-    vec2  stampSize;     // stamp 纹理像素尺寸
-    float opacity;
-    float alphaLock;     // 预留：阿尔法锁定
+    vec2  pos;          // dab 圆心（画布像素坐标）
+    float radius;       // 半径（像素）
+    float hardness;     // 硬核 0..1
+    float softness;     // 外缘软化 0..1
+    float opacity;      // dab 不透明度
+    float rgb[3];       // straight RGB（0..1）
+    uint  shapeType;    // 0=圆形软笔（默认），1/2/3 扩展位
 } pc;
+
+#ifdef DGC_USE_FWIDTH
+// fwidth 在 compute shader 需 derivative 支持（VK_NV_compute_shader_derivatives）。
+// host 运行时探测到扩展才定义 DGC_USE_FWIDTH；Android glslc 预编译不定义 → 走解析兜底（R1）。
+#extension GL_NV_compute_shader_derivatives : require
+#endif
 
 void main() {
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
     ivec2 sz = imageSize(u_Canvas);
     if (c.x >= sz.x || c.y >= sz.y) return;
 
-    vec2 uv = (vec2(c) - pc.stampPos) / pc.stampSize;
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return;
+    // 像素中心坐标（与 CPU 参考 c+0.5 对齐）。
+    vec2 pixelCenter = vec2(c) + vec2(0.5);
 
-    vec4 stamp = texture(u_Stamp, uv);
-    float a = stamp.a * pc.opacity;
+    // 归一化距离：0 = 圆心，1 = 半径边缘。
+    float dist = length(pixelCenter - pc.pos) / max(pc.radius, 1e-3);
+
+    // hardness/softness 软硬边（对齐 MakeSoftCircleStamp 的 edge 语义）：
+    // edge = hardness*(1-softness)，dist<=edge 全 alpha，edge<dist<1 走 smoothstep 斜坡。
+    float edge = pc.hardness * (1.0 - pc.softness);
+    float coverage;
+    if (dist <= edge) {
+        coverage = 1.0;
+    } else if (dist < 1.0) {
+        coverage = 1.0 - smoothstep(edge, 1.0, dist);
+    } else {
+        coverage = 0.0;
+    }
+
+    // §3.2 fwidth 抗锯齿：仅在外缘 rim（dist 穿越 1.0）补亚像素过渡。
+    // 无 derivative 支持时解析 AA 宽度兜底 ww = 1/radius（归一化下 1px 带宽，等价软边）。
+#ifdef DGC_USE_FWIDTH
+    float ww = fwidth(dist);
+#else
+    float ww = 1.0 / max(pc.radius, 1e-3);
+#endif
+    float rimAA = 1.0 - smoothstep(1.0 - ww, 1.0 + ww, dist);
+    coverage *= rimAA;
+
+    float a = coverage * pc.opacity;
     if (a <= 0.001) return;
 
-    vec4 canvas = imageLoad(u_Canvas, c);
+    vec4 dst = imageLoad(u_Canvas, c);
     // premultiplied over：dst = src + dst*(1-src.a)
-    vec4 outColor = vec4(stamp.rgb * a + canvas.rgb * (1.0 - a),
-                         a + canvas.a * (1.0 - a));
-    imageStore(u_Canvas, c, outColor);
+    vec4 outC = vec4(vec3(pc.rgb[0], pc.rgb[1], pc.rgb[2]) * a + dst.rgb * (1.0 - a),
+                     a + dst.a * (1.0 - a));
+    imageStore(u_Canvas, c, outC);
 }

@@ -23,22 +23,28 @@
 namespace {
 
 constexpr VkFormat kCanvasFormat = VK_FORMAT_R8G8B8A8_UNORM;
-constexpr VkFormat kStampFormat  = VK_FORMAT_R8G8B8A8_UNORM;
 
-// 与 brush_composite.comp 的 push_constant 布局一一对应。
+// 与 brush_composite.comp 的 push_constant 布局一一对应（B4-1 融合版）。
+// vec3 在 push constant（std140 语义）有 16 字节对齐陷阱，故用 flat float rgb[3]。
 struct BrushPushConstant {
-    float stampPos[2];
-    float stampSize[2];
+    float pos[2];
+    float radius;
+    float hardness;
+    float softness;
     float opacity;
-    float alphaLock;
+    float rgb[3];
+    std::uint32_t shapeType;
 };
-static_assert(sizeof(BrushPushConstant) == 6 * sizeof(float), "push constant size");
+static_assert(sizeof(BrushPushConstant) == 10 * sizeof(float), "push constant size");
 
 // §4.5 GLSL → SPIR-V：host 用 shaderc 库在代码内编译（不 shell 调 glslc/glslangValidator）；
 // Android（NDK 无 libshaderc）改走构建期 glslc 预编译的内嵌 SPIR-V（DGCPAIN_PRECOMPILED_SPV）。
-std::vector<uint32_t> CompileBrushShader(std::string* err) {
+// B4-1：useDerivatives 为真时定义 DGC_USE_FWIDTH，启用 compute 内 fwidth（需设备支持
+// VK_NV_compute_shader_derivatives）；否则走解析 AA 宽度兜底（R1）。
+std::vector<uint32_t> CompileBrushShader(bool useDerivatives, std::string* err) {
 #ifdef DGCPAIN_PRECOMPILED_SPV
-    (void)err;  // 无运行时编译错误路径
+    (void)useDerivatives;  // 预编译 SPIR-V 已在构建期按「无 fwidth」路径生成（解析兜底）。
+    (void)err;             // 无运行时编译错误路径
     const size_t nbytes = sizeof(kBrushCompositeSpv);
     // SPIR-V 指令长度按 4 字节对齐（glslc 产出天然 4 对齐）。
     static_assert(sizeof(kBrushCompositeSpv) % sizeof(uint32_t) == 0,
@@ -51,6 +57,9 @@ std::vector<uint32_t> CompileBrushShader(std::string* err) {
     shaderc::CompileOptions options;
     options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1);
     options.SetOptimizationLevel(shaderc_optimization_level_performance);
+    if (useDerivatives) {
+        options.AddMacroDefinition("DGC_USE_FWIDTH", "1");
+    }
     shaderc::SpvCompilationResult result = compiler.CompileGlslToSpv(
         kBrushCompositeGlsl, std::strlen(kBrushCompositeGlsl),
         shaderc_compute_shader, "brush_composite.comp", options);
@@ -148,109 +157,6 @@ void CreateBuffer(VkDevice device, VkPhysicalDevice phys, VkDeviceSize size, VkB
         return;
     }
     vkBindBufferMemory(device, buffer, memory, 0);
-}
-
-void TransitionImageLayout(VkCommandBuffer cmd, VkImage image,
-                           VkImageLayout oldLayout, VkImageLayout newLayout) {
-    VkImageMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout = oldLayout;
-    barrier.newLayout = newLayout;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image;
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.baseMipLevel = 0;
-    barrier.subresourceRange.levelCount = 1;
-    barrier.subresourceRange.baseArrayLayer = 0;
-    barrier.subresourceRange.layerCount = 1;
-
-    VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-    VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
-    if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
-        barrier.srcAccessMask = 0;
-        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-        dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    } else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
-               newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        dstStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-    } else if (oldLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
-               newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
-        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        srcStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-        dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    }
-    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-}
-
-// 程序化软圆 alpha 位图（B3-1 起按逐 dab 颜色烘焙，不再固定黑）。
-// RGB 取 s.r/s.g/s.b（straight RGB，0..1），A 为软圆 alpha（hardness 控硬核、softness 控外缘软化）。
-// softness=0 时与 B2-1 行为完全一致（hardness 内实心 → 外缘线性斜坡）。
-std::vector<uint8_t> MakeSoftCircleStamp(const StampData& s, uint32_t* outSize) {
-    int d = (int)std::ceil(s.radius * 2.0f);
-    if (d < 1) {
-        d = 1;
-    }
-    if (d > 512) {
-        d = 512;  // 占位 stamp 上限，防内存失控
-    }
-    *outSize = (uint32_t)d;
-    std::vector<uint8_t> px((size_t)d * d * 4, 0);
-
-    const float r = s.radius > 0.0f ? s.radius : 1.0f;
-    float hardness = s.hardness;
-    if (hardness < 0.0f) {
-        hardness = 0.0f;
-    }
-    if (hardness > 0.999f) {
-        hardness = 0.999f;
-    }
-    float softness = s.softness;
-    if (softness < 0.0f) {
-        softness = 0.0f;
-    }
-    if (softness > 0.999f) {
-        softness = 0.999f;
-    }
-    // 有效硬核边界：softness 越大硬核越小、外缘越软；softness=0 → edge=hardness（B2-1 兼容）。
-    const float edge = hardness * (1.0f - softness);
-
-    // straight RGB → 8bit（clamp 到 [0,1]）。
-    const auto to8 = [](float c) -> uint8_t {
-        c = c < 0.0f ? 0.0f : (c > 1.0f ? 1.0f : c);
-        return (uint8_t)(c * 255.0f + 0.5f);
-    };
-    const uint8_t cr = to8(s.r);
-    const uint8_t cg = to8(s.g);
-    const uint8_t cb = to8(s.b);
-
-    const float center = (float)(d - 1) * 0.5f;
-    for (int y = 0; y < d; ++y) {
-        for (int x = 0; x < d; ++x) {
-            const float dx = ((float)x + 0.5f - center) / r;
-            const float dy = ((float)y + 0.5f - center) / r;
-            const float dist = std::sqrt(dx * dx + dy * dy);
-            float alpha = 0.0f;
-            if (dist <= edge) {
-                alpha = 1.0f;
-            } else if (dist < 1.0f) {
-                const float t = (1.0f - dist) / (1.0f - edge);
-                alpha = t * t * (3.0f - 2.0f * t);  // smoothstep
-            }
-            const uint8_t a = (uint8_t)(alpha * 255.0f + 0.5f);
-            const size_t i = ((size_t)y * (size_t)d + (size_t)x) * 4;
-            px[i + 0] = cr;  // r（逐 dab 颜色）
-            px[i + 1] = cg;  // g
-            px[i + 2] = cb;  // b
-            px[i + 3] = a;   // a
-        }
-    }
-    return px;
 }
 
 // ── 最小手写 RAII 守卫（B1-8，不引入 vk::raii）：值语义、禁拷贝、可移动、
@@ -360,7 +266,6 @@ struct VkBackend::Impl {
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 
     VkDeviceHandle<VkFence, vkDestroyFence> fence;
-    VkDeviceHandle<VkSampler, vkDestroySampler> sampler;
     VkDeviceHandle<VkDescriptorSetLayout, vkDestroyDescriptorSetLayout> descriptorLayout;
     VkDeviceHandle<VkPipelineLayout, vkDestroyPipelineLayout> pipelineLayout;
     VkDeviceHandle<VkPipeline, vkDestroyPipeline> pipeline;
@@ -371,23 +276,14 @@ struct VkBackend::Impl {
     int width = 0;
     int height = 0;
 
-    VkDeviceHandle<VkImage, vkDestroyImage> stampImage;
-    VkDeviceHandle<VkDeviceMemory, vkFreeMemory> stampMemory;
-    VkDeviceHandle<VkImageView, vkDestroyImageView> stampView;
-    uint32_t stampSize = 0;
-    VkImageLayout stampLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
     VkDeviceHandle<VkDescriptorPool, vkDestroyDescriptorPool> descriptorPool;
     VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
-
-    VkDeviceHandle<VkBuffer, vkDestroyBuffer> stagingBuffer;
-    VkDeviceHandle<VkDeviceMemory, vkFreeMemory> stagingMemory;
-    VkDeviceSize stagingSize = 0;
 
     VkDeviceHandle<VkBuffer, vkDestroyBuffer> readbackBuffer;
     VkDeviceHandle<VkDeviceMemory, vkFreeMemory> readbackMemory;
     VkDeviceSize readbackSize = 0;
 
+    bool useDerivatives = false;  // 设备支持 VK_NV_compute_shader_derivatives → fwidth 路径。
     bool deviceReady = false;
     bool canvasReady = false;
 
@@ -450,6 +346,26 @@ struct VkBackend::Impl {
             return;
         }
 
+        // B4-1：探测 VK_NV_compute_shader_derivatives（compute 内 fwidth 需要）。
+        // 支持则启用 fwidth 路径；不支持走解析 AA 宽度兜底（R1）。
+        useDerivatives = false;
+        {
+            uint32_t extCount = 0;
+            vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount, nullptr);
+            std::vector<VkExtensionProperties> exts(extCount);
+            vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount, exts.data());
+            for (const VkExtensionProperties& e : exts) {
+                if (std::strcmp(e.extensionName,
+                                VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME) == 0) {
+                    useDerivatives = true;
+                    break;
+                }
+            }
+        }
+        std::fprintf(stderr, "[VkBackend] dab raster AA: %s\n",
+                     useDerivatives ? "fwidth (compute derivatives)"
+                                    : "analytic ww=1/radius fallback");
+
         float priority = 1.0f;
         VkDeviceQueueCreateInfo queueInfo{};
         queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -457,10 +373,22 @@ struct VkBackend::Impl {
         queueInfo.queueCount = 1;
         queueInfo.pQueuePriorities = &priority;
 
+        // fwidth（隐式导数）按 2x2 quad 组计算，需显式开启该 feature。
+        VkPhysicalDeviceComputeShaderDerivativesFeaturesNV derivFeatures{};
+        derivFeatures.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_NV;
+        derivFeatures.computeDerivativeGroupQuads = VK_TRUE;
+        const char* derivExtName = VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME;
+
         VkDeviceCreateInfo deviceInfo{};
         deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         deviceInfo.queueCreateInfoCount = 1;
         deviceInfo.pQueueCreateInfos = &queueInfo;
+        if (useDerivatives) {
+            deviceInfo.enabledExtensionCount = 1;
+            deviceInfo.ppEnabledExtensionNames = &derivExtName;
+            deviceInfo.pNext = &derivFeatures;
+        }
         // storage image 写入是 core，无需额外 feature（shader 用 rgba8 显式格式）。
         VkDevice dev = VK_NULL_HANDLE;
         if (vkCreateDevice(physicalDevice, &deviceInfo, nullptr, &dev) != VK_SUCCESS) {
@@ -495,28 +423,11 @@ struct VkBackend::Impl {
         vkCreateFence(device, &fenceInfo, nullptr, &fenceH);
         fence.assign(device, fenceH);
 
-        VkSamplerCreateInfo samplerInfo{};
-        samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-        samplerInfo.magFilter = VK_FILTER_LINEAR;
-        samplerInfo.minFilter = VK_FILTER_LINEAR;
-        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        samplerInfo.maxLod = 0.0f;
-        VkSampler samplerH = VK_NULL_HANDLE;
-        vkCreateSampler(device, &samplerInfo, nullptr, &samplerH);
-        sampler.assign(device, samplerH);
-
-        std::array<VkDescriptorSetLayoutBinding, 2> bindings{};
+        std::array<VkDescriptorSetLayoutBinding, 1> bindings{};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         bindings[0].descriptorCount = 1;
         bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        bindings[1].binding = 1;
-        bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        bindings[1].descriptorCount = 1;
-        bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         VkDescriptorSetLayoutCreateInfo layoutInfo{};
         layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         layoutInfo.bindingCount = (uint32_t)bindings.size();
@@ -541,7 +452,7 @@ struct VkBackend::Impl {
         pipelineLayout.assign(device, pl);
 
         std::string err;
-        std::vector<uint32_t> spv = CompileBrushShader(&err);
+        std::vector<uint32_t> spv = CompileBrushShader(useDerivatives, &err);
         if (spv.empty()) {
             std::fprintf(stderr, "[VkBackend] shaderc compile failed: %s\n", err.c_str());
             return;
@@ -575,20 +486,10 @@ struct VkBackend::Impl {
         deviceReady = true;
     }
 
-    void DestroyStampTexture() {
-        // RAII 守卫 reset()：幂等，重复调用安全；析构顺序由声明序保证（子对象 → device）。
-        stampView.reset();
-        stampImage.reset();
-        stampMemory.reset();
-        stampSize = 0;
-        stampLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    }
-
     void DestroyCanvas() {
         // descriptorPool 销毁 → 隐式释放 descriptorSet（池子句柄，无独立守卫）。
         descriptorPool.reset();
         descriptorSet = VK_NULL_HANDLE;
-        DestroyStampTexture();
         canvasView.reset();
         canvasImage.reset();
         canvasMemory.reset();
@@ -638,11 +539,9 @@ struct VkBackend::Impl {
             return;
         }
 
-        std::array<VkDescriptorPoolSize, 2> poolSizes{};
+        std::array<VkDescriptorPoolSize, 1> poolSizes{};
         poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         poolSizes[0].descriptorCount = 1;
-        poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        poolSizes[1].descriptorCount = 1;
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         poolInfo.maxSets = 1;
@@ -673,50 +572,6 @@ struct VkBackend::Impl {
         vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
 
         canvasReady = true;
-    }
-
-    void CreateStampTexture(uint32_t size) {
-        if (stampSize == size && stampImage != VK_NULL_HANDLE) {
-            return;
-        }
-        DestroyStampTexture();
-        stampSize = size;
-        VkImage img = VK_NULL_HANDLE;
-        VkDeviceMemory mem = VK_NULL_HANDLE;
-        CreateImage(device, physicalDevice, size, size, kStampFormat,
-                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                    VK_IMAGE_LAYOUT_UNDEFINED, img, mem);
-        stampImage.assign(device, img);
-        stampMemory.assign(device, mem);
-        stampView.assign(device, CreateImageView(device, img, kStampFormat));
-
-        VkDeviceSize need = (VkDeviceSize)size * size * 4;
-        if (need > stagingSize) {
-            stagingBuffer.reset();
-            stagingMemory.reset();
-            VkBuffer buf = VK_NULL_HANDLE;
-            VkDeviceMemory bmem = VK_NULL_HANDLE;
-            CreateBuffer(device, physicalDevice, need, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                         buf, bmem);
-            stagingBuffer.assign(device, buf);
-            stagingMemory.assign(device, bmem);
-            stagingSize = need;
-        }
-
-        // 写 stamp binding（binding 1：combined image sampler）。
-        VkDescriptorImageInfo stampInfo{};
-        stampInfo.sampler = sampler;
-        stampInfo.imageView = stampView;
-        stampInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        VkWriteDescriptorSet write{};
-        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        write.dstSet = descriptorSet;
-        write.dstBinding = 1;
-        write.descriptorCount = 1;
-        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        write.pImageInfo = &stampInfo;
-        vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
     }
 
     void SubmitAndWait() {
@@ -753,53 +608,26 @@ struct VkBackend::Impl {
         }
         BeginCommands();
         for (const StampData& s : stamps) {
-            uint32_t size = 0;
-            std::vector<uint8_t> px = MakeSoftCircleStamp(s, &size);
-            CreateStampTexture(size);
-
-            // 上传 staging → stamp 纹理。
-            void* data = nullptr;
-            vkMapMemory(device, stagingMemory, 0, stagingSize, 0, &data);
-            std::memcpy(data, px.data(), px.size());
-            vkUnmapMemory(device, stagingMemory);
-
-            const VkImageLayout prevLayout = stampLayout;
-            if (prevLayout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
-                TransitionImageLayout(commandBuffer, stampImage, prevLayout,
-                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            }
-            VkBufferImageCopy region{};
-            region.bufferOffset = 0;
-            region.bufferRowLength = 0;
-            region.bufferImageHeight = 0;
-            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            region.imageSubresource.mipLevel = 0;
-            region.imageSubresource.baseArrayLayer = 0;
-            region.imageSubresource.layerCount = 1;
-            region.imageOffset = {0, 0, 0};
-            region.imageExtent = {size, size, 1};
-            vkCmdCopyBufferToImage(commandBuffer, stagingBuffer, stampImage,
-                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-            TransitionImageLayout(commandBuffer, stampImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            stampLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
             vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
             vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0,
                                     1, &descriptorSet, 0, nullptr);
 
             BrushPushConstant pc{};
-            pc.stampPos[0] = s.x - s.radius;
-            pc.stampPos[1] = s.y - s.radius;
-            pc.stampSize[0] = s.radius * 2.0f;
-            pc.stampSize[1] = s.radius * 2.0f;
+            pc.pos[0] = s.x;
+            pc.pos[1] = s.y;
+            pc.radius = s.radius;
+            pc.hardness = s.hardness;
+            pc.softness = s.softness;
             pc.opacity = s.opacity;
-            pc.alphaLock = 0.0f;
+            pc.rgb[0] = s.r;
+            pc.rgb[1] = s.g;
+            pc.rgb[2] = s.b;
+            pc.shapeType = 0u;  // 0=圆形软笔（默认），1/2/3 扩展位（本期不实现）。
             vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                sizeof(pc), &pc);
 
             // shader 以 gl_GlobalInvocationID.xy 作为绝对画布坐标，dispatch 覆盖全画布，
-            // 由 shader 内的 uv 裁剪只写 stamp 包围盒（§4.5 权威 shader 文本）。
+            // 由 shader 内的 SDF dist 越界早退（coverage<=0.001 return）只写 dab 覆盖区。
             const uint32_t gx = (uint32_t)std::ceil((double)width / 8.0);
             const uint32_t gy = (uint32_t)std::ceil((double)height / 8.0);
             vkCmdDispatch(commandBuffer, gx, gy, 1);
@@ -857,13 +685,10 @@ struct VkBackend::Impl {
         }
         vkDeviceWaitIdle(device);
         DestroyCanvas();
-        stagingBuffer.reset();
-        stagingMemory.reset();
         fence.reset();
         pipeline.reset();
         pipelineLayout.reset();
         descriptorLayout.reset();
-        sampler.reset();
         commandPool.reset();
         commandBuffer = VK_NULL_HANDLE;
         device.reset();
