@@ -95,6 +95,7 @@ record() { # name level status detail
 }
 
 # ---------- MSVC 环境注入（vswhere + vcvarsall） ----------
+# vswhere 必须带 -prerelease，否则 2026 Insiders 被默认过滤。
 find_vswhere() {
   local c
   for c in \
@@ -112,7 +113,7 @@ setup_msvc_env() {
     warn "未找到 vswhere.exe（VS2026 Installer 缺失或未装 VS）"
     return 1
   }
-  vsdir="$("$vswhere" -latest -products '*' \
+  vsdir="$("$vswhere" -prerelease -latest -products '*' \
       -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
       -property installationPath 2>/dev/null | tail -1)"
   [ -n "$vsdir" ] || {
