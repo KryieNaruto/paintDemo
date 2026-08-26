@@ -1,0 +1,49 @@
+# 三方库清单（单一事实来源）。供 scripts/fetch-deps.sh 解析。
+# size_class: big=预编译拉取；small=FetchContent 编译
+# 镜像池（清华→阿里→官方 archive.ubuntu.com）实现在 fetch-deps.sh 的 fetch_deb 内，
+# 不在本文件重复声明（避免双处维护）。url 支持 {mirror} {version} 占位符。
+deps:
+  - name: vulkan
+    size_class: big
+    platform: [linux, win]
+    version: "1.3.275.0-1build1"
+    debs:
+      - pkg: libvulkan-dev
+        url: "{mirror}/ubuntu/pool/main/v/vulkan-loader/libvulkan-dev_{version}_amd64.deb"
+    extract_to: "deps/usr"
+    env_export: "DGCPAIN_DEPS_ROOT"
+    check: "include/vulkan/vulkan.h"
+  - name: shaderc
+    size_class: big
+    platform: [linux]
+    version: "2023.8-1build1"
+    debs:
+      - pkg: libshaderc1
+        url: "{mirror}/ubuntu/pool/universe/s/shaderc/libshaderc1_{version}_amd64.deb"
+      - pkg: libshaderc-dev
+        url: "{mirror}/ubuntu/pool/universe/s/shaderc/libshaderc-dev_{version}_amd64.deb"
+      - pkg: glslc
+        url: "{mirror}/ubuntu/pool/universe/s/shaderc/glslc_{version}_amd64.deb"
+    extract_to: "deps/usr"
+    env_export: "DGCPAIN_DEPS_ROOT"
+    check: "lib/libshaderc_shared.so"
+  - name: glfw
+    size_class: small
+    platform: [linux, win]
+    fetch: "FetchContent"
+    mirror: "ghproxy"
+  - name: imgui
+    size_class: small
+    platform: [linux, win]
+    fetch: "FetchContent"
+    mirror: "ghproxy"
+  - name: android_sdk
+    size_class: big
+    platform: [linux, win, mac]
+    fetch: "sdkmanager"
+    mirror: "dl.google.com"
+  - name: android_ndk
+    size_class: big
+    platform: [linux, win, mac]
+    fetch: "sdkmanager"
+    mirror: "dl.google.com"
