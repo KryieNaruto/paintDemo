@@ -26,19 +26,20 @@ bootstrap-consumer.sh — 在「已存在的空克隆」里把 paintDemo SDK 加
        git clone git@github.com:KryieNaruto/paint-android.git
        cd paint-android
   3. 在该目录里运行本脚本（用绝对/相对路径指向 paintDemo 仓库里的脚本）：
-       /path/to/paintDemo/scripts/bootstrap-consumer.sh --tag v0.1.0
+       /path/to/paintDemo/scripts/bootstrap-consumer.sh
+       # 默认：跟随 main 最新；发布快照可选 --tag <tag> / --commit <sha>
   4. 提交 .gitmodules 与 submodule 指针：
        git add .gitmodules sdk && git commit -m "chore: submodule paintDemo SDK 到 sdk/"
 
 选项:
   --url <URL>      SDK 仓库 URL（默认 https://github.com/KryieNaruto/paintDemo.git）
-  --tag <TAG>      把 SDK 钉在指定 tag（推荐；不跟踪 main）
-  --commit <SHA>   把 SDK 钉在指定 commit（与 --tag 二选一）
+  --tag <TAG>      把 SDK 钉在指定 tag（可选；默认跟随 main）
+  --commit <SHA>   把 SDK 钉在指定 commit（可选；与 --tag 二选一）
   -h, --help       显示本帮助
 
 约定（详见 docs/git/README.md）:
   - submodule 路径固定 sdk/，指向 https://github.com/KryieNaruto/paintDemo.git
-  - 钉 commit 或 tag，禁止长期漂浮跟踪 main
+  - 默认跟随 main 最新（branch = main，setup.* 用 --remote 拉最新）；发布快照可 --tag/--commit 钉版本
   - 消费者只 #include "dgc_paint_c_api.h"，禁止 include core/
   - clone 消费者仓库时用 git clone --recurse-submodules
 EOF
@@ -97,11 +98,12 @@ elif [[ -n "$COMMIT" ]]; then
   echo ">> 钉 commit: git -C $SUBMODULE_PATH checkout $COMMIT"
   git -C "$SUBMODULE_PATH" checkout "$COMMIT"
 else
+  echo ">> 配置跟随 main 最新: git config -f .gitmodules submodule.sdk.branch main"
+  git config -f .gitmodules submodule.sdk.branch main
   cat <<'EOF'
 
-未指定 --tag / --commit。已按 submodule 默认记录当前 SDK commit。
-建议立即钉 tag（不要长期漂浮跟踪 main）：
-  git -C sdk checkout <tag>
+未指定 --tag / --commit：已配置为跟随 paintDemo main 最新（branch = main）。
+消费者 scripts/setup.* 会用 git submodule update --init --recursive --remote 每次拉最新。
 EOF
 fi
 
