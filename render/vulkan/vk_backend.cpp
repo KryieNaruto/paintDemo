@@ -2,6 +2,10 @@
 
 #include <vulkan/vulkan.h>
 
+#ifdef DGCPAIN_RENDERDOC_ENABLED
+#include "render/renderdoc/renderdoc_capture.h"
+#endif
+
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -255,6 +259,11 @@ struct VkDeviceHandle {
 struct VkBackend::Impl {
     // 声明序 = instance → device → 全部子对象：逆声明序析构 = 子对象 → device → instance，
     // 即 Vulkan 释放顺序正确。commandBuffer/descriptorSet 属池子句柄，不独立守卫。
+    // rdc 声明在 instance 之前 → 逆序析构最后销毁（RenderDoc 库在整个 Vulkan 拆除期间保持加载，
+    // 避免若未来启用 layer 注入时 dispatch 表悬空；默认关，未启用时内部 no-op）。
+#ifdef DGCPAIN_RENDERDOC_ENABLED
+    std::unique_ptr<RenderDocCapture> rdc;
+#endif
     VkTopHandle<VkInstance, vkDestroyInstance> instance;
     VkTopHandle<VkDevice, vkDestroyDevice> device;
 
@@ -484,6 +493,12 @@ struct VkBackend::Impl {
         vkDestroyShaderModule(device, module, nullptr);
 
         deviceReady = true;
+
+        // B5-4：设备就绪后构造 RenderDoc 程序化抓帧（构造即读 DGC_RENDERDOC env；
+        // 未启用/加载失败内部降级 no-op，不影响离屏路径）。
+#ifdef DGCPAIN_RENDERDOC_ENABLED
+        rdc = std::make_unique<RenderDocCapture>();
+#endif
     }
 
     void DestroyCanvas() {
@@ -606,6 +621,16 @@ struct VkBackend::Impl {
         if (stamps.empty()) {
             return;
         }
+        // B5-4：RenderDoc 程序化抓帧 —— Start/End 包住整段 composite commandBuffer
+        // （bind pipeline/descriptor/push constants/vkCmdDispatch + 提交完成），与 dispatch
+        // 同线程（render 线程）且被 mutex_ 串行。Vulkan 的 RenderDoc device pointer 是
+        // VkInstance 的 dispatch 表指针（不能用 VkDevice），故经宏转换后传入。
+#ifdef DGCPAIN_RENDERDOC_ENABLED
+        void* rdocDevice = rdc ? RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance.get()) : nullptr;
+        if (rdc) {
+            rdc->startFrameCapture(rdocDevice);
+        }
+#endif
         BeginCommands();
         for (const StampData& s : stamps) {
             vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
@@ -633,6 +658,11 @@ struct VkBackend::Impl {
             vkCmdDispatch(commandBuffer, gx, gy, 1);
         }
         SubmitAndWait();
+#ifdef DGCPAIN_RENDERDOC_ENABLED
+        if (rdc) {
+            rdc->endFrameCapture(rdocDevice);
+        }
+#endif
     }
 
     void ClearCanvasLocked() {
