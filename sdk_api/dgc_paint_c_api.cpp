@@ -278,6 +278,12 @@ int dgcExportPNG(DgcContext* ctx, const char* path) {
         g_last_error = DGC_ERR_NOT_IMPLEMENTED;
         return DGC_ERR_NOT_IMPLEMENTED;
     }
+    // 导出前先 drain：exportPNG 内部即画布读回，引擎三线程异步合成有滞后，
+    // 必须先 flush 等全部已提交输入合成完成，否则导出缺最近 dab（线条空洞）。
+    // 与 dgcFlush 同逻辑；flush 幂等，无未决输入时直接返回。
+    if (ctx->impl_->engine->running()) {
+        ctx->impl_->engine->flush();
+    }
     ctx->impl_->backend->exportPNG(path);
     g_last_error = DGC_OK;
     return DGC_OK;
@@ -295,6 +301,12 @@ int dgcReadbackPixels(DgcContext* ctx, void* rgbaOut) {
     if (!ctx->impl_->backend->supportsOffscreen()) {
         g_last_error = DGC_ERR_NOT_IMPLEMENTED;
         return DGC_ERR_NOT_IMPLEMENTED;
+    }
+    // 读回前先 drain：引擎为「输入→笔刷→渲染」三线程异步模型，渲染线程合成 dab
+    // 有滞后；若直接 readback 拷贝画布，会缺最近提交但尚未合成的 dab（线条空洞）。
+    // 与 dgcFlush 同逻辑，保证拷贝到的是已合成全部已提交输入的完整画布。
+    if (ctx->impl_->engine->running()) {
+        ctx->impl_->engine->flush();
     }
     ctx->impl_->backend->readback(rgbaOut);
     g_last_error = DGC_OK;
