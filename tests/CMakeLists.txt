@@ -77,6 +77,12 @@ if(DGCPAIN_KERNEL_BRUSH AND EXISTS ${CMAKE_SOURCE_DIR}/kernels/brush/CMakeLists.
         target_include_directories(test_brush_offscreen PRIVATE ${CMAKE_SOURCE_DIR})
         target_link_libraries(test_brush_offscreen PRIVATE dgc_paint)
         add_test(NAME test_brush_offscreen COMMAND test_brush_offscreen)
+
+        # bugfix 复现：readback 不先 drain 时画布完整性（模拟 paint-pc 每帧读回）。
+        add_executable(test_readback_drain test_readback_drain.cpp)
+        target_include_directories(test_readback_drain PRIVATE ${CMAKE_SOURCE_DIR})
+        target_link_libraries(test_readback_drain PRIVATE dgc_paint)
+        add_test(NAME test_readback_drain COMMAND test_readback_drain)
     endif()
 endif()
 
