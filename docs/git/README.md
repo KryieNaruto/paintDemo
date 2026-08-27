@@ -25,8 +25,8 @@
 | 仓库 | 状态 | 用途 |
 |------|------|------|
 | `KryieNaruto/paintDemo` | 已存在（本仓库） | 绘画内核 SDK 基座，产出 `dgc_paint`，唯一公开头 `dgc_paint_c_api.h` |
-| `KryieNaruto/paint-android` | 已建 | Android UI 消费者；自备 JNI / Compose / Ink，窗口句柄经 `dgcSetSurface` 传入 SDK；submodule 已钉 `43500e5` |
-| `KryieNaruto/paint-pc` | 已建 | PC UI 消费者；自备 ImGui / GLFW 窗口，窗口句柄经 `dgcSetSurface` 传入 SDK；submodule 已钉 `43500e5` |
+| `KryieNaruto/paint-android` | 已建 | Android UI 消费者；自备 JNI / Compose / Ink，窗口句柄经 `dgcSetSurface` 传入 SDK；submodule 跟随 main 最新（branch = main） |
+| `KryieNaruto/paint-pc` | 已建 | PC UI 消费者；自备 ImGui / GLFW 窗口，窗口句柄经 `dgcSetSurface` 传入 SDK；submodule 跟随 main 最新（branch = main） |
 
 > 消费者仓库不在本仓库创建（由独立 GitHub 仓库承载）。`paint-android` / `paint-pc` 骨架已搭建，submodule 引用本库，窗口 / 输入 / JNI 仍由消费者实现。
 
@@ -41,9 +41,10 @@
 
    也可用 `scripts/bootstrap-consumer.sh` 一键完成（见下文）。
 
-2. **钉 commit 或 tag，禁止长期漂浮跟踪 `main`。**
-   接入后立刻 `git -C sdk checkout <tag|commit>` 并把 submodule 记录提交进消费者仓库。
-   SDK 更新需显式、经评审地重钉版本，而不是自动跟随 `main` 漂移。
+2. **默认跟随 `main` 最新（不钉 pin）。**
+   `.gitmodules` 配 `branch = main`，消费者 `scripts/setup.*` 每次构建用
+   `git submodule update --init --recursive --remote` 拉到 SDK 最新，日常开发不需手动钉版本。
+   如需发布快照 / 复现某次构建，可临时 `git -C sdk checkout <tag|commit>` 覆盖并记录，但不作为长期约定。
 
 3. **消费者只 `#include "dgc_paint_c_api.h"`，禁止 include `core/`。**
    `core/` `kernels/` `render/` 都是 SDK 内部实现，不在 ABI 承诺内；
@@ -67,7 +68,8 @@ gh repo create KryieNaruto/paint-android --private   # 或网页 https://github.
 # 2) clone 空库并进入：
 git clone git@github.com:KryieNaruto/paint-android.git && cd paint-android
 # 3) 在该空库目录里执行（脚本只操作当前消费者目录，不碰 SDK 仓库文件）：
-/path/to/paintDemo/scripts/bootstrap-consumer.sh --tag v0.1.0
+/path/to/paintDemo/scripts/bootstrap-consumer.sh      # 默认：跟随 main 最新（branch = main）
+#    发布快照可选：--tag <tag> / --commit <sha> 钉版本
 # 4) 提交 .gitmodules 与 submodule 指针：
 git add .gitmodules sdk && git commit -m "chore: submodule paintDemo SDK 到 sdk/"
 ```
