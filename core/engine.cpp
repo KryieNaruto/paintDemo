@@ -32,6 +32,10 @@ void Engine::start() {
         return;
     }
     stop_.store(false, std::memory_order_release);
+    // 默认笔刷同步建于调用线程（start() 返回前即存在），消除「C API 设色早于
+    // brushLoop 异步创建笔刷」的竞态（风险 R3）：brushLoop 不再自行 createBrush，
+    // 复用 default_brush_。
+    default_brush_ = kernel_->createBrush(BrushParams{});
     input_thread_  = std::thread(&Engine::inputLoop, this);
     brush_thread_  = std::thread(&Engine::brushLoop, this);
     render_thread_ = std::thread(&Engine::renderLoop, this);
@@ -171,7 +175,8 @@ void Engine::inputLoop() {
 
 void Engine::brushLoop() {
     // 内核线程：beginStroke/endStroke 有状态，必须在此线程执行。
-    const BrushHandle brush = kernel_->createBrush(BrushParams{});
+    // 默认笔刷已在 start() 同步创建（default_brush_），此处直接复用，不再重复 createBrush。
+    const BrushHandle brush = default_brush_;
     while (true) {
         if (stop_.load(std::memory_order_acquire)) {
             return;

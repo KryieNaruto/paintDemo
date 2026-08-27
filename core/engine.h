@@ -65,6 +65,11 @@ public:
     // （C API 调用线程）调用；纯等待 + 原子读，无新堆所有权。
     void flush();
 
+    // 默认笔刷句柄（D6-3）：start() 内同步创建，返回前即有效，供 C API
+    // dgcSetBrushColor(DGC_DEFAULT_BRUSH, ...) 等无需等待 brushLoop 异步创建
+    // （消除设色早于笔刷建成的竞态，风险 R3）。start() 前调用返回值未定义。
+    BrushHandle defaultBrush() const noexcept { return default_brush_; }
+
 private:
     void inputLoop();             // 输入线程：pending_input_ → input_to_brush_
     void brushLoop();             // 内核线程：strokeTo → stamp 批 → brush_to_render_
@@ -118,4 +123,8 @@ private:
     std::thread input_thread_;
     std::thread brush_thread_;
     std::thread render_thread_;
+
+    // 默认笔刷句柄（D6-3）：start() 内同步创建（早于三线程启动/join 前对外可见），
+    // 值语义，无堆所有权；brushLoop 复用同一句柄，不再自行 createBrush。
+    BrushHandle default_brush_ = 0;
 };

@@ -450,6 +450,11 @@ int dgcSetBrushColor(DgcContext* ctx, DgcBrush brush, float r, float g, float b,
         return DGC_ERR_INVALID_HANDLE;
     }
     ctx->impl_->brush_colors[brush] = {r, g, b, a};
+    // 桥接到内核（D6-3）：此前仅写 brush_colors（死存储，无读取点），改颜色不落地到
+    // 渲染。补一跳转发到 IPaintKernel::setBrushColor（RGB→HSV→Brush::setColor），
+    // 下一笔 strokeTo 的 dab 即用新色；旧笔迹已 composite 到画布，不受影响。
+    // 约定：与 setBrushColor 本体同款并发 caveat——建议消费端在 stroke 前/引擎空闲时调用。
+    ctx->impl_->kernel->setBrushColor(brush, r, g, b, a);
     g_last_error = DGC_OK;
     return DGC_OK;
 }

@@ -211,6 +211,23 @@ DGCPAIN_RENDER_SKIA=ON     # C
 DGCPAIN_RENDER_BGFX=ON     # D
 ```
 
+## 垂直同步（vsync）归属
+
+SDK 渲染路径**纯离屏**：`render/vulkan/vk_backend.h` 无窗口 headless 模式，不创建
+swapchain；`vk_backend.cpp` 的 `present()` 为 no-op。SDK **没有、也不提供 vsync 概念**——
+`dgcRender`/`dgcFlush` 只驱动离屏合成（compute dab → composite 到离屏画布），与「上屏
+帧节奏」无关。
+
+「关闭垂直同步」是**消费端**的 present 模式切换，与 SDK 无关：
+
+- GLFW + OpenGL 上屏（如 paint-pc）：`glfwSwapInterval(0)` 关闭 / `glfwSwapInterval(1)` 开启，
+  作用于消费端自己的 `glfwSwapBuffers` 上屏调用，SDK 不感知。
+- Vulkan 原生上屏：消费端自建 swapchain 时切换 `VkPresentModeKHR`（`VK_PRESENT_MODE_FIFO_KHR`
+  ↔ `VK_PRESENT_MODE_IMMEDIATE_KHR`）。
+
+即：消费端从 SDK 读回像素（`dgcReadbackPixels`/`dgcExportPNG`）或贴图后自行上屏，
+vsync 完全是消费端上屏管线的职责，SDK 离屏渲染路径本身零改动、零回归。
+
 ## 性能指标（目标）
 
 | 指标 | 目标 | 测量方法 |

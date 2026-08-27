@@ -45,4 +45,36 @@ inline void hsv_to_rgb_float(float h, float s, float v, float* r, float* g, floa
     *b = b1 + m;
 }
 
+// RGB → HSV 反变换（r/g/b ∈ [0,1] → h ∈ [0,360)、s/v ∈ [0,1]）。
+// 供 dgcSetBrushColor 桥接用：C API 收 straight RGBA，内核 dab 用 HSV 调制。
+// 边界：max==min（灰度，含纯黑/纯白）→ s=0、h=0，避免除零 / fmod 噪声（风险 R5）。
+inline void rgb_to_hsv_float(float r, float g, float b, float* h, float* s, float* v) {
+    r = clamp01(r);
+    g = clamp01(g);
+    b = clamp01(b);
+    const float mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+    const float mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+    const float delta = mx - mn;
+    *v = mx;
+    if (delta <= 0.0f) {
+        *h = 0.0f;
+        *s = 0.0f;
+        return;
+    }
+    *s = delta / mx;
+    float hh = 0.0f;
+    if (mx == r) {
+        hh = (g - b) / delta;
+    } else if (mx == g) {
+        hh = (b - r) / delta + 2.0f;
+    } else {
+        hh = (r - g) / delta + 4.0f;
+    }
+    hh *= 60.0f;
+    if (hh < 0.0f) {
+        hh += 360.0f;
+    }
+    *h = hh;
+}
+
 }  // namespace brush
