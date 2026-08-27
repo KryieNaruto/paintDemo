@@ -8,6 +8,7 @@
 #include "core/engine.h"
 #include "core/interfaces/i_paint_kernel.h"
 #include "core/interfaces/i_render_backend.h"
+#include "core/stroke_predictor.h"
 #include "core/types.h"
 #include "kernels/brush/brush_kernel_factory.h"
 #ifdef DGCPAIN_HAVE_BRUSH
@@ -41,6 +42,19 @@ struct DgcContext::Impl {
     FixedTimeStepper  time_stepper;             // 固定时间步进
     std::unordered_map<DgcBrush, std::array<double, DGC_SETTING_COUNT>> brush_settings;
     std::unordered_map<DgcBrush, std::array<float, 4>>                  brush_colors;
+
+    // D6-1：context 级 stroke modeler 参数与惰性激活的预测器。
+    //   - model_params 为值成员，缺省即 StrokeModelParams 的字面默认值；
+    //     dgcSetBrushSetting(modeler 项) 改写后立即 Configure 生效。
+    //   - predictor_handle_ 是**非拥有**裸指针：真正所有权在
+    //     engine->setPredictor 移交后的 Engine::predictor_（unique_ptr），
+    //     本处只保留一份指针用于后续 Configure 调用，不 new/delete、不重复释放。
+    //   - 惰性激活（plan §4.2）：dgcCreate 不创建/注入 predictor（passthrough，
+    //     默认零回归）；首次设置任一 modeler settingId 才 make_unique 创建、
+    //     Configure、经 engine->setPredictor 移交所有权。
+    StrokeModelParams model_params;
+    StrokeModeler*    predictor_handle_ = nullptr;  // 非拥有裸指针，不释放
+    uint64_t          next_brush_handle_ = 1;       // dgcCreateBrush 发号器
 };
 
 // 析构器必须在 Impl 完整后定义（unique_ptr<Impl> + 不完整类型，否则隐式析构在声明处
@@ -51,6 +65,43 @@ namespace {
 
 // 错误码记录：dgcGetLastError 无 ctx 参数，故用线程局部变量。
 thread_local DgcError g_last_error = DGC_OK;
+
+// D6-1：settingId >= DGC_SETTING_WOBBLE_TIMEOUT_MS 即 stroke modeler 参数
+// （见 sdk_api/dgc_paint_c_api.h 枚举分段注释）；写入 StrokeModelParams 对应字段。
+// 调用方需先保证 settingId 已在 [0, DGC_SETTING_COUNT) 范围内。
+void applyModelerSetting(StrokeModelParams& p, int settingId, double value) {
+    switch (settingId) {
+        case DGC_SETTING_WOBBLE_TIMEOUT_MS:
+            p.wobble_timeout_ms = static_cast<float>(value);
+            break;
+        case DGC_SETTING_WOBBLE_SPEED_FLOOR:
+            p.wobble_speed_floor = static_cast<float>(value);
+            break;
+        case DGC_SETTING_MIN_OUTPUT_RATE_HZ:
+            p.min_output_rate_hz = static_cast<float>(value);
+            break;
+        case DGC_SETTING_END_OF_STROKE_STOPPING_DISTANCE_MM:
+            p.end_of_stroke_stopping_distance_mm = static_cast<float>(value);
+            break;
+        case DGC_SETTING_SPRING_MASS_CONSTANT:
+            p.spring_mass_constant = static_cast<float>(value);
+            break;
+        case DGC_SETTING_SPRING_DRAG_CONSTANT:
+            p.spring_drag_constant = static_cast<float>(value);
+            break;
+        case DGC_SETTING_KALMAN_PROCESS_NOISE:
+            p.kalman_process_noise = static_cast<float>(value);
+            break;
+        case DGC_SETTING_KALMAN_MEASUREMENT_NOISE:
+            p.kalman_measurement_noise = static_cast<float>(value);
+            break;
+        case DGC_SETTING_PREDICTION_INTERVAL_MS:
+            p.prediction_interval_ms = static_cast<float>(value);
+            break;
+        default:
+            break;  // 不可达：调用方已校验 settingId 属于 modeler 段。
+    }
+}
 
 const char* errorMessage(DgcError e) {
     switch (e) {
@@ -183,9 +234,14 @@ DgcBrush dgcCreateBrush(DgcContext* ctx, const DgcBrushParams* params) {
         g_last_error = DGC_ERR_NULL_CONTEXT;
         return DGC_INVALID_BRUSH;
     }
-    // 引擎固定默认笔刷，本期不接线按笔画选笔刷（见 B1-4 计划「风险」）。
-    g_last_error = DGC_ERR_NOT_IMPLEMENTED;
-    return DGC_INVALID_BRUSH;
+    // D6-1（plan §4.4，B1-4 遗留的最小落地）：仅做发号器，返回自增非 0 句柄，
+    // 供 dgcSetBrushSetting/dgcSetBrushColor 校验非 DGC_INVALID_BRUSH 用；
+    // 不触达 engine/kernel —— 引擎渲染仍用固定默认笔刷（笔刷切换/加载不在
+    // D6-1 范围，dgcSetBrush/dgcDestroyBrush/dgcLoadBrushFromMyb 保持
+    // NOT_IMPLEMENTED）。modeler 参数是 context 级单例，与具体笔刷句柄值无关。
+    const DgcBrush handle = static_cast<DgcBrush>(ctx->impl_->next_brush_handle_++);
+    g_last_error = DGC_OK;
+    return handle;
 }
 
 DgcBrush dgcLoadBrushFromMyb(DgcContext* ctx, const char* mybJson) {
@@ -346,6 +402,26 @@ int dgcSetBrushSetting(DgcContext* ctx, DgcBrush brush, int settingId, double va
     if (brush == DGC_INVALID_BRUSH) {
         g_last_error = DGC_ERR_INVALID_HANDLE;
         return DGC_ERR_INVALID_HANDLE;
+    }
+    if (settingId >= DGC_SETTING_WOBBLE_TIMEOUT_MS) {
+        // D6-1：stroke modeler 参数（context 级单例，与具体笔刷句柄值无关，
+        // 见 plan §4.4）。惰性激活（plan §4.2）：首次设置才创建 + 注入，之后
+        // 仅 Configure 更新参数，dgcCreate 默认不注入，保证零回归。
+        applyModelerSetting(ctx->impl_->model_params, settingId, value);
+        if (ctx->impl_->predictor_handle_ == nullptr) {
+            // 所有权：make_unique 创建 → engine->setPredictor 整体移交，
+            // Engine::predictor_（unique_ptr）持有并负责析构；此处仅留一份
+            // 非拥有裸指针供后续 Configure 调用，不 new/delete、不重复释放。
+            auto predictor = std::make_unique<StrokeModeler>();
+            StrokeModeler* raw = predictor.get();
+            predictor->Configure(ctx->impl_->model_params);
+            ctx->impl_->engine->setPredictor(std::move(predictor));
+            ctx->impl_->predictor_handle_ = raw;
+        } else {
+            ctx->impl_->predictor_handle_->Configure(ctx->impl_->model_params);
+        }
+        g_last_error = DGC_OK;
+        return DGC_OK;
     }
     ctx->impl_->brush_settings[brush][settingId] = value;
     g_last_error = DGC_OK;
