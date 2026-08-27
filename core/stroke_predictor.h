@@ -24,27 +24,65 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 // 调参集合（镜像 ink SamplingParams + StrokeModelParams 的绘画场景子集）。
+//
+// D6-1：以下 9 个字段均为消费端调试面板可调的 stroke modeler 参数（经
+// `DgcBrushSetting` 的 DGC_SETTING_WOBBLE_TIMEOUT_MS .. DGC_SETTING_PREDICTION_INTERVAL_MS
+// 透传，见 sdk_api/dgc_paint_c_api.h 与 docs/brush_settings_mapping.md）。
 struct StrokeModelParams {
-    // wobble smoothing：低通时间常数 / 判静止速度下限（mm/s）
+    // wobble smoothing（抖动消除）：低通滤波的时间常数。
+    // 物理/手感含义：越大，输入被平滑的窗口越长，抖动压制越强但跟手感越迟滞
+    // （数值上是 WobbleSmoother 一阶低通 alpha = dt/(dt+timeout_s) 里的 timeout_s）。
+    // 单位：毫秒（ms）。
     float wobble_timeout_ms  = 40.0f;
+
+    // wobble smoothing（抖动消除）：判定「静止/微动」的速度下限。
+    // 物理/手感含义：瞬时速度低于此阈值即视为停笔抖动，走 dwell 累积平均分支
+    // （压住手抖）；高于阈值走运动分支（走低通，尽量跟手）。
+    // 单位：毫米/秒（mm/s）。
     float wobble_speed_floor = 1.31f;
 
-    // 重采样：固定 min_output_rate 上采样（保证输出点密度下限）
+    // 重采样：固定 min_output_rate 上采样，保证输出点密度下限。
+    // 物理/手感含义：越大，稀疏输入（快速划动/低采样率设备）被补点越密，笔迹
+    // 曲线越平滑；同时决定 Predict() 外推点的时间间隔（period = 1/rate）。
+    // 单位：赫兹（Hz）。
     float min_output_rate_hz = 180.0f;
+
+    // 抬笔停止距离：StrokeEndPredictor 判定「停笔点」的位移阈值。
+    // 物理/手感含义：沿当前速度方向按阻尼衰减估算的剩余位移若小于该值，视为
+    // 已停笔（末端预测点直接取当前位置，不再外推），越大越倾向于继续外推末端。
+    // 单位：毫米（mm）。
     float end_of_stroke_stopping_distance_mm = 0.1f;
 
-    // 弹簧质点（位置模型）：K/m（1/s²）与 C/m（1/s）。
+    // 弹簧质点（位置模型）：弹簧刚度 K 与质量 m 的比值 K/m。
+    // 物理/手感含义：越大，弹簧把「目标位置（输入点）」拉向自身的力越强、响应
+    // 越快、越跟手；越小则跟踪越迟滞、笔迹越平滑但滞后感越明显。
     // 注：plan 草稿给的 1.0/20.0 会得到约 20 s 的响应时间常数（模型几乎不跟踪输入），
     //     此处按「绘画场景」调为临界阻尼（ζ=C/(2√K)=1，ωn=√K≈20 rad/s → 约 50 ms
     //     跟踪），既明显压制 100 Hz 级手抖，又能在百毫秒级笔划内跟上输入。
+    // 单位：1/秒²（1/s²）。
     float spring_mass_constant = 400.0f;
+
+    // 弹簧质点（位置模型）：阻尼系数 C 与质量 m 的比值 C/m。
+    // 物理/手感含义：越大，弹簧运动衰减越快（类似「粘滞阻力」），抑制过冲/震荡；
+    // 与 spring_mass_constant 共同决定阻尼比 ζ=C/(2√K)，同时复用作
+    // StrokeEndPredictor 的位移衰减率。
+    // 单位：1/秒（1/s）。
     float spring_drag_constant = 40.0f;
 
-    // Kalman 预测：恒定速度模型的过程/量测噪声
+    // Kalman 预测：恒定速度模型的过程噪声（状态转移不确定性）。
+    // 物理/手感含义：越大，卡尔曼滤波越信任「最新量测」而非历史轨迹，估计速度
+    // 对手部动作变化的反应越灵敏（但也更易受噪声干扰、外推抖动更大）。
     float kalman_process_noise   = 0.0005f;
+
+    // Kalman 预测：位置量测噪声（传感器/输入点抖动的不确定性）。
+    // 物理/手感含义：越大，卡尔曼滤波越不信任单次量测、估计速度越平滑（但对
+    // 真实加减速的响应越滞后），用于压制输入设备本身的量测抖动。
     float kalman_measurement_noise = 0.004f;
 
-    // 外推时长：Predict() 沿速度方向外推 future_ms 内、按 min_output_rate 布点
+    // 外推时长：Predict() 沿卡尔曼估计速度方向外推的时间窗口，按
+    // min_output_rate 布点，越大预测点越远、越靠前遮盖输入延迟，但笔画结束/
+    // 转向时被真实点覆盖修正的幅度也越大（越容易"抢跑"看到明显预测漂移）。
+    // 单位：毫秒（ms）。
     float prediction_interval_ms = 16.0f;
 };
 

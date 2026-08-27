@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 白盒移植 Ink Stroke Modeler 的内部组件（全部在匿名命名空间，值成员 + RAII）。
@@ -299,6 +300,16 @@ struct StrokeEndPredictor {
 }  // namespace
 
 // ── StrokeModeler::Impl ─────────────────────────────────────────────────────
+//
+// D6-1 线程安全（plan §4.3 点 2）：Configure/Update/Predict/Reset 由不同线程
+// 调用（C API 调用线程 setBrushSetting → Configure；引擎输入线程 → Update/
+// Predict/Reset），Impl 内持一把非递归 std::mutex 保护全部内部状态。
+//
+// 死锁规避：Reset() 是公开入口会自行加锁；Configure() 内部语义上也要做一次
+// 「清空状态」，若 Configure 加锁后再调用会加锁的 Reset() 会对同一把非递归锁
+// 重入自锁死锁。故拆出私有的 ResetLocked()（假定调用方已持锁，内部不再加锁），
+// Configure() 加锁一次后内联调用 ResetLocked()；公开 Reset() 加锁后调用
+// ResetLocked()。
 struct StrokeModeler::Impl {
     void ApplyParams() {
         wobble_.Configure(params_.wobble_timeout_ms, params_.wobble_speed_floor);
@@ -308,6 +319,19 @@ struct StrokeModeler::Impl {
         end_pred_.Configure(params_.spring_drag_constant,
                             params_.end_of_stroke_stopping_distance_mm);
     }
+
+    // 无锁内部重置：调用方必须已持有 mutex_（Configure/Reset 的公开入口负责加锁）。
+    void ResetLocked() {
+        wobble_.Reset();
+        resampler_.Reset();
+        position_.Reset();
+        kalman_.Reset();
+        end_pred_.Reset();
+        has_output_ = false;
+        last_output_ = {};
+    }
+
+    std::mutex mutex_;  // 守卫以下全部状态；四个公开方法各自加锁，互斥执行。
 
     StrokeModelParams params_{};
     WobbleSmoother wobble_;
@@ -323,28 +347,25 @@ struct StrokeModeler::Impl {
 };
 
 StrokeModeler::StrokeModeler() : impl_(std::make_unique<Impl>()) {
-    impl_->ApplyParams();
+    impl_->ApplyParams();  // 构造期单线程，无需加锁。
 }
 
 StrokeModeler::~StrokeModeler() = default;
 
 void StrokeModeler::Configure(const StrokeModelParams& params) {
+    std::lock_guard<std::mutex> lock(impl_->mutex_);
     impl_->params_ = params;
     impl_->ApplyParams();
-    Reset();
+    impl_->ResetLocked();  // 内联重置，避免对 Reset() 重入加锁自死锁。
 }
 
 void StrokeModeler::Reset() {
-    impl_->wobble_.Reset();
-    impl_->resampler_.Reset();
-    impl_->position_.Reset();
-    impl_->kalman_.Reset();
-    impl_->end_pred_.Reset();
-    impl_->has_output_ = false;
-    impl_->last_output_ = {};
+    std::lock_guard<std::mutex> lock(impl_->mutex_);
+    impl_->ResetLocked();
 }
 
 void StrokeModeler::Update(const StrokePoint& raw, std::vector<StrokePoint>* out) {
+    std::lock_guard<std::mutex> lock(impl_->mutex_);
     StrokePoint w = impl_->wobble_.Smooth(raw);
 
     std::vector<StrokePoint> resampled;
@@ -361,6 +382,7 @@ void StrokeModeler::Update(const StrokePoint& raw, std::vector<StrokePoint>* out
 }
 
 void StrokeModeler::Predict(std::vector<StrokePoint>* out) {
+    std::lock_guard<std::mutex> lock(impl_->mutex_);
     if (!impl_->has_output_) {
         return;
     }
