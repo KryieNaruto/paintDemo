@@ -83,6 +83,13 @@ if(DGCPAIN_KERNEL_BRUSH AND EXISTS ${CMAKE_SOURCE_DIR}/kernels/brush/CMakeLists.
         target_include_directories(test_readback_drain PRIVATE ${CMAKE_SOURCE_DIR})
         target_link_libraries(test_readback_drain PRIVATE dgc_paint)
         add_test(NAME test_readback_drain COMMAND test_readback_drain)
+
+        # bugfix 回归补充：模拟 paint-pc 真实 GUI 循环——笔画进行中逐帧读回（无 flush），
+        # 与 test_readback_drain（仅笔画结束后读回一次）互补，覆盖"边画边读"场景。
+        add_executable(test_midstroke_readback test_midstroke_readback.cpp)
+        target_include_directories(test_midstroke_readback PRIVATE ${CMAKE_SOURCE_DIR})
+        target_link_libraries(test_midstroke_readback PRIVATE dgc_paint)
+        add_test(NAME test_midstroke_readback COMMAND test_midstroke_readback)
     endif()
 endif()
 
