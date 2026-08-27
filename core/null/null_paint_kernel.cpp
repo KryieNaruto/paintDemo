@@ -11,3 +11,5 @@ std::vector<StampData> NullPaintKernel::strokeTo(BrushHandle, const StrokePoint&
 }
 
 void NullPaintKernel::endStroke(BrushHandle) {}
+
+void NullPaintKernel::setBrushColor(BrushHandle, float, float, float, float) {}

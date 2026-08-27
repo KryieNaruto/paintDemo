@@ -1,7 +1,8 @@
 // B3-1 host 单测：自研 C++ 笔刷内核主链。
 // 覆盖：createBrush 非零句柄 / strokeTo 非空 / dab 数·半径·不透明度取值范围 /
 // countDabsTo 求和语义 / 颜色调制（HSV→RGB）/ 同 seed 确定性 / 传感器滤波结构断言 /
-// 多轮 create/stroke 无泄漏循环。
+// 多轮 create/stroke 无泄漏循环 / rgb_to_hsv_float 反变换边界（D6-3） /
+// BrushKernel::setBrushColor 桥接后 strokeTo 变色、旧笔迹不变（D6-3）。
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -207,6 +208,54 @@ int main() {
             // k 析构自动释放 registry + Brush + RNG。
         }
         CHECK(true, "create/stroke/destroy loop completes");
+    }
+
+    // ── 7. rgb_to_hsv_float 反变换（边界 + 往返）──
+    {
+        float h, s, v;
+        // 纯红：hsv(0,1,1) -> rgb(1,0,0) -> hsv 应回到 h≈0, s=1, v=1。
+        brush::rgb_to_hsv_float(1.0f, 0.0f, 0.0f, &h, &s, &v);
+        CHECK(std::fabs(h - 0.0f) < 1e-3f, "rgb(1,0,0) -> h=0");
+        CHECK(std::fabs(s - 1.0f) < 1e-3f, "rgb(1,0,0) -> s=1");
+        CHECK(std::fabs(v - 1.0f) < 1e-3f, "rgb(1,0,0) -> v=1");
+        // 灰度边界（R5）：max==min（纯黑/纯白）-> s=0, h=0，不产生 NaN。
+        brush::rgb_to_hsv_float(0.0f, 0.0f, 0.0f, &h, &s, &v);
+        CHECK(h == 0.0f && s == 0.0f && v == 0.0f, "rgb(0,0,0) -> h=0,s=0,v=0 (no NaN)");
+        brush::rgb_to_hsv_float(1.0f, 1.0f, 1.0f, &h, &s, &v);
+        CHECK(h == 0.0f && s == 0.0f && v == 1.0f, "rgb(1,1,1) -> h=0,s=0,v=1 (no NaN)");
+    }
+
+    // ── 8. dgcSetBrushColor 桥接：IPaintKernel::setBrushColor 后 strokeTo 变色 ──
+    // 对应 D6-3：改颜色后新笔画为该颜色（此处直连内核，不依赖 C API/Vulkan）。
+    {
+        BrushKernel k(99);
+        BrushHandle h = k.createBrush(BrushParams{});
+        CHECK(h != 0, "setBrushColor: createBrush non-zero handle");
+
+        // 默认色（黑，HSV 全零）下先出一批 dab，确认非目标色。
+        k.beginStroke(h, MakePoint(0.0f, 0.0f, 0.5f, 0));
+        auto before = k.strokeTo(h, MakePoint(10.0f, 0.0f, 0.5f, 16666));
+        k.endStroke(h);
+        CHECK(!before.empty(), "setBrushColor: pre-color stroke non-empty");
+
+        // 改为亮蓝（straight RGB 0,0,1）后，新笔画 dab 应为蓝色；旧 dab（before）不受影响。
+        k.setBrushColor(h, 0.0f, 0.0f, 1.0f, 1.0f);
+        k.beginStroke(h, MakePoint(0.0f, 0.0f, 0.5f, 0));
+        auto after = k.strokeTo(h, MakePoint(10.0f, 0.0f, 0.5f, 16666));
+        k.endStroke(h);
+        CHECK(!after.empty(), "setBrushColor: post-color stroke non-empty");
+        if (!after.empty()) {
+            CHECK(after[0].b > 0.95f && after[0].r < 0.05f && after[0].g < 0.05f,
+                  "setBrushColor: new stroke dab is blue after color change");
+        }
+        if (!before.empty()) {
+            CHECK(before[0].r < 0.05f && before[0].g < 0.05f && before[0].b < 0.05f,
+                  "setBrushColor: old stroke (pre-change) stays black, unaffected");
+        }
+
+        // 未知句柄：no-op，不崩溃（风险 R3 缺失句柄防御）。
+        k.setBrushColor(h + 1000, 1.0f, 1.0f, 1.0f, 1.0f);
+        CHECK(true, "setBrushColor: unknown handle is no-op, does not crash");
     }
 
     if (failures == 0) {

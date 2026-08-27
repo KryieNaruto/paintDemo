@@ -9,4 +9,5 @@ public:
     void beginStroke(BrushHandle brush, const StrokePoint& point) override;
     std::vector<StampData> strokeTo(BrushHandle brush, const StrokePoint& point) override;
     void endStroke(BrushHandle brush) override;
+    void setBrushColor(BrushHandle brush, float r, float g, float b, float a) override;
 };
