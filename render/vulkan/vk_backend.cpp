@@ -6,7 +6,9 @@
 #include "render/renderdoc/renderdoc_capture.h"
 #endif
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -38,8 +40,9 @@ struct BrushPushConstant {
     float opacity;
     float rgb[3];
     std::uint32_t shapeType;
+    float dispatchOffset[2];  // 包围盒 dispatch 原点（shader：c = gl_GlobalInvocationID.xy + offset）
 };
-static_assert(sizeof(BrushPushConstant) == 10 * sizeof(float), "push constant size");
+static_assert(sizeof(BrushPushConstant) == 12 * sizeof(float), "push constant size");
 
 // §4.5 GLSL → SPIR-V：host 用 shaderc 库在代码内编译（不 shell 调 glslc/glslangValidator）；
 // Android（NDK 无 libshaderc）改走构建期 glslc 预编译的内嵌 SPIR-V（DGCPAIN_PRECOMPILED_SPV）。
@@ -631,12 +634,16 @@ struct VkBackend::Impl {
             rdc->startFrameCapture(rdocDevice);
         }
 #endif
+#ifdef DGCPAIN_PERF
+        auto t0 = std::chrono::steady_clock::now();
+#endif
         BeginCommands();
+        // 每 stamp 只变 push constant；pipeline/descriptor 绑定提出循环（避免逐 dab 重绑）。
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0,
+                                1, &descriptorSet, 0, nullptr);
+        size_t dispatches = 0;
         for (const StampData& s : stamps) {
-            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-            vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0,
-                                    1, &descriptorSet, 0, nullptr);
-
             BrushPushConstant pc{};
             pc.pos[0] = s.x;
             pc.pos[1] = s.y;
@@ -648,16 +655,42 @@ struct VkBackend::Impl {
             pc.rgb[1] = s.g;
             pc.rgb[2] = s.b;
             pc.shapeType = 0u;  // 0=圆形软笔（默认），1/2/3 扩展位（本期不实现）。
+
+            // 包围盒 dispatch（性能根因二：每 dab 全画布 dispatch 浪费 ~30 倍线程）。
+            // shader 写范围硬边界 = 圆心 ± radius（coverage 在 dist>=1.0 分支为 0），
+            // 加 1px AA 余量；dispatchOffset push constant 把 gl_GlobalInvocationID 平移到
+            // 覆盖区原点，普通 vkCmdDispatch 即可（不用 vkCmdDispatchBase——Mali 驱动实测
+            // gl_GlobalInvocationID 未含 base，画不到偏移区域）。覆盖区仍含 dab 全部有效
+            // 像素，shader 内 SDF 早退保证输出与全画布逐像素一致。
+            const float margin = 1.0f;
+            const float x0 = s.x - s.radius - margin;
+            const float y0 = s.y - s.radius - margin;
+            const float x1 = s.x + s.radius + margin;
+            const float y1 = s.y + s.radius + margin;
+            const int ix0 = std::max(0, (int)std::floor(x0));
+            const int iy0 = std::max(0, (int)std::floor(y0));
+            const int ix1 = std::min(width - 1, (int)std::ceil(x1));
+            const int iy1 = std::min(height - 1, (int)std::ceil(y1));
+            if (ix0 > ix1 || iy0 > iy1) {
+                continue;  // dab 完全在画布外：无需 dispatch。
+            }
+            pc.dispatchOffset[0] = (float)ix0;
+            pc.dispatchOffset[1] = (float)iy0;
+            const uint32_t cntX = (uint32_t)((ix1 - ix0 + 8) / 8);  // ceil((ix1-ix0+1)/8)
+            const uint32_t cntY = (uint32_t)((iy1 - iy0 + 8) / 8);
             vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                sizeof(pc), &pc);
-
-            // shader 以 gl_GlobalInvocationID.xy 作为绝对画布坐标，dispatch 覆盖全画布，
-            // 由 shader 内的 SDF dist 越界早退（coverage<=0.001 return）只写 dab 覆盖区。
-            const uint32_t gx = (uint32_t)std::ceil((double)width / 8.0);
-            const uint32_t gy = (uint32_t)std::ceil((double)height / 8.0);
-            vkCmdDispatch(commandBuffer, gx, gy, 1);
+            vkCmdDispatch(commandBuffer, cntX, cntY, 1);
+            ++dispatches;
         }
         SubmitAndWait();
+#ifdef DGCPAIN_PERF
+        auto t1 = std::chrono::steady_clock::now();
+        std::fprintf(stderr,
+                     "[PERF] composite stamps=%zu dispatches=%zu total=%.3f ms (%dx%d)\n",
+                     stamps.size(), dispatches,
+                     std::chrono::duration<double, std::milli>(t1 - t0).count(), width, height);
+#endif
 #ifdef DGCPAIN_RENDERDOC_ENABLED
         if (rdc) {
             rdc->endFrameCapture(rdocDevice);
@@ -689,6 +722,9 @@ struct VkBackend::Impl {
         if (!canvasReady || rgbaOut == nullptr) {
             return;
         }
+#ifdef DGCPAIN_PERF
+        auto t0 = std::chrono::steady_clock::now();
+#endif
         BeginCommands();
         VkBufferImageCopy region{};
         region.bufferOffset = 0;
@@ -703,10 +739,21 @@ struct VkBackend::Impl {
         vkCmdCopyImageToBuffer(commandBuffer, canvasImage, VK_IMAGE_LAYOUT_GENERAL, readbackBuffer,
                                1, &region);
         SubmitAndWait();
+#ifdef DGCPAIN_PERF
+        auto t1 = std::chrono::steady_clock::now();
+#endif
         void* data = nullptr;
         vkMapMemory(device, readbackMemory, 0, readbackSize, 0, &data);
         std::memcpy(rgbaOut, data, (size_t)readbackSize);
         vkUnmapMemory(device, readbackMemory);
+#ifdef DGCPAIN_PERF
+        auto t2 = std::chrono::steady_clock::now();
+        std::fprintf(stderr,
+                     "[PERF] readback copy+wait=%.3f ms memcpy=%.3f ms (%dx%d %.1f MB)\n",
+                     std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                     std::chrono::duration<double, std::milli>(t2 - t1).count(), width, height,
+                     (double)readbackSize / 1e6);
+#endif
     }
 
     void DestroyDevice() {

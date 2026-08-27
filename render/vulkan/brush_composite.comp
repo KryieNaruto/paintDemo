@@ -13,6 +13,7 @@ layout(push_constant) uniform PC {
     float opacity;      // dab 不透明度
     float rgb[3];       // straight RGB（0..1）
     uint  shapeType;    // 0=圆形软笔（默认），1/2/3 扩展位
+    vec2  dispatchOffset;  // 包围盒 dispatch 原点：c = gl_GlobalInvocationID.xy + offset
 } pc;
 
 #ifdef DGC_USE_FWIDTH
@@ -22,7 +23,10 @@ layout(push_constant) uniform PC {
 #endif
 
 void main() {
-    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    // dispatchOffset：包围盒 dispatch 原点（画布像素坐标）。用 push constant 偏移而非
+    // vkCmdDispatchBase——后者要求 gl_GlobalInvocationID 含 base workgroup，部分移动驱动
+    // （Mali 实测）未正确实现，导致偏移区域画不到；普通 dispatch + 偏移全设备一致。
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy) + ivec2(pc.dispatchOffset);
     ivec2 sz = imageSize(u_Canvas);
     if (c.x >= sz.x || c.y >= sz.y) return;
 
