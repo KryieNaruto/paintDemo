@@ -53,7 +53,8 @@ if(DGCPAIN_ANDROID)
     endif()
 
     execute_process(
-        COMMAND ${GLSLC_BIN} -fshader-stage=compute
+        # -g：内嵌 OpSource debug 信息，RenderDoc 的 Pipeline State 可显示 GLSL 源码。
+        COMMAND ${GLSLC_BIN} -g -fshader-stage=compute
             ${CMAKE_CURRENT_SOURCE_DIR}/brush_composite.comp
             -o ${CMAKE_CURRENT_BINARY_DIR}/brush_composite.spv
         RESULT_VARIABLE _glslc_rc

@@ -64,6 +64,9 @@ std::vector<uint32_t> CompileBrushShader(bool useDerivatives, std::string* err) 
     shaderc::CompileOptions options;
     options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1);
     options.SetOptimizationLevel(shaderc_optimization_level_performance);
+    // 内嵌 OpSource debug 信息：RenderDoc 的 Pipeline State 才能显示 GLSL 源码
+    // （画世界式调试视图），否则只有 SPIR-V 反汇编。不改变渲染语义，像素确定性不受影响。
+    options.SetGenerateDebugInfo();
     if (useDerivatives) {
         options.AddMacroDefinition("DGC_USE_FWIDTH", "1");
     }
@@ -266,6 +269,7 @@ struct VkBackend::Impl {
     // 避免若未来启用 layer 注入时 dispatch 表悬空；默认关，未启用时内部 no-op）。
 #ifdef DGCPAIN_RENDERDOC_ENABLED
     std::unique_ptr<RenderDocCapture> rdc;
+    bool initCaptureOpen_ = false;  // 「资源创建→首次 composite」合并抓帧窗口是否开启
 #endif
     VkTopHandle<VkInstance, vkDestroyInstance> instance;
     VkTopHandle<VkDevice, vkDestroyDevice> device;
@@ -322,6 +326,16 @@ struct VkBackend::Impl {
             return;
         }
         instance = inst;
+
+#ifdef DGCPAIN_RENDERDOC_ENABLED
+        // B5-4 fix：构造并开启「资源创建 + 首次 composite」合并抓帧。必须在管线/描述符/画布
+        // 创建之前 StartFrameCapture——否则这些对象在抓帧窗口之外创建，RenderDoc 无法解析
+        // dispatch 的管线状态（Pipeline State 各面板全空）。首次 composite 的 EndFrameCapture
+        // 收尾此条完整 capture（见 CompositeLocked）。未启用/加载失败内部降级 no-op。
+        rdc = std::make_unique<RenderDocCapture>();
+        rdc->startFrameCapture(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(inst));
+        initCaptureOpen_ = rdc->available();
+#endif
 
         uint32_t count = 0;
         vkEnumeratePhysicalDevices(instance, &count, nullptr);
@@ -496,12 +510,6 @@ struct VkBackend::Impl {
         vkDestroyShaderModule(device, module, nullptr);
 
         deviceReady = true;
-
-        // B5-4：设备就绪后构造 RenderDoc 程序化抓帧（构造即读 DGC_RENDERDOC env；
-        // 未启用/加载失败内部降级 no-op，不影响离屏路径）。
-#ifdef DGCPAIN_RENDERDOC_ENABLED
-        rdc = std::make_unique<RenderDocCapture>();
-#endif
     }
 
     void DestroyCanvas() {
@@ -629,8 +637,11 @@ struct VkBackend::Impl {
         // 同线程（render 线程）且被 mutex_ 串行。Vulkan 的 RenderDoc device pointer 是
         // VkInstance 的 dispatch 表指针（不能用 VkDevice），故经宏转换后传入。
 #ifdef DGCPAIN_RENDERDOC_ENABLED
+        // 首次 composite：initCaptureOpen_ 为真（StartFrameCapture 已在资源创建前开启），
+        // 不重复 start，由下面 EndFrameCapture 收尾那条完整的「资源创建+首次 composite」抓帧；
+        // 后续 composite 各自 start/end（窗口窄，管线状态以首条 capture 为准）。
         void* rdocDevice = rdc ? RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance.get()) : nullptr;
-        if (rdc) {
+        if (rdc && !initCaptureOpen_) {
             rdc->startFrameCapture(rdocDevice);
         }
 #endif
@@ -694,6 +705,7 @@ struct VkBackend::Impl {
 #ifdef DGCPAIN_RENDERDOC_ENABLED
         if (rdc) {
             rdc->endFrameCapture(rdocDevice);
+            initCaptureOpen_ = false;
         }
 #endif
     }
@@ -757,6 +769,13 @@ struct VkBackend::Impl {
     }
 
     void DestroyDevice() {
+#ifdef DGCPAIN_RENDERDOC_ENABLED
+        // 若从未触发过首次 composite（未画任何笔迹），确保未闭合的初始化抓帧在此收尾，避免悬挂。
+        if (rdc && initCaptureOpen_) {
+            rdc->endFrameCapture(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance.get()));
+            initCaptureOpen_ = false;
+        }
+#endif
         if (device == VK_NULL_HANDLE) {
             return;
         }
