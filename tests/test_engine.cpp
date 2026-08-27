@@ -21,7 +21,7 @@ public:
     void resize(int, int) override {}
     void beginFrame() override {}
     void composite(const std::vector<StampData>&) override { ++composites; }
-    void clearCanvas() override {}
+    void clearCanvas(float, float, float, float) override {}
     void present() override {}
     void shutdown() override {}
     void initOffscreen(int, int) override {}

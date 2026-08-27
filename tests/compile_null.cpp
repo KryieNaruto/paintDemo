@@ -23,7 +23,7 @@ int main() {
     backend.resize(0, 0);
     backend.beginFrame();
     backend.composite({});
-    backend.clearCanvas();
+    backend.clearCanvas(1.0f, 1.0f, 1.0f, 1.0f);
     backend.present();
     backend.shutdown();
 

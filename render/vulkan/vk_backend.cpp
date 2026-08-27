@@ -772,16 +772,16 @@ struct VkBackend::Impl {
 #endif
     }
 
-    void ClearCanvasLocked() {
+    void ClearCanvasLocked(float r, float g, float b, float a) {
         if (!canvasReady) {
             return;
         }
         BeginCommands();
         VkClearColorValue clear{};
-        clear.float32[0] = 1.0f;
-        clear.float32[1] = 1.0f;
-        clear.float32[2] = 1.0f;
-        clear.float32[3] = 1.0f;
+        clear.float32[0] = r;
+        clear.float32[1] = g;
+        clear.float32[2] = b;
+        clear.float32[3] = a;
         VkImageSubresourceRange range{};
         range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         range.baseMipLevel = 0;
@@ -898,9 +898,9 @@ void VkBackend::composite(const std::vector<StampData>& stamps) {
     impl_->CompositeLocked(stamps);
 }
 
-void VkBackend::clearCanvas() {
+void VkBackend::clearCanvas(float r, float g, float b, float a) {
     std::lock_guard<std::mutex> lock(mutex_);
-    impl_->ClearCanvasLocked();
+    impl_->ClearCanvasLocked(r, g, b, a);
 }
 
 void VkBackend::present() {

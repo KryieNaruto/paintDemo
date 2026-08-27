@@ -9,7 +9,7 @@ public:
     void resize(int w, int h) override;
     void beginFrame() override;
     void composite(const std::vector<StampData>& stamps) override;
-    void clearCanvas() override;
+    void clearCanvas(float r, float g, float b, float a) override;
     void present() override;
     void shutdown() override;
 

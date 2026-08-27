@@ -62,7 +62,7 @@ int main() {
     {
         VkBackend backend;
         backend.initOffscreen(32, 32);
-        backend.clearCanvas();  // 白底
+        backend.clearCanvas(1.0f, 1.0f, 1.0f, 1.0f);  // 白底
 
         std::vector<StampData> stamps;
         StampData s{};

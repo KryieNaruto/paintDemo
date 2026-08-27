@@ -230,15 +230,11 @@ int dgcRender(DgcContext* ctx) {
 }
 
 int dgcClear(DgcContext* ctx, float r, float g, float b, float a) {
-    (void)r;
-    (void)g;
-    (void)b;
-    (void)a;
     if (ctx == nullptr) {
         g_last_error = DGC_ERR_NULL_CONTEXT;
         return DGC_ERR_NULL_CONTEXT;
     }
-    ctx->impl_->backend->clearCanvas();
+    ctx->impl_->backend->clearCanvas(r, g, b, a);
     g_last_error = DGC_OK;
     return DGC_OK;
 }

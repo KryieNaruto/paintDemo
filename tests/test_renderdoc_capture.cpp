@@ -53,7 +53,7 @@ static std::vector<uint8_t> runSession(bool enableCapture) {
 
     VkBackend backend;
     backend.initOffscreen(kW, kH);
-    backend.clearCanvas();
+    backend.clearCanvas(1.0f, 1.0f, 1.0f, 1.0f);
 
     std::vector<StampData> stamps;
     stamps.push_back(StampData{32.0f, 32.0f, 16.0f, 0.5f, 1.0f});
