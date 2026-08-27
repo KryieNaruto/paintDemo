@@ -25,6 +25,9 @@ option(DGCPAIN_RENDER_BGFX    "Route D: bgfx"                       OFF)
 option(DGCPAIN_BUILD_TESTS    "Build host unit tests"               ON)
 option(DGCPAIN_BUILD_CLI      "Build CLI host (host only)"          ON)
 
+# B5-4：RenderDoc 程序化抓帧（运行时注入，默认关，需 env DGC_RENDERDOC 才生效）。
+option(DGCPAIN_RENDERDOC      "RenderDoc runtime injection (programmatic capture)" ON)
+
 # 所有权/内存安全验证：ASan + LSan（host GCC/Clang 调试构建；Android 下不适用，勿加）。
 option(DGCPAIN_SANITIZE "Enable AddressSanitizer + LeakSanitizer (host debug)" OFF)
 if(DGCPAIN_SANITIZE)
@@ -97,6 +100,9 @@ if(DGCPAIN_KERNEL_GPU AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/kernels/gpu/CMakeLi
 endif()
 if(DGCPAIN_RENDER_VULKAN AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/render/vulkan/CMakeLists.txt)
     add_subdirectory(render/vulkan)
+endif()
+if(DGCPAIN_RENDERDOC AND DGCPAIN_RENDER_VULKAN AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/render/renderdoc/CMakeLists.txt)
+    add_subdirectory(render/renderdoc)
 endif()
 if(DGCPAIN_RENDER_SKIA AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/render/skia/CMakeLists.txt)
     add_subdirectory(render/skia)
