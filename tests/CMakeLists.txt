@@ -90,6 +90,12 @@ if(DGCPAIN_KERNEL_BRUSH AND EXISTS ${CMAKE_SOURCE_DIR}/kernels/brush/CMakeLists.
         target_include_directories(test_midstroke_readback PRIVATE ${CMAKE_SOURCE_DIR})
         target_link_libraries(test_midstroke_readback PRIVATE dgc_paint)
         add_test(NAME test_midstroke_readback COMMAND test_midstroke_readback)
+
+        # bugfix 回归：dgcReadbackPixels 不应阻塞在渲染线程 composite 上（PC 20fps 回退）。
+        add_executable(test_perf_regression test_perf_regression.cpp)
+        target_include_directories(test_perf_regression PRIVATE ${CMAKE_SOURCE_DIR})
+        target_link_libraries(test_perf_regression PRIVATE dgc_paint)
+        add_test(NAME test_perf_regression COMMAND test_perf_regression)
     endif()
 endif()
 
