@@ -77,7 +77,10 @@ DGC_API int dgcBeginStroke(DgcContext* ctx, float x, float y, float pressure, fl
 DGC_API int dgcStrokeTo(DgcContext* ctx, float x, float y, float pressure, float tiltX, float tiltY, int isPredicted);
 DGC_API int dgcEndStroke(DgcContext* ctx);
 
-/* 笔刷管理。myb 加载本期未实现（无 L5），返回 DGC_INVALID_BRUSH + 错误码。 */
+/* 笔刷管理。dgcCreateBrush 自 D6-1 起返回有效发号器句柄（自增，非 0），供
+ * dgcSetBrushSetting/dgcSetBrushColor 校验用；不接线具体笔刷选择/加载，引擎
+ * 渲染仍用固定默认笔刷（不作用于 DGC_SETTING_RADIUS/HARDNESS/OPACITY 等笔刷内核
+ * 参数）。myb 加载 / 笔刷切换 / 销毁本期未实现，返回 DGC_INVALID_BRUSH + 错误码。 */
 DGC_API DgcBrush dgcCreateBrush(DgcContext* ctx, const DgcBrushParams* params);
 DGC_API DgcBrush dgcLoadBrushFromMyb(DgcContext* ctx, const char* mybJson);
 DGC_API int      dgcDestroyBrush(DgcContext* ctx, DgcBrush brush);
@@ -90,13 +93,28 @@ DGC_API int dgcClear(DgcContext* ctx, float r, float g, float b, float a);
 /* 最近一次错误描述（线程局部）：有错误返回静态描述串，无错误返回 NULL。 */
 DGC_API const char* dgcGetLastError(void);
 
-/* 笔刷参数化 settingId 常量（C API 层自定；真实内核语义归 B3-1）。 */
+/* 笔刷参数化 settingId 常量：0-3 为笔刷内核基础参数（真实内核语义归 B3-1，
+ * 当前仅存参、不作用于默认笔刷）；4-12 为 stroke modeler 参数（D6-1 补齐，
+ * 透传到 core/stroke_predictor.h 的 StrokeModelParams，惰性激活——首次设置任一
+ * modeler 项才创建/注入预测器，默认参数下渲染路径与不调用本组 settingId 完全
+ * 一致，零回归）。参数含义/默认值/单位/消费端滑杆建议范围见
+ * docs/brush_settings_mapping.md。 */
 typedef enum {
     DGC_SETTING_RADIUS     = 0, /* 半径 */
     DGC_SETTING_HARDNESS   = 1, /* 硬度 */
     DGC_SETTING_OPACITY    = 2, /* 不透明度 */
     DGC_SETTING_RADIUS_LOG = 3, /* §4.0.6 radius_logarithmic 别名 */
-    DGC_SETTING_COUNT      = 4  /* 非法值校验上界 */
+    /* ── 以下为 stroke modeler 参数（D6-1 补齐，语义归 core/stroke_predictor.h）── */
+    DGC_SETTING_WOBBLE_TIMEOUT_MS                  = 4,  /* 抖动消除超时（ms） */
+    DGC_SETTING_WOBBLE_SPEED_FLOOR                 = 5,  /* 抖动消除最低速度（mm/s） */
+    DGC_SETTING_MIN_OUTPUT_RATE_HZ                 = 6,  /* 最小输出采样率（Hz） */
+    DGC_SETTING_END_OF_STROKE_STOPPING_DISTANCE_MM = 7,  /* 抬笔停止距离（mm） */
+    DGC_SETTING_SPRING_MASS_CONSTANT               = 8,  /* 弹簧质量常量（1/s²） */
+    DGC_SETTING_SPRING_DRAG_CONSTANT               = 9,  /* 弹簧阻尼常量（1/s） */
+    DGC_SETTING_KALMAN_PROCESS_NOISE               = 10, /* 卡尔曼过程噪声 */
+    DGC_SETTING_KALMAN_MEASUREMENT_NOISE           = 11, /* 卡尔曼测量噪声 */
+    DGC_SETTING_PREDICTION_INTERVAL_MS             = 12, /* 预测间隔（ms） */
+    DGC_SETTING_COUNT                              = 13  /* 非法值校验上界 */
 } DgcBrushSetting;
 
 /* ── v3.0：离屏 / 导出 / 像素读回（真实实现归 B2-1，本期 NOT_IMPLEMENTED）── */

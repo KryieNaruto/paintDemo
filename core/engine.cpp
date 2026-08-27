@@ -50,6 +50,8 @@ void Engine::stop() {
 }
 
 void Engine::setPredictor(std::unique_ptr<StrokeModeler> predictor) {
+    // D6-1：与 inputLoop 的读并发，predictor_mutex_ 守卫指针写入（§4.3 点 1）。
+    std::lock_guard<std::mutex> lock(predictor_mutex_);
     predictor_ = std::move(predictor);
 }
 
@@ -125,16 +127,35 @@ void Engine::inputLoop() {
             pending_input_.pop_front();
         }
 
-        if (predictor_) {
+        // D6-1：每事件加锁取一次裸指针快照后立即解锁（predictor 注入后不再替换/
+        // 销毁，故裸指针在引擎生命周期内有效，可在锁外安全调用；StrokeModeler
+        // 自身的线程安全由其内部 mutex 负责，见 stroke_predictor.cpp）。
+        StrokeModeler* pred = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(predictor_mutex_);
+            pred = predictor_.get();
+        }
+        if (pred != nullptr) {
             if (ev.type == StrokeEventType::BeginStroke ||
                 ev.type == StrokeEventType::EndStroke) {
-                predictor_->Reset();
+                pred->Reset();
             } else if (ev.type == StrokeEventType::StrokePoint) {
                 std::vector<StrokePoint> out;
-                predictor_->Update(ev.point, &out);
-                predictor_->Predict(&out);
-                for (const StrokePoint& p : out) {
-                    if (!pushEvent(StrokeEvent{StrokeEventType::StrokePoint, p})) {
+                pred->Update(ev.point, &out);
+                pred->Predict(&out);
+                // D6-1：一次外部 StrokePoint 提交展开成 out.size() 个内部事件，
+                // 破坏了「1 提交 = 1 composited_ 计数」的 1:1 关系（见
+                // StrokeEvent::count_submission 注释）。只把展开出的最后一个
+                // 事件标记为 count_submission=true，其余全为 false：SPSC 单消费者
+                // 严格 FIFO，故它被合成时，本次提交展开出的全部前序事件必已合成。
+                // Update()/Predict() 的管线设计下 out 恒非空（resampler 首点必发、
+                // 稀疏/密集分支均至少落 1 点），故无需处理 out.empty() 的兜底路径；
+                // 若未来管线改动导致可能为空，需在此补发一个 count-only 事件，
+                // 否则 submitted_/composited_ 将永久失配、flush() 卡死。
+                for (std::size_t i = 0; i < out.size(); ++i) {
+                    StrokeEvent oev{StrokeEventType::StrokePoint, out[i],
+                                    /*count_submission=*/(i + 1 == out.size())};
+                    if (!pushEvent(oev)) {
                         return;
                     }
                 }
@@ -166,8 +187,11 @@ void Engine::brushLoop() {
                 break;
             case StrokeEventType::StrokePoint: {
                 std::vector<StampData> stamps = kernel_->strokeTo(brush, ev.point);
+                // count_submission 原样透传（D6-1）：从触发本批的 StrokeEvent 带到
+                // renderLoop，供 composited_ 按「外部提交数」而非「批数」计数。
+                RenderBatch batch_item{std::move(stamps), ev.count_submission};
                 // 有界等待：满则 yield 重试，期间响应 stop_。
-                while (!brush_to_render_.try_push(std::move(stamps))) {
+                while (!brush_to_render_.try_push(std::move(batch_item))) {
                     if (stop_.load(std::memory_order_acquire)) {
                         return;
                     }
@@ -189,23 +213,29 @@ void Engine::renderLoop() {
     // 把多个输入点的 stamp 批攒进 batch，满足任一条件才合批提交一次：
     //   - flush() 已请求（drain 屏障在等合成完成，强制尽快提交）；
     //   - brush_to_render_ 已空（当前输入暂告一段落，避免无限攒批 / 延迟上屏）。
-    // composited_ 按批内 stamp 批数（= 已提交 StrokePoint 数，含空批）递增，屏障追平语义
-    // 不变；空批（未移动的点）也计入，与 submitted_ 一一对应。
-    std::vector<std::vector<StampData>> batch;
+    // composited_ 按批内 count_submission==true 的条目数（D6-1：= 外部 StrokePoint
+    // 提交次数，而非批数本身，见 StrokeEvent::count_submission / RenderBatch 注释）
+    // 递增，屏障追平语义不变；predictor 关闭（passthrough）时 count_submission
+    // 恒为 true，批数即提交数，与改造前行为完全一致（零回归）。
+    std::vector<RenderBatch> batch;
     auto flushBatch = [&]() {
         if (batch.empty()) {
             return;
         }
         std::vector<StampData> flat;
+        std::size_t counted = 0;
         {
             std::size_t total = 0;
             for (const auto& b : batch) {
-                total += b.size();
+                total += b.stamps.size();
+                if (b.count_submission) {
+                    ++counted;
+                }
             }
             flat.reserve(total);
         }
         for (const auto& b : batch) {
-            flat.insert(flat.end(), b.begin(), b.end());
+            flat.insert(flat.end(), b.stamps.begin(), b.stamps.end());
         }
 #ifdef DGCPAIN_PERF
         auto r0 = std::chrono::steady_clock::now();
@@ -218,8 +248,9 @@ void Engine::renderLoop() {
                      std::chrono::duration<double, std::milli>(r1 - r0).count(), flat.size(),
                      batch.size());
 #endif
-        // B5-2：每合批提交一轮后递增 composited_（release，供 flush 屏障 acquire 追平）。
-        composited_.fetch_add(batch.size(), std::memory_order_release);
+        // B5-2/D6-1：每合批提交一轮后按「外部提交计数」递增 composited_
+        // （release，供 flush 屏障 acquire 追平），而非批内条目总数。
+        composited_.fetch_add(counted, std::memory_order_release);
         batch.clear();
     };
 
@@ -227,7 +258,7 @@ void Engine::renderLoop() {
         if (stop_.load(std::memory_order_acquire)) {
             return;
         }
-        std::vector<StampData> stamps;
+        RenderBatch stamps;
         if (brush_to_render_.try_pop(stamps)) {
             batch.push_back(std::move(stamps));
             // flush() 在等合成完成：把已攒批尽早合入一次提交（原子交换顺便清标志，幂等）。
