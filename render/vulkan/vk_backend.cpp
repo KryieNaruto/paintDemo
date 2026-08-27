@@ -386,16 +386,6 @@ struct VkBackend::Impl {
         }
         instance = inst;
 
-#ifdef DGCPAIN_RENDERDOC_ENABLED
-        // B5-4 fix：构造并开启「资源创建 + 首次 composite」合并抓帧。必须在管线/描述符/画布
-        // 创建之前 StartFrameCapture——否则这些对象在抓帧窗口之外创建，RenderDoc 无法解析
-        // dispatch 的管线状态（Pipeline State 各面板全空）。首次 composite 的 EndFrameCapture
-        // 收尾此条完整 capture（见 CompositeLocked）。未启用/加载失败内部降级 no-op。
-        rdc = std::make_unique<RenderDocCapture>();
-        rdc->startFrameCapture(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(inst));
-        initCaptureOpen_ = rdc->available();
-#endif
-
         uint32_t count = 0;
         vkEnumeratePhysicalDevices(instance, &count, nullptr);
         if (count == 0) {
@@ -482,6 +472,18 @@ struct VkBackend::Impl {
         }
         device = dev;
         vkGetDeviceQueue(device, queueFamily, 0, &queue);
+
+#ifdef DGCPAIN_RENDERDOC_ENABLED
+        // B5-4 fix：构造并开启「资源创建 + 首次 composite」合并抓帧。必须在管线/描述符/画布
+        // 创建之前 StartFrameCapture——否则这些对象在抓帧窗口之外创建，RenderDoc 无法解析
+        // dispatch 的管线状态（Pipeline State 各面板全空）。首次 composite 的 EndFrameCapture
+        // 收尾此条完整 capture（见 CompositeLocked）。未启用/加载失败内部降级 no-op。
+        // 注意：必须在 vkCreateDevice 之后调用——RenderDoc 需从 instance 解析出 VkDevice
+        // 上下文，VkDevice 存在之前 StartFrameCapture 会直接崩溃（RenderDoc launch 注入复现）。
+        rdc = std::make_unique<RenderDocCapture>();
+        rdc->startFrameCapture(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(instance.get()));
+        initCaptureOpen_ = rdc->available();
+#endif
 
         VkCommandPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
