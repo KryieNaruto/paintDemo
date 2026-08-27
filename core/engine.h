@@ -76,9 +76,13 @@ private:
     std::condition_variable input_cv_;
 
     // drain 屏障计数（B5-2）：submitted_ 在 submitInput 对 StrokePoint 事件同步递增；
-    // composited_ 由渲染线程每 composite 一轮后 fetch_add；flush 等二者追平。
+    // composited_ 由渲染线程每合批提交后 fetch_add(批内点数)；flush 等二者追平。
     std::atomic<std::size_t> submitted_{0};
     std::atomic<std::size_t> composited_{0};
+
+    // 批量 composite（性能根因一）：flush() 置位，渲染线程据此把已攒批尽早合入一次提交，
+    // 避免「生产者持续投递、队列不空」时屏障等不到 composite 而饿死。
+    std::atomic<bool> flush_requested_{false};
 
     std::atomic<bool> stop_{false};
     std::atomic<bool> running_{false};

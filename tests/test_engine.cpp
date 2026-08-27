@@ -79,8 +79,9 @@ int main() {
     e.stop();
     assert(!e.running());
 
-    // B5-2：flush drain 屏障。NullPaintKernel 每 StrokePoint 仍 push 一个空 stamp 批，
-    // 故每个 StrokePoint → 一次 composite。flush 应阻塞至 composite 轮数追平提交数。
+    // B5-2：flush drain 屏障。批量 composite（性能根因一）下渲染线程把多个输入点的
+    // stamp 批合批提交，composite 调用次数 ≤ 提交点数（可能分散，但不逐点各调一次）。
+    // flush 应阻塞至所有已提交 StrokePoint 合成完毕（composited_ 追平 submitted_）。
     {
         NullPaintKernel  kernel2;
         CountingBackend  backend2;
@@ -100,7 +101,10 @@ int main() {
         assert(e2.submitInput({StrokeEventType::EndStroke, p}));
 
         e2.flush();  // 阻塞至全部 kPoints 个 StrokePoint 合成完毕。
-        assert(backend2.composites.load() == kPoints);
+        // 合批契约：至少一次提交（屏障要求所有工作完成），且不超过点数。
+        const int calls = backend2.composites.load();
+        assert(calls >= 1);
+        assert(calls <= kPoints);
 
         e2.stop();
     }

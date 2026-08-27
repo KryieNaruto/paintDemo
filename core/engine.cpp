@@ -1,5 +1,6 @@
 #include "core/engine.h"
 
+#include <chrono>
 #include <utility>
 
 #include "core/interfaces/i_paint_kernel.h"
@@ -69,6 +70,10 @@ bool Engine::submitInput(const StrokeEvent& ev) {
 
 void Engine::flush() {
     // drain 屏障（B5-2）：把三线程异步时序压成确定性 drain。仅在引擎三线程之外调用。
+    //
+    // 批量 composite：先置位 flush_requested_，渲染线程据此把已攒批尽早合入一次提交，
+    // 保证「生产者持续投递、队列不空」时屏障仍能等来 composite（避免饿死）。
+    flush_requested_.store(true, std::memory_order_release);
     //
     // 1) 等 pending_input_ 排空：短锁检查 + 解锁 + yield 轮询。绝不持 input_mutex_ 自旋，
     //    否则与 inputLoop 抢锁可能死锁（review 反馈 1）。
@@ -178,19 +183,63 @@ void Engine::brushLoop() {
 }
 
 void Engine::renderLoop() {
-    // 渲染线程：取 stamp 批 → composite → present。
+    // 渲染线程：取 stamp 批 → 合批 → composite → present。
+    //
+    // 批量 composite（性能根因一：每输入点一次 SubmitAndWait 的 ~0.73ms/批同步开销）：
+    // 把多个输入点的 stamp 批攒进 batch，满足任一条件才合批提交一次：
+    //   - flush() 已请求（drain 屏障在等合成完成，强制尽快提交）；
+    //   - brush_to_render_ 已空（当前输入暂告一段落，避免无限攒批 / 延迟上屏）。
+    // composited_ 按批内 stamp 批数（= 已提交 StrokePoint 数，含空批）递增，屏障追平语义
+    // 不变；空批（未移动的点）也计入，与 submitted_ 一一对应。
+    std::vector<std::vector<StampData>> batch;
+    auto flushBatch = [&]() {
+        if (batch.empty()) {
+            return;
+        }
+        std::vector<StampData> flat;
+        {
+            std::size_t total = 0;
+            for (const auto& b : batch) {
+                total += b.size();
+            }
+            flat.reserve(total);
+        }
+        for (const auto& b : batch) {
+            flat.insert(flat.end(), b.begin(), b.end());
+        }
+#ifdef DGCPAIN_PERF
+        auto r0 = std::chrono::steady_clock::now();
+#endif
+        backend_->composite(flat);
+        backend_->present();
+#ifdef DGCPAIN_PERF
+        auto r1 = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "[PERF] engine::renderLoop composite=%.3f ms stamps=%zu batches=%zu\n",
+                     std::chrono::duration<double, std::milli>(r1 - r0).count(), flat.size(),
+                     batch.size());
+#endif
+        // B5-2：每合批提交一轮后递增 composited_（release，供 flush 屏障 acquire 追平）。
+        composited_.fetch_add(batch.size(), std::memory_order_release);
+        batch.clear();
+    };
+
     while (true) {
         if (stop_.load(std::memory_order_acquire)) {
             return;
         }
         std::vector<StampData> stamps;
-        if (!brush_to_render_.try_pop(stamps)) {
-            std::this_thread::yield();
+        if (brush_to_render_.try_pop(stamps)) {
+            batch.push_back(std::move(stamps));
+            // flush() 在等合成完成：把已攒批尽早合入一次提交（原子交换顺便清标志，幂等）。
+            if (flush_requested_.exchange(false, std::memory_order_acq_rel)) {
+                flushBatch();
+            }
             continue;
         }
-        backend_->composite(stamps);
-        backend_->present();
-        // B5-2：每 composite 一轮后递增 composited_（release，供 flush 屏障 acquire 追平）。
-        composited_.fetch_add(1, std::memory_order_release);
+        if (!batch.empty()) {
+            flushBatch();  // 队列已空：当前输入暂告一段落，合批提交。
+            continue;
+        }
+        std::this_thread::yield();
     }
 }

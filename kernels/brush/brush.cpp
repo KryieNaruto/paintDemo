@@ -1,8 +1,10 @@
 #include "kernels/brush/brush.h"
 
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <vector>
 
@@ -206,6 +208,9 @@ void Brush::beginStroke(const StrokePoint& p) {
 }
 
 std::vector<StampData> Brush::strokeTo(const StrokePoint& p) {
+#ifdef DGCPAIN_PERF
+    auto st0 = std::chrono::steady_clock::now();
+#endif
     std::vector<StampData> out;
 
     // dtime 单位换算（plan-review 提醒 1）：t_us 为 uint64 微秒，dtime 为秒。
@@ -239,6 +244,11 @@ std::vector<StampData> Brush::strokeTo(const StrokePoint& p) {
     // 推进位置到真实点（速度滤波用整段 dtime；MVP 速度不影响 dab，无精度敏感）。
     impl_->updateStates(p.x, p.y, static_cast<float>(dtime), p);
     impl_->last_t_us = p.t_us;
+#ifdef DGCPAIN_PERF
+    auto st1 = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "[PERF] brush::strokeTo=%.3f ms -> %zu dabs\n",
+                 std::chrono::duration<double, std::milli>(st1 - st0).count(), out.size());
+#endif
     return out;
 }
 
