@@ -27,7 +27,7 @@ int main() {
 
     VkBackend backend;
     backend.initOffscreen(kW, kH);
-    backend.clearCanvas();  // 清成不透明白底
+    backend.clearCanvas(1.0f, 1.0f, 1.0f, 1.0f);  // 清成不透明白底
 
     // 固定 stamp：中心 (32,32)、半径 16、硬度 0.5、不透明度 1.0。
     std::vector<StampData> stamps;

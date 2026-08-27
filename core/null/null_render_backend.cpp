@@ -8,7 +8,7 @@ void NullRenderBackend::beginFrame() {}
 
 void NullRenderBackend::composite(const std::vector<StampData>&) {}
 
-void NullRenderBackend::clearCanvas() {}
+void NullRenderBackend::clearCanvas(float, float, float, float) {}
 
 void NullRenderBackend::present() {}
 

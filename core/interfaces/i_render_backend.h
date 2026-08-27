@@ -12,7 +12,7 @@ public:
     virtual void resize(int w, int h) = 0;
     virtual void beginFrame() = 0;
     virtual void composite(const std::vector<StampData>&) = 0;
-    virtual void clearCanvas() = 0;
+    virtual void clearCanvas(float r, float g, float b, float a) = 0;
     virtual void present() = 0;
     virtual void shutdown() = 0;
 
