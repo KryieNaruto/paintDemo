@@ -54,6 +54,14 @@ if(DGCPAIN_RENDER_VULKAN AND EXISTS ${CMAKE_SOURCE_DIR}/render/vulkan/CMakeLists
     target_include_directories(test_gpu_dab_raster PRIVATE ${CMAKE_SOURCE_DIR})
     target_link_libraries(test_gpu_dab_raster PRIVATE dgc_paint)
     add_test(NAME test_gpu_dab_raster COMMAND test_gpu_dab_raster)
+
+    # B5-4：RenderDoc 程序化抓帧 —— 降级等价 + 所有权循环（无 renderdoc 库环境）。
+    if(DGCPAIN_RENDERDOC)
+        add_executable(test_renderdoc_capture test_renderdoc_capture.cpp)
+        target_include_directories(test_renderdoc_capture PRIVATE ${CMAKE_SOURCE_DIR})
+        target_link_libraries(test_renderdoc_capture PRIVATE dgc_paint)
+        add_test(NAME test_renderdoc_capture COMMAND test_renderdoc_capture)
+    endif()
 endif()
 
 # B3-1：自研 C++ 笔刷内核主链（host 无条件，无 Vulkan 依赖）。
