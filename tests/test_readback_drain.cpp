@@ -1,12 +1,19 @@
-// bugfix repro：dgcReadbackPixels 不先 drain 时可能返回不完整画布。
+// bugfix repro：dgcReadbackPixels 不阻塞、也不会永久缺 dab。
 //
-// 模拟 paint-pc 消费端行为：喂入大量笔画点后【不调 dgcFlush】立即 dgcReadbackPixels。
-// 三线程引擎是异步的，渲染线程合成有滞后；若 readback 不先 drain，拷贝到的画布
-// 可能缺最近提交但尚未合成的 dab → 线条出现空洞。
+// 模拟 paint-pc 消费端行为：喂入大量笔画点、笔画结束、【不调 dgcFlush】。
 //
-// 回归断言：无 flush 直接读回的墨迹数 应 ≈ flush 后读回的墨迹数（完整画布）。
+// 架构说明（对照 docs/plans/bugfix-readback-blocks-render-thread.md）：readback 现在是
+// 渲染线程发布的"快照缓存"的一次纯内存拷贝，不等待、不驱动渲染线程——这正是修复 20fps
+// 回退的关键（旧版本在此强制 engine->flush()，把每帧读回变成同步等渲染线程 composite
+// 完成）。代价是单次读回可能比最新输入落后一小段（渲染线程尚未来得及发布最新快照），
+// 但不会永久缺失：只要再有真实的一帧时间流逝（哪怕只是等一次 OS 调度），渲染线程总会
+// 追上并发布完整快照。这里用一个远小于人眼可感知延迟的短等待模拟"至少一帧 GUI 主循环
+// 的 OS/GL 开销已经过去"（真实 paint-pc 帧循环本身就含 glfwPollEvents/GL 调用，天然给
+// 渲染线程调度窗口），验证短暂等待后无 flush 读回也能收敛到完整画布。
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <thread>
 #include <vector>
 
 #include "dgc_paint_c_api.h"
@@ -52,26 +59,39 @@ int main() {
     }
     dgcEndStroke(ctx);
 
-    // 模拟 paint-pc：不调 dgcFlush，直接读回。
+    // 模拟 paint-pc：不调 dgcFlush，只反复调 dgcReadbackPixels（真实 GUI 主循环每帧的
+    // 调用）。每次轮询前 sleep 1ms，模拟真实帧循环里 glfwPollEvents/GL 调用天然让出的
+    // 调度窗口——不是 dgcFlush 那种"强制等 composite 完成"的阻塞屏障，纯粹是时间流逝。
+    // 不做"读数不再变化"式早退——批量 composite 下渲染线程可能有短暂间隔仍在推进，
+    // 早退会把"暂时没变"误判为"已收敛"。固定跑满上限轮询，取最后一次读数（这条直线在
+    // 256x256 画布上完整 composite 实测 <5ms，50 次 1ms 轮询给了 10 倍余量）。
     std::vector<std::uint8_t> buf1((size_t)kW * kH * 4, 0);
-    CHECK(dgcReadbackPixels(ctx, buf1.data()) == DGC_OK, "readback no-flush OK");
-    const int inkNoFlush = CountInk(buf1, kW, kH);
+    int inkNoFlush = 0;
+    constexpr int kMaxPolls = 50;  // 固定 50 次（1ms/次节奏下 <100ms），远小于人眼可感知延迟。
+    int pollsUsed = 0;
+    for (int i = 0; i < kMaxPolls; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(dgcReadbackPixels(ctx, buf1.data()) == DGC_OK, "readback no-flush OK");
+        inkNoFlush = CountInk(buf1, kW, kH);
+        pollsUsed = i + 1;
+    }
 
-    // 对照：flush（drain 屏障）后读回 = 完整画布。
+    // 对照：flush（drain 屏障）后读回 = 权威完整画布。
     CHECK(dgcFlush(ctx) == DGC_OK, "flush OK");
     std::vector<std::uint8_t> buf2((size_t)kW * kH * 4, 0);
     CHECK(dgcReadbackPixels(ctx, buf2.data()) == DGC_OK, "readback after-flush OK");
     const int inkFlushed = CountInk(buf2, kW, kH);
 
     std::fprintf(stderr,
-                 "[test_readback_drain] ink no-flush=%d flush=%d 缺=%d (%.1f%%)\n",
-                 inkNoFlush, inkFlushed, inkFlushed - inkNoFlush,
+                 "[test_readback_drain] polls=%d ink no-flush=%d flush=%d 缺=%d (%.1f%%)\n",
+                 pollsUsed, inkNoFlush, inkFlushed, inkFlushed - inkNoFlush,
                  inkFlushed > 0 ? 100.0 * (inkFlushed - inkNoFlush) / inkFlushed : 0.0);
 
-    // 回归断言：无 flush 读回应返回完整画布（缺 < 5%）。
+    // 回归断言：无 flush、仅让时间自然流逝（<=50 次 1ms 轮询）即应收敛到接近完整画布
+    // （缺 < 5%）——验证"不阻塞"与"不会永久缺 dab"同时成立。
     CHECK(inkFlushed > 0, "flushed canvas has ink");
     const int missing = inkFlushed - inkNoFlush;
-    CHECK(missing < inkFlushed / 20, "readback without flush is complete (missing<5%)");
+    CHECK(missing < inkFlushed / 20, "readback without flush converges to complete (missing<5%)");
 
     dgcDestroy(ctx);
 

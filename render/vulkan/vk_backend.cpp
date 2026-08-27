@@ -358,6 +358,14 @@ struct VkBackend::Impl {
     VkDeviceSize readbackSize = 0;
     bool readbackCached_ = false;  // 读回 buffer 用 HOST_CACHED 内存 → 读前须 invalidate
 
+    // bugfix（20fps 回退）：readback 快照缓存 —— 渲染线程每次 composite/clear 完成后
+    // "顺手"把画布发布进这里；VkBackend::readback() 只从这里 memcpy，不碰 GPU、不等
+    // 渲染线程。cache_mutex_ 与上面串行化 GPU 提交的 mutex_（VkBackend 成员）分开，
+    // 避免 GUI 线程的读回被渲染线程的 GPU 提交阻塞（见 docs/plans/
+    // bugfix-readback-blocks-render-thread.md）。
+    std::vector<std::uint8_t> cache_;
+    std::mutex cache_mutex_;
+
     bool useDerivatives = false;  // 设备支持 VK_NV_compute_shader_derivatives → fwidth 路径。
     bool deviceReady = false;
     bool canvasReady = false;
@@ -662,6 +670,15 @@ struct VkBackend::Impl {
         vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
 
         canvasReady = true;
+
+        // bugfix（20fps 回退）：cache_ 按画布尺寸预置（图像内容此刻未定义——按 Vulkan
+        // 规范新建 image 内容未初始化，零填充是确定性的安全默认；真实内容由调用方后续
+        // clearCanvas()/composite() 触发 RefreshReadbackCacheLocked() 覆盖，与既有调用
+        // 约定一致：现有全部调用方均先 dgcSetOffscreenSurface 后 dgcClear 才读回）。
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            cache_.assign((size_t)readbackSize, 0);
+        }
     }
 
     void SubmitAndWait() {
@@ -772,6 +789,9 @@ struct VkBackend::Impl {
             initCaptureOpen_ = false;
         }
 #endif
+        // bugfix（20fps 回退）：composite 批提交完成后顺手发布快照，供 readback() 直接
+        // memcpy——放在 RenderDoc capture 窗口结束之后，不把这次内部拷贝计入抓帧。
+        RefreshReadbackCacheLocked();
     }
 
     void ClearCanvasLocked(float r, float g, float b, float a) {
@@ -792,6 +812,9 @@ struct VkBackend::Impl {
         range.layerCount = 1;
         vkCmdClearColorImage(commandBuffer, canvasImage, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
         SubmitAndWait();
+        // 清屏后画布内容立即变化，快照缓存必须同步刷新，否则 readback() 在下一次
+        // composite 之前会一直读到清屏前的旧内容。
+        RefreshReadbackCacheLocked();
     }
 
     void ReadbackLocked(void* rgbaOut) {
@@ -840,6 +863,47 @@ struct VkBackend::Impl {
                      std::chrono::duration<double, std::milli>(t2 - t1).count(), width, height,
                      (double)readbackSize / 1e6);
 #endif
+    }
+
+    // bugfix（20fps 回退）：把画布发布进 readback 快照缓存——复用与 ReadbackLocked 相同的
+    // GPU 拷贝路径，但目标是内部 cache_（配独立 cache_mutex_），不是调用方传入的指针。
+    // 调用方（CompositeLocked/ClearCanvasLocked/initOffscreen）均已持有外层 mutex_（串行
+    // 化 GPU 提交），此处只需保证 cache_ 本身的写入对 VkBackend::readback() 线程安全可见——
+    // cache_mutex_ 临界区仅一次 memcpy，不含任何 GPU 等待，不会把这个等待传导给 GUI 线程。
+    void RefreshReadbackCacheLocked() {
+        if (!canvasReady) {
+            return;
+        }
+        BeginCommands();
+        VkBufferImageCopy region{};
+        region.bufferOffset = 0;
+        region.bufferRowLength = 0;
+        region.bufferImageHeight = 0;
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel = 0;
+        region.imageSubresource.baseArrayLayer = 0;
+        region.imageSubresource.layerCount = 1;
+        region.imageOffset = {0, 0, 0};
+        region.imageExtent = {(uint32_t)width, (uint32_t)height, 1};
+        vkCmdCopyImageToBuffer(commandBuffer, canvasImage, VK_IMAGE_LAYOUT_GENERAL, readbackBuffer,
+                               1, &region);
+        SubmitAndWait();
+        void* data = nullptr;
+        vkMapMemory(device, readbackMemory, 0, readbackSize, 0, &data);
+        if (readbackCached_) {
+            VkMappedMemoryRange range{};
+            range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+            range.memory = readbackMemory.get();
+            range.offset = 0;
+            range.size = readbackSize;
+            vkInvalidateMappedMemoryRanges(device, 1, &range);
+        }
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            cache_.resize((size_t)readbackSize);
+            std::memcpy(cache_.data(), data, (size_t)readbackSize);
+        }
+        vkUnmapMemory(device, readbackMemory);
     }
 
     void DestroyDevice() {
@@ -921,8 +985,17 @@ void VkBackend::initOffscreen(int w, int h) {
 }
 
 void VkBackend::readback(void* rgbaOut) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    impl_->ReadbackLocked(rgbaOut);
+    // bugfix（20fps 回退）：不再取 mutex_、不再触发 GPU 拷贝——直接从渲染线程维护的
+    // 快照缓存 memcpy。彻底与渲染线程的 composite 提交解耦，不会等渲染线程；缓存只在
+    // 完整 composite/clear 批提交完成后才刷新，因此永远是"完整画布"，不会读到半个 dab
+    // （见 RefreshReadbackCacheLocked 与 docs/plans/bugfix-readback-blocks-render-thread.md）。
+    if (rgbaOut == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(impl_->cache_mutex_);
+    if (!impl_->cache_.empty()) {
+        std::memcpy(rgbaOut, impl_->cache_.data(), impl_->cache_.size());
+    }
 }
 
 void VkBackend::exportPNG(const char* path) {

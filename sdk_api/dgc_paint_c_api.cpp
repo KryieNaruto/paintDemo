@@ -358,12 +358,13 @@ int dgcReadbackPixels(DgcContext* ctx, void* rgbaOut) {
         g_last_error = DGC_ERR_NOT_IMPLEMENTED;
         return DGC_ERR_NOT_IMPLEMENTED;
     }
-    // 读回前先 drain：引擎为「输入→笔刷→渲染」三线程异步模型，渲染线程合成 dab
-    // 有滞后；若直接 readback 拷贝画布，会缺最近提交但尚未合成的 dab（线条空洞）。
-    // 与 dgcFlush 同逻辑，保证拷贝到的是已合成全部已提交输入的完整画布。
-    if (ctx->impl_->engine->running()) {
-        ctx->impl_->engine->flush();
-    }
+    // bugfix（20fps 回退）：不再在此 drain——早先版本在此强制 engine->flush()，把 GUI 高频
+    // 调用（每帧一次）变成同步等渲染线程 composite 完成，快速甩笔时直接掉帧到 20fps，
+    // 抵消了渲染线程「批量 composite」优化本该带来的异步解耦（见 docs/plans/
+    // bugfix-readback-blocks-render-thread.md）。正确性改由 VkBackend::readback() 内部的
+    // 快照缓存保证：缓存只在渲染线程完整 composite/clear 一批提交完成后才刷新，因此这里
+    // 永远读到"完整画布"（可能比最新输入落后一批，但不会缺 dab），且是纯内存拷贝，不等
+    // 渲染线程。
     ctx->impl_->backend->readback(rgbaOut);
     g_last_error = DGC_OK;
     return DGC_OK;
