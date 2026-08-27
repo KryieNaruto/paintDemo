@@ -28,6 +28,12 @@ public:
     // 约定：仅引擎空闲 / stroke 前调用（与 brush 线程 strokeTo 并发访问 RNG 有数据竞争，风险 R5）。
     void SetSeed(std::uint64_t seed);
 
+    // 设置笔刷基础色（straight RGBA，0..1；a 为 ABI 兼容保留，本期内核只用 RGB）。
+    // 内部 RGB→HSV 后转发到 Brush::setColor。句柄不存在时 no-op（不崩）。
+    // 约定：仅引擎空闲 / stroke 前调用——颜色由消费端/UI 线程写入，brush 线程 strokeTo
+    // 读同一 Brush 的 ColorH/S/V，跨线程变更（与 SetSeed 同款并发 caveat，风险 R5）。
+    void setBrushColor(BrushHandle brush, float r, float g, float b, float a) override;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

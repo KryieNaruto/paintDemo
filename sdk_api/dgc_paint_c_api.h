@@ -54,6 +54,11 @@ typedef struct {
 
 #define DGC_INVALID_BRUSH ((DgcBrush)0)
 
+/* 引擎固定默认笔刷句柄：Engine::start() 内同步创建的唯一笔刷（BrushKernel
+ * next_handle 从 1 起，确定性地 = 1）。dgcCreateBrush 本期仍 DGC_ERR_NOT_IMPLEMENTED，
+ * 消费端设色/设参数（dgcSetBrushColor / dgcSetBrushSetting）用该宏取默认笔刷句柄。 */
+#define DGC_DEFAULT_BRUSH ((DgcBrush)1)
+
 /* 错误码：int 返回函数 0 = 成功，非 0 = 失败；失败后可再 dgcGetLastError 读描述。 */
 typedef enum {
     DGC_OK                 = 0, /* 成功 */
@@ -83,7 +88,10 @@ DGC_API DgcBrush dgcLoadBrushFromMyb(DgcContext* ctx, const char* mybJson);
 DGC_API int      dgcDestroyBrush(DgcContext* ctx, DgcBrush brush);
 DGC_API int      dgcSetBrush(DgcContext* ctx, DgcBrush brush);
 
-/* 渲染/清屏。 */
+/* 渲染/清屏。
+ * dgcRender 仅驱动 SDK 离屏合成（render/vulkan/vk_backend.h：无 swapchain，
+ * present() no-op），不涉及上屏/垂直同步（vsync）——vsync 归属见 README「垂直同步
+ * （vsync）归属」小节：由消费端 present 模式（如 GLFW glfwSwapInterval）负责。 */
 DGC_API int dgcRender(DgcContext* ctx);
 DGC_API int dgcClear(DgcContext* ctx, float r, float g, float b, float a);
 

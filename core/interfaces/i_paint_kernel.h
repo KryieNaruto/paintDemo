@@ -12,4 +12,9 @@ public:
     virtual void beginStroke(BrushHandle, const StrokePoint&) = 0;
     virtual std::vector<StampData> strokeTo(BrushHandle, const StrokePoint&) = 0;
     virtual void endStroke(BrushHandle) = 0;
+    // 设置笔刷基础色（straight RGBA，0..1）。a 为 ABI 兼容保留，本期内核只用 RGB
+    // （StampData 无 alpha 字段，不透明度走 setBrushSetting(DGC_SETTING_OPACITY)）。
+    // 约定：仅引擎空闲 / stroke 前调用——颜色变更发生在消费端/UI 线程，而 brush 线程
+    // strokeTo 读同一 Brush 的 ColorH/S/V，属跨线程变更（与 SetSeed 同款并发 caveat）。
+    virtual void setBrushColor(BrushHandle, float r, float g, float b, float a) = 0;
 };
