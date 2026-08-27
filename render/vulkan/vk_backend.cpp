@@ -95,6 +95,26 @@ uint32_t FindMemoryType(VkPhysicalDevice phys, uint32_t typeFilter, VkMemoryProp
     return 0;
 }
 
+// 读回 buffer 内存类型选择（优化 4）：优先 HOST_CACHED——Mali 的 HOST_COHERENT
+// 是 uncached（读回 3.1MB memcpy ~8.7ms，每字节从 DRAM 取），cacheable 内存让大块
+// memcpy 走 CPU 缓存快得多，代价是读前需 vkInvalidateMappedMemoryRanges 使设备写入可见。
+// 无 HOST_CACHED 类型则回退调用方原有的 HOST_COHERENT 路径（返回 false，不 invalidate）。
+// 返回 true 表示命中了 HOST_CACHED（ReadbackLocked 读前必须 invalidate）。
+bool FindReadbackCachedType(VkPhysicalDevice phys, uint32_t typeFilter, uint32_t& outIndex) {
+    VkPhysicalDeviceMemoryProperties memProps;
+    vkGetPhysicalDeviceMemoryProperties(phys, &memProps);
+    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+        const VkMemoryType& mt = memProps.memoryTypes[i];
+        if ((typeFilter & (1u << i)) == 0) continue;
+        if ((mt.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) continue;
+        if (mt.propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) {
+            outIndex = i;
+            return true;
+        }
+    }
+    return false;
+}
+
 void CreateImage(VkDevice device, VkPhysicalDevice phys, uint32_t w, uint32_t h, VkFormat format,
                  VkImageUsageFlags usage, VkImageLayout initialLayout,
                  VkImage& image, VkDeviceMemory& memory) {
@@ -167,6 +187,44 @@ void CreateBuffer(VkDevice device, VkPhysicalDevice phys, VkDeviceSize size, VkB
         return;
     }
     vkBindBufferMemory(device, buffer, memory, 0);
+}
+
+// 读回 buffer 专用创建（优化 4）：优先 HOST_CACHED（大块 memcpy 走 CPU 缓存），
+// 无则回退原 HOST_VISIBLE|HOST_COHERENT。outCached=true → 读前必须 invalidate。
+bool CreateReadbackBuffer(VkDevice device, VkPhysicalDevice phys, VkDeviceSize size,
+                          VkBuffer& buffer, VkDeviceMemory& memory, bool& outCached) {
+    VkBufferCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    info.size = size;
+    info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(device, &info, nullptr, &buffer) != VK_SUCCESS) {
+        std::fprintf(stderr, "[VkBackend] vkCreateBuffer(readback) failed\n");
+        return false;
+    }
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(device, buffer, &req);
+    uint32_t idx = 0;
+    bool cached = FindReadbackCachedType(phys, req.memoryTypeBits, idx);
+    if (!cached) {
+        // 设备无 HOST_CACHED 类型 → 回退原 HOST_COHERENT 语义（FindMemoryType 找不到返回 0，
+        // 与原实现一致，分配失败会走下方清理路径）。
+        idx = FindMemoryType(phys, req.memoryTypeBits,
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    }
+    VkMemoryAllocateInfo alloc{};
+    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc.allocationSize = req.size;
+    alloc.memoryTypeIndex = idx;
+    if (vkAllocateMemory(device, &alloc, nullptr, &memory) != VK_SUCCESS) {
+        std::fprintf(stderr, "[VkBackend] vkAllocateMemory(readback) failed\n");
+        vkDestroyBuffer(device, buffer, nullptr);
+        buffer = VK_NULL_HANDLE;
+        return false;
+    }
+    vkBindBufferMemory(device, buffer, memory, 0);
+    outCached = cached;
+    return true;
 }
 
 // ── 最小手写 RAII 守卫（B1-8，不引入 vk::raii）：值语义、禁拷贝、可移动、
@@ -298,6 +356,7 @@ struct VkBackend::Impl {
     VkDeviceHandle<VkBuffer, vkDestroyBuffer> readbackBuffer;
     VkDeviceHandle<VkDeviceMemory, vkFreeMemory> readbackMemory;
     VkDeviceSize readbackSize = 0;
+    bool readbackCached_ = false;  // 读回 buffer 用 HOST_CACHED 内存 → 读前须 invalidate
 
     bool useDerivatives = false;  // 设备支持 VK_NV_compute_shader_derivatives → fwidth 路径。
     bool deviceReady = false;
@@ -523,6 +582,7 @@ struct VkBackend::Impl {
         readbackMemory.reset();
         width = height = 0;
         readbackSize = 0;
+        readbackCached_ = false;
         canvasReady = false;
     }
 
@@ -555,9 +615,11 @@ struct VkBackend::Impl {
         readbackSize = (VkDeviceSize)w * (VkDeviceSize)h * 4;
         VkBuffer rbuf = VK_NULL_HANDLE;
         VkDeviceMemory rmem = VK_NULL_HANDLE;
-        CreateBuffer(device, physicalDevice, readbackSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                     rbuf, rmem);
+        // 优化 4：优先 HOST_CACHED（Mali uncached COHERENT memcpy ~8.7ms → cacheable 快得多），
+        // 无则回退 HOST_COHERENT。readbackCached_=true 时 ReadbackLocked 读前须 invalidate。
+        bool rbCached = false;
+        bool rbOk = CreateReadbackBuffer(device, physicalDevice, readbackSize, rbuf, rmem, rbCached);
+        readbackCached_ = rbOk && rbCached;  // 仅成功创建且命中 HOST_CACHED 才 invalidate
         readbackBuffer.assign(device, rbuf);
         readbackMemory.assign(device, rmem);
         if (rbuf == VK_NULL_HANDLE) {
@@ -756,6 +818,16 @@ struct VkBackend::Impl {
 #endif
         void* data = nullptr;
         vkMapMemory(device, readbackMemory, 0, readbackSize, 0, &data);
+        if (readbackCached_) {
+            // HOST_CACHED：设备写入可能尚未进 CPU 缓存，invalidate 强制丢弃失效缓存行，
+            // 让拷贝结果对 host 可见后再 memcpy（COHERENT 内存上 invalidate 无害，故无需分支）。
+            VkMappedMemoryRange range{};
+            range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+            range.memory = readbackMemory.get();
+            range.offset = 0;
+            range.size = readbackSize;
+            vkInvalidateMappedMemoryRanges(device, 1, &range);
+        }
         std::memcpy(rgbaOut, data, (size_t)readbackSize);
         vkUnmapMemory(device, readbackMemory);
 #ifdef DGCPAIN_PERF
