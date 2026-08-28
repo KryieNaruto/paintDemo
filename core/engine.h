@@ -127,6 +127,14 @@ private:
     //   2) 攒批已超上限（stamp 数或时长阈值，见 engine.cpp 匿名命名空间常量）——
     //      不依赖 1)，兜底"队列理论上永不空、无人置位 flush_requested_"的连续输入场景；
     //   3) brush_to_render_ 已空（当前输入暂告一段落）。
+    //
+    // flush_requested_ 节流（P7-2）：非阻塞置位可能来自远高于 renderLoop 攒批节奏的
+    // 调用频率（如 PC 关 vsync 后 dgcReadbackPixels 的忙循环调用）。renderLoop() 对
+    // 该标志的“响应”频率做了节流（kMinFlushIntervalMs，见 engine.cpp），未达节流
+    // 间隔时不清零该标志（保留请求，不静默丢弃），下一次循环检查间隔已过时会补上；
+    // 节流窗口与既有 kMaxBatchDurationMs 攒批时长上限取同一数值（复用常量），使
+    // 该路径的最大触发频率不超过既有攒批兜底本就承诺的上界，理论上不会比 P7-1
+    // 验收通过时的批量吞吐更差（详见 docs/plans/P7-2.md §1.2）。
     std::atomic<bool> flush_requested_{false};
 
     std::atomic<bool> stop_{false};

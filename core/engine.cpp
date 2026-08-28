@@ -29,6 +29,15 @@ constexpr std::size_t kMaxPendingInput = 1024;
 constexpr std::size_t kMaxBatchStamps = 512;
 constexpr auto kMaxBatchDurationMs = std::chrono::milliseconds(4);
 
+// flush_requested_ 节流窗口（P7-2）。刻意与 kMaxBatchDurationMs 取同一值并直接复用
+// 该常量（不引入独立数字）——理由见 docs/plans/P7-2.md §1.2：既有攒批时长上限已经
+// 在“持续繁忙输入”场景独立保证 ≤kMaxBatchDurationMs 的滞后上界，节流窗口取更小的
+// 值只会让 flush_requested_ 快速路径抢在该上界生效前提前触发、重新压小批大小（P7-1
+// 回归的病理）；取更大的值则在“输入稀疏、overCap 时间检查得不到新 stamp 触发机会”
+// 场景下让读回多等，没有收益。两者相等是唯一能让该路径最大触发频率不超过既有兜底
+// 承诺频率、因而不会打回批量吞吐的取值。
+constexpr auto kMinFlushIntervalMs = kMaxBatchDurationMs;
+
 }  // namespace
 
 Engine::Engine(IPaintKernel* kernel, IRenderBackend* backend)
@@ -240,11 +249,14 @@ void Engine::renderLoop() {
     // 两条 + 新增攒批上限兜底，共三条）：
     //   1) flush_requested_ 已置位——由 flush()（drain 屏障，正在等合成完成）或
     //      requestFlush()（非阻塞 catch-up，见 dgcReadbackPixels/dgcExportPNG）任一
-    //      途径置位，语义仍是「尽快找机会合批」；
+    //      途径置位，语义仍是「尽快找机会合批」；P7-2 起该条件额外受
+    //      kMinFlushIntervalMs 节流（见下），未达节流间隔不响应也不清零标志；
     //   2) 攒批已超上限（本批 stamp 数 ≥ kMaxBatchStamps 或攒批时长 ≥
-    //      kMaxBatchDurationMs）——不依赖条件 1) 是否曾被置位，兜底"连续不间断输入
-    //      下队列理论上永不空、且置位可能被更快输入抢跑清空"的病理场景（P7-1 背景）；
-    //   3) brush_to_render_ 已空（当前输入暂告一段落，见下方 try_pop 失败分支）。
+    //      kMaxBatchDurationMs）——不依赖条件 1) 是否曾被置位，也不受节流影响，兜底
+    //      "连续不间断输入下队列理论上永不空、且置位可能被更快输入抢跑清空"的病理
+    //      场景（P7-1 背景）；
+    //   3) brush_to_render_ 已空（当前输入暂告一段落，见下方 try_pop 失败分支），
+    //      不受节流影响。
     // composited_ 按批内 count_submission==true 的条目数（D6-1：= 外部 StrokePoint
     // 提交次数，而非批数本身，见 StrokeEvent::count_submission / RenderBatch 注释）
     // 递增，屏障追平语义不变；predictor 关闭（passthrough）时 count_submission
@@ -252,6 +264,9 @@ void Engine::renderLoop() {
     std::vector<RenderBatch> batch;
     std::size_t batchStampCount = 0;
     std::chrono::steady_clock::time_point batchStart{};
+    // P7-2：仅渲染线程本地读写（无跨线程访问），不需要原子/锁；初值设为 epoch
+    // 确保 start() 后第一次收到请求即可立即响应，不因初值巧合被节流。
+    auto lastFlushTime = std::chrono::steady_clock::time_point{};
     auto flushBatch = [&]() {
         if (batch.empty()) {
             return;
@@ -300,18 +315,29 @@ void Engine::renderLoop() {
             }
             batchStampCount += stamps.stamps.size();
             batch.push_back(std::move(stamps));
-            // 三条触发条件（P7-1，见上方注释）之 1) 与 2)；原子交换顺便清标志，幂等。
-            const bool requested = flush_requested_.exchange(false, std::memory_order_acq_rel);
+            // 三条触发条件（P7-1，见上方注释）之 1) 与 2)。P7-2：条件 1) 只 peek
+            // 不清零（是否清零取决于本次是否真的触发 flush，见下），并额外受
+            // kMinFlushIntervalMs 节流。
+            const bool haveRequest = flush_requested_.load(std::memory_order_acquire);
+            const auto now = std::chrono::steady_clock::now();
+            const bool intervalOk = (now - lastFlushTime) >= kMinFlushIntervalMs;
             const bool overCap = batchStampCount >= kMaxBatchStamps ||
-                                  (std::chrono::steady_clock::now() - batchStart) >=
-                                      kMaxBatchDurationMs;
-            if (requested || overCap) {
+                                  (now - batchStart) >= kMaxBatchDurationMs;
+            if (overCap || (haveRequest && intervalOk)) {
+                // 仅在“本次确实要 flush”时才消费该请求：overCap 触发时若 haveRequest
+                // 也为真，说明这次 flush 同样满足了那次 catch-up 诉求，一并清零；
+                // 未触发 flush 时绝不清零，保证请求不被静默丢弃（P7-2 硬要求）。
+                if (haveRequest) {
+                    flush_requested_.store(false, std::memory_order_release);
+                }
                 flushBatch();
+                lastFlushTime = std::chrono::steady_clock::now();
             }
             continue;
         }
         if (!batch.empty()) {
-            flushBatch();  // 条件 3)：队列已空，当前输入暂告一段落，合批提交。
+            flushBatch();  // 条件 3)：队列已空，当前输入暂告一段落，合批提交，不受节流影响。
+            lastFlushTime = std::chrono::steady_clock::now();
             continue;
         }
         std::this_thread::yield();
