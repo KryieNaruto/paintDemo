@@ -13,6 +13,22 @@ namespace {
 // 避免生产者快于消费者时无界膨胀。
 constexpr std::size_t kMaxPendingInput = 1024;
 
+// 攒批上限兜底（P7-1）：连续不间断输入下 brush_to_render_ 理论上永不为空，仅靠
+// "队列已空"这一条件永远等不到 flushBatch；flush_requested_ 仅由 GUI 侧
+// dgcReadbackPixels/dgcExportPNG（非阻塞 catch-up）或 dgcFlush（drain）驱动，其调用
+// 节奏与渲染线程攒批节奏彼此独立，存在"置位后被更快输入抢跑填满新一批"的窗口
+// （任务书 P7-1 背景描述的病理）。故补第三条不依赖前两者的无条件触发：
+//
+//   kMaxBatchDurationMs = 4ms：PC 120fps 预算 8.33ms 的约 1/2、Android 60fps 预算
+//   16.67ms 的约 1/4——保证 readback 快照缓存最大滞后远小于任一目标帧时间（不会
+//   在人眼可感知窗口内出现孔洞），同时仍显著大于单次 GPU SubmitAndWait 的 ~0.73ms
+//   开销（批量 composite 优化的根因一），多数正常绘制节奏下仍能攒到多个 stamp 再
+//   提交，不退化回"每点一次提交"。
+//   kMaxBatchStamps = 512：独立硬上限，兜底调度抖动导致时长检查被延迟的极端情况，
+//   远高于 4ms 窗口内正常输入速率下的期望批大小。
+constexpr std::size_t kMaxBatchStamps = 512;
+constexpr auto kMaxBatchDurationMs = std::chrono::milliseconds(4);
+
 }  // namespace
 
 Engine::Engine(IPaintKernel* kernel, IRenderBackend* backend)
@@ -74,12 +90,17 @@ bool Engine::submitInput(const StrokeEvent& ev) {
     return true;
 }
 
+void Engine::requestFlush() noexcept {
+    flush_requested_.store(true, std::memory_order_release);
+}
+
 void Engine::flush() {
     // drain 屏障（B5-2）：把三线程异步时序压成确定性 drain。仅在引擎三线程之外调用。
     //
-    // 批量 composite：先置位 flush_requested_，渲染线程据此把已攒批尽早合入一次提交，
-    // 保证「生产者持续投递、队列不空」时屏障仍能等来 composite（避免饿死）。
-    flush_requested_.store(true, std::memory_order_release);
+    // 批量 composite：先置位 flush_requested_（复用 requestFlush()，避免重复 store），
+    // 渲染线程据此把已攒批尽早合入一次提交，保证「生产者持续投递、队列不空」时屏障
+    // 仍能等来 composite（避免饿死）。
+    requestFlush();
     //
     // 1) 等 pending_input_ 排空：短锁检查 + 解锁 + yield 轮询。绝不持 input_mutex_ 自旋，
     //    否则与 inputLoop 抢锁可能死锁（review 反馈 1）。
@@ -215,14 +236,22 @@ void Engine::renderLoop() {
     // 渲染线程：取 stamp 批 → 合批 → composite → present。
     //
     // 批量 composite（性能根因一：每输入点一次 SubmitAndWait 的 ~0.73ms/批同步开销）：
-    // 把多个输入点的 stamp 批攒进 batch，满足任一条件才合批提交一次：
-    //   - flush() 已请求（drain 屏障在等合成完成，强制尽快提交）；
-    //   - brush_to_render_ 已空（当前输入暂告一段落，避免无限攒批 / 延迟上屏）。
+    // 把多个输入点的 stamp 批攒进 batch，满足以下任一条件才合批提交一次（P7-1：原有
+    // 两条 + 新增攒批上限兜底，共三条）：
+    //   1) flush_requested_ 已置位——由 flush()（drain 屏障，正在等合成完成）或
+    //      requestFlush()（非阻塞 catch-up，见 dgcReadbackPixels/dgcExportPNG）任一
+    //      途径置位，语义仍是「尽快找机会合批」；
+    //   2) 攒批已超上限（本批 stamp 数 ≥ kMaxBatchStamps 或攒批时长 ≥
+    //      kMaxBatchDurationMs）——不依赖条件 1) 是否曾被置位，兜底"连续不间断输入
+    //      下队列理论上永不空、且置位可能被更快输入抢跑清空"的病理场景（P7-1 背景）；
+    //   3) brush_to_render_ 已空（当前输入暂告一段落，见下方 try_pop 失败分支）。
     // composited_ 按批内 count_submission==true 的条目数（D6-1：= 外部 StrokePoint
     // 提交次数，而非批数本身，见 StrokeEvent::count_submission / RenderBatch 注释）
     // 递增，屏障追平语义不变；predictor 关闭（passthrough）时 count_submission
     // 恒为 true，批数即提交数，与改造前行为完全一致（零回归）。
     std::vector<RenderBatch> batch;
+    std::size_t batchStampCount = 0;
+    std::chrono::steady_clock::time_point batchStart{};
     auto flushBatch = [&]() {
         if (batch.empty()) {
             return;
@@ -257,6 +286,7 @@ void Engine::renderLoop() {
         // （release，供 flush 屏障 acquire 追平），而非批内条目总数。
         composited_.fetch_add(counted, std::memory_order_release);
         batch.clear();
+        batchStampCount = 0;  // P7-1：随批一起清零，供下一批重新计攒批上限。
     };
 
     while (true) {
@@ -265,15 +295,23 @@ void Engine::renderLoop() {
         }
         RenderBatch stamps;
         if (brush_to_render_.try_pop(stamps)) {
+            if (batch.empty()) {
+                batchStart = std::chrono::steady_clock::now();
+            }
+            batchStampCount += stamps.stamps.size();
             batch.push_back(std::move(stamps));
-            // flush() 在等合成完成：把已攒批尽早合入一次提交（原子交换顺便清标志，幂等）。
-            if (flush_requested_.exchange(false, std::memory_order_acq_rel)) {
+            // 三条触发条件（P7-1，见上方注释）之 1) 与 2)；原子交换顺便清标志，幂等。
+            const bool requested = flush_requested_.exchange(false, std::memory_order_acq_rel);
+            const bool overCap = batchStampCount >= kMaxBatchStamps ||
+                                  (std::chrono::steady_clock::now() - batchStart) >=
+                                      kMaxBatchDurationMs;
+            if (requested || overCap) {
                 flushBatch();
             }
             continue;
         }
         if (!batch.empty()) {
-            flushBatch();  // 队列已空：当前输入暂告一段落，合批提交。
+            flushBatch();  // 条件 3)：队列已空，当前输入暂告一段落，合批提交。
             continue;
         }
         std::this_thread::yield();
