@@ -34,6 +34,12 @@ public:
     // 读同一 Brush 的 ColorH/S/V，跨线程变更（与 SetSeed 同款并发 caveat，风险 R5）。
     void setBrushColor(BrushHandle brush, float r, float g, float b, float a) override;
 
+    // 设置笔刷基础参数（bugfix）：按句柄查 Brush 并调 Brush::setBase(id, value)，实时生效
+    // 于下一笔 strokeTo。句柄不存在时 no-op（不崩）。约定：仅引擎空闲 / stroke 前调用——
+    // 消费端/UI 线程写入 base_value，brush 线程 strokeTo 读同一值，与 setBrushColor 同款
+    // 跨线程变更 caveat（风险 R5）。
+    void setBrushSetting(BrushHandle brush, brush::SettingId id, float value) override;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

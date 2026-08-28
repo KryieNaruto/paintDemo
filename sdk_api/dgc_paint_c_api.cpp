@@ -1,6 +1,8 @@
 #include "sdk_api/dgc_paint_c_api.h"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <memory>
 #include <unordered_map>
 
@@ -14,6 +16,7 @@
 #ifdef DGCPAIN_HAVE_BRUSH
 #include "kernels/brush/brush_kernel.h"
 #endif
+#include "kernels/brush/brush_settings.h"  // brush::SettingId（bugfix：0-2 落地内核的枚举）
 #include "render/render_backend_factory.h"
 
 // DgcContext 为不透明句柄，内部定义不对外暴露。经典 Pimpl：唯一数据成员是
@@ -52,6 +55,9 @@ struct DgcContext::Impl {
     //   - 惰性激活（plan §4.2）：dgcCreate 不创建/注入 predictor（passthrough，
     //     默认零回归）；首次设置任一 modeler settingId 才 make_unique 创建、
     //     Configure、经 engine->setPredictor 移交所有权。
+    //   - bugfix（Fix A）：predictor 激活后，未 override 时 dgcBeginStroke 给点流注入
+    //     默认时间步（= min_output_rate_hz 的倒数，见 dgcBeginStroke），避免全 0 时间戳
+    //     把 PositionModeler 钉死在首点导致笔画塌缩成点；override/passthrough 路径不变。
     StrokeModelParams model_params;
     StrokeModeler*    predictor_handle_ = nullptr;  // 非拥有裸指针，不释放
     uint64_t          next_brush_handle_ = 1;       // dgcCreateBrush 发号器
@@ -65,6 +71,11 @@ namespace {
 
 // 错误码记录：dgcGetLastError 无 ctx 参数，故用线程局部变量。
 thread_local DgcError g_last_error = DGC_OK;
+
+// clamp 到 [0,1]（bugfix：HARDNESS/OPACITY 走内核 setBase 前归一化，对齐 Brush::Impl::clamp01）。
+float clamp01(float v) {
+    return std::clamp(v, 0.0f, 1.0f);
+}
 
 // D6-1：settingId >= DGC_SETTING_WOBBLE_TIMEOUT_MS 即 stroke modeler 参数
 // （见 sdk_api/dgc_paint_c_api.h 枚举分段注释）；写入 StrokeModelParams 对应字段。
@@ -191,8 +202,23 @@ int dgcBeginStroke(DgcContext* ctx, float x, float y, float pressure, float tilt
     }
     // B1-7：每笔画开始把固定时间步进器归零（仅在 C API 调用线程推进，与引擎三线程
     // 无共享；fixed_time_us/override_time 在此读一次快照）。
+    //
+    // bugfix（Fix A）：predictor 激活且未 dgcSetFixedTime 时，点流不能给全 0 时间戳——
+    // StrokeModeler 的 PositionModeler 里 dt_s>0 恒假 → 跳过弹簧积分、把每个点钉死在
+    // 首点 → 笔画塌缩成点（Bug #3 复现 1）。此时给固定默认步长 kDefaultModelerDtUs =
+    // 1e6 / min_output_rate_hz（如默认 180Hz → 5555µs），使输入节奏与 modeler 重采样
+    // 周期 1:1，避免人为上/下采样失真；固定步长 → 输出仍确定。override_time==true 路径
+    // 与 passthrough（无 predictor）路径完全不变（default_step 恒 0）。
+    double default_step_us = 0.0;
+    if (!ctx->impl_->determinism.override_time && ctx->impl_->predictor_handle_ != nullptr) {
+        const float rate = ctx->impl_->model_params.min_output_rate_hz;
+        if (rate > 0.0f) {
+            default_step_us = 1e6 / rate;
+        }
+    }
     ctx->impl_->time_stepper.beginStroke(ctx->impl_->determinism.fixed_time_us,
-                                         ctx->impl_->determinism.override_time);
+                                         ctx->impl_->determinism.override_time,
+                                         default_step_us);
     g_last_error = DGC_OK;
     return DGC_OK;
 }
@@ -202,7 +228,8 @@ int dgcStrokeTo(DgcContext* ctx, float x, float y, float pressure, float tiltX, 
         g_last_error = DGC_ERR_NULL_CONTEXT;
         return DGC_ERR_NULL_CONTEXT;
     }
-    // B1-7：t_us 由固定时间步进器产出（override 时 n*step，否则 0）。
+    // B1-7：t_us 由固定时间步进器产出（override 时 n*step；predictor 激活非 override 时
+    // n*default_step，见 dgcBeginStroke 的 Fix A 注释；否则 0）。
     StrokePoint p{x, y, pressure, tiltX, tiltY, ctx->impl_->time_stepper.next(), (isPredicted != 0)};
     StrokeEvent ev{StrokeEventType::StrokePoint, p};
     if (!ctx->impl_->engine->submitInput(ev)) {
@@ -450,6 +477,31 @@ int dgcSetBrushSetting(DgcContext* ctx, DgcBrush brush, int settingId, double va
         return DGC_OK;
     }
     ctx->impl_->brush_settings[brush][settingId] = value;
+
+    // bugfix（Bug #1）：0-2 此前只存这张 brush_settings 表（全代码库无读取点，死存储），
+    // 渲染仍用 createBrush(BrushParams{}) 注入的默认参数 → 消费端半径/硬度/不透明度滑杆
+    // 全无效。对齐 setBrushColor 先例直接桥接到内核：经 IPaintKernel::setBrushSetting →
+    // BrushKernel::setBrushSetting → Brush::setBase 落地 base_value，下一笔 strokeTo 即生效。
+    // 句柄不是内核已建笔刷（如 dgcCreateBrush 发号器返回的非 1 句柄）时内核 no-op，与
+    // setBrushColor 行为一致。线程约定与 setBrushColor 相同：消费端在 !strokeActive 时调用。
+    const float v = static_cast<float>(value);
+    switch (settingId) {
+        case DGC_SETTING_RADIUS:  // 0 radius → RadiusLogarithmic = log(max(value, 1e-3))
+            ctx->impl_->kernel->setBrushSetting(brush, brush::SettingId::RadiusLogarithmic,
+                                                std::log(std::max(v, 1e-3f)));
+            break;
+        case DGC_SETTING_HARDNESS:  // 1 hardness → Hardness = clamp01
+            ctx->impl_->kernel->setBrushSetting(brush, brush::SettingId::Hardness, clamp01(v));
+            break;
+        case DGC_SETTING_OPACITY:  // 2 opacity → Opaque = clamp01
+            ctx->impl_->kernel->setBrushSetting(brush, brush::SettingId::Opaque, clamp01(v));
+            break;
+        case DGC_SETTING_RADIUS_LOG:  // 3 radius_log → RadiusLogarithmic = value（直通）
+            ctx->impl_->kernel->setBrushSetting(brush, brush::SettingId::RadiusLogarithmic, v);
+            break;
+        default:
+            break;  // 不可达：调用方已校验 settingId 属于 [0, DGC_SETTING_COUNT)。
+    }
     g_last_error = DGC_OK;
     return DGC_OK;
 }
