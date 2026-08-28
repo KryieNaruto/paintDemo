@@ -370,6 +370,14 @@ struct VkBackend::Impl {
     bool deviceReady = false;
     bool canvasReady = false;
 
+#ifdef DGCPAIN_TEST_HOOKS
+    // Bug3（dab 合成孔洞）回归：CompositeLocked 里实际 dispatch / barrier 的调用计数，
+    // 供 test_composite_barrier_repro 断言「每次 dispatch 后都插了一次 image barrier」。
+    // 仅测试编译（顶层 CMake 选项 DGCPAIN_TEST_HOOKS），生产构建零开销。
+    std::uint64_t dispatchCount_ = 0;
+    std::uint64_t barrierCount_ = 0;
+#endif
+
     void EnsureDevice() {
         if (device != VK_NULL_HANDLE) {
             return;
@@ -774,6 +782,33 @@ struct VkBackend::Impl {
                                sizeof(pc), &pc);
             vkCmdDispatch(commandBuffer, cntX, cntY, 1);
             ++dispatches;
+#ifdef DGCPAIN_TEST_HOOKS
+            ++dispatchCount_;
+#endif
+
+            // 修复"dab 孔洞"：相邻 dab 包围盒/覆盖区域几乎必然重叠（间距 2.5px << 半径 10px），
+            // 下一次 dispatch 的 shader 对同一批像素 imageLoad 必须保证读到这次 dispatch 刚
+            // imageStore 的结果。没有显式 barrier 时，Vulkan 规范不保证同一 command buffer 内
+            // 连续两次 dispatch 对同一张 storage image 重叠区域的读写可见性（未定义行为），
+            // 部分驱动会因乱序/并行调度读到脏值 → 局部覆盖丢失（用户 Windows 真机 RenderDoc
+            // 抓帧截图复现的孔洞）。compute-to-compute 同 stage 的最小化 barrier，只刷新缓存
+            // 级别开销，不牵扯图形管线阶段。
+            VkImageMemoryBarrier barrier{};
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = canvasImage;
+            barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                                 0, nullptr, 0, nullptr, 1, &barrier);
+#ifdef DGCPAIN_TEST_HOOKS
+            ++barrierCount_;
+#endif
         }
         SubmitAndWait();
 #ifdef DGCPAIN_PERF
@@ -1016,3 +1051,16 @@ void VkBackend::exportPNG(const char* path) {
         std::fprintf(stderr, "[VkBackend] stbi_write_png failed for %s\n", path);
     }
 }
+
+#ifdef DGCPAIN_TEST_HOOKS
+// Bug3 回归 hook（仅测试编译）：读 CompositeLocked 的 dispatch/barrier 计数。
+std::uint64_t VkBackend::testDispatchCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return impl_->dispatchCount_;
+}
+
+std::uint64_t VkBackend::testBarrierCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return impl_->barrierCount_;
+}
+#endif

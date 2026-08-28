@@ -55,6 +55,16 @@ if(DGCPAIN_RENDER_VULKAN AND EXISTS ${CMAKE_SOURCE_DIR}/render/vulkan/CMakeLists
     target_link_libraries(test_gpu_dab_raster PRIVATE dgc_paint)
     add_test(NAME test_gpu_dab_raster COMMAND test_gpu_dab_raster)
 
+    # Bug3（dab 合成孔洞）回归：真实 5-dab 数据（RenderDoc 抓帧 a-capture_16.rdc 解出，
+    # 见 test_composite_barrier_repro.cpp 内常量数组）跑 VkBackend::composite()，断言
+    # (a) 覆盖区内 alpha>0（barrier 不破坏覆盖正确性）(b) dispatchCount == barrierCount
+    # （每次 dispatch 后都插了一次同步 barrier）。需 DGCPAIN_TEST_HOOKS 编进库。
+    add_executable(test_composite_barrier_repro test_composite_barrier_repro.cpp)
+    target_include_directories(test_composite_barrier_repro PRIVATE ${CMAKE_SOURCE_DIR})
+    target_link_libraries(test_composite_barrier_repro PRIVATE dgc_paint)
+    target_compile_definitions(test_composite_barrier_repro PRIVATE DGCPAIN_TEST_HOOKS=1)
+    add_test(NAME test_composite_barrier_repro COMMAND test_composite_barrier_repro)
+
     # B5-4：RenderDoc 程序化抓帧 —— 降级等价 + 所有权循环（无 renderdoc 库环境）。
     if(DGCPAIN_RENDERDOC)
         add_executable(test_renderdoc_capture test_renderdoc_capture.cpp)
