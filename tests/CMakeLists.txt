@@ -117,6 +117,30 @@ if(DGCPAIN_KERNEL_BRUSH AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/brush/
         target_include_directories(test_continuous_input_regression PRIVATE ${CMAKE_SOURCE_DIR})
         target_link_libraries(test_continuous_input_regression PRIVATE dgc_paint)
         add_test(NAME test_continuous_input_regression COMMAND test_continuous_input_regression)
+
+        # bugfix：笔刷内核基础参数 0-2 必须真实作用于渲染（红：设 RADIUS=40 无效果）。
+        add_executable(test_brush_setting_applies test_brush_setting_applies.cpp)
+        target_include_directories(test_brush_setting_applies PRIVATE ${CMAKE_SOURCE_DIR})
+        target_link_libraries(test_brush_setting_applies PRIVATE dgc_paint)
+        add_test(NAME test_brush_setting_applies COMMAND test_brush_setting_applies)
+
+        # bugfix：modeler 激活后必须渲染出可用笔画（红：未调 fixedtime 时塌缩成点）。
+        add_executable(test_modeler_stroke_renders test_modeler_stroke_renders.cpp)
+        target_include_directories(test_modeler_stroke_renders PRIVATE ${CMAKE_SOURCE_DIR})
+        target_link_libraries(test_modeler_stroke_renders PRIVATE dgc_paint)
+        add_test(NAME test_modeler_stroke_renders COMMAND test_modeler_stroke_renders)
+
+        # bugfix：modeler 参数必须可观测地改变输出（红：全零时间戳下两参数输出相同）。
+        add_executable(test_modeler_param_changes_output test_modeler_param_changes_output.cpp)
+        target_include_directories(test_modeler_param_changes_output PRIVATE ${CMAKE_SOURCE_DIR})
+        target_link_libraries(test_modeler_param_changes_output PRIVATE dgc_paint)
+        add_test(NAME test_modeler_param_changes_output COMMAND test_modeler_param_changes_output)
+
+        # bugfix：modeler 路径确定性——同输入同参数两次逐字节一致。
+        add_executable(test_modeler_deterministic test_modeler_deterministic.cpp)
+        target_include_directories(test_modeler_deterministic PRIVATE ${CMAKE_SOURCE_DIR})
+        target_link_libraries(test_modeler_deterministic PRIVATE dgc_paint)
+        add_test(NAME test_modeler_deterministic COMMAND test_modeler_deterministic)
     endif()
 endif()
 

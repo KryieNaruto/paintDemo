@@ -160,8 +160,15 @@ struct PositionModeler {
             return target;
         }
         const double dt_s = double(target.t_us - last_t_us_) / 1e6;
-        if (dt_s > 0.0) {
-            double remaining = dt_s;
+        // 防御分支（bugfix Fix B 备选）：dt<=0（全 0/负时间戳，本应被 C API 的 Fix A 消除）
+        // 时按一个固定微步推进弹簧，避免把每个点钉死在首点（修复前笔画塌缩成点的根因），
+        // 防未来再次出现全零时间戳时退化。dt>0 的正常路径（override/fixedtime）不变。
+        double integrate_dt = dt_s;
+        if (integrate_dt <= 0.0) {
+            integrate_dt = kStepS;
+        }
+        {
+            double remaining = integrate_dt;
             while (remaining > 0.0) {
                 const double h = std::min(remaining, kStepS);
                 const double ax = k_ * (double(target.x) - pos_x_) - c_ * vel_x_;
