@@ -127,6 +127,14 @@ typedef enum {
 
 /* ── v3.0：离屏 / 导出 / 像素读回（真实实现归 B2-1，本期 NOT_IMPLEMENTED）── */
 DGC_API int dgcSetOffscreenSurface(DgcContext* ctx, int w, int h);
+
+/* P7-2：dgcExportPNG/dgcReadbackPixels 内部已对渲染线程做非阻塞 catch-up（含节流，
+ * 见 core/engine.cpp kMinFlushIntervalMs），调用方不应在调用本函数前再自行调用
+ * 阻塞版 dgcFlush()——那样会先阻塞等一次完整 drain，再让本函数的非阻塞设计变得没有
+ * 意义，等价于 paint-android 在 P7-2 之前的错误用法（每帧先阻塞 dgcFlush() 再读回，
+ * 见 docs/tasks/detail/PC-Android真机性能瓶颈修复.md 背景）。若确需“精确到最后一笔”
+ * 的完整读回/导出（批处理脚本、CLI、确定性测试的 golden 对比），才应显式调用
+ * dgcFlush()，且应放在对性能不敏感的调用点（不要放进每帧/每次渲染的热路径）。 */
 DGC_API int dgcExportPNG(DgcContext* ctx, const char* path);
 DGC_API int dgcReadbackPixels(DgcContext* ctx, void* rgbaOut);
 
