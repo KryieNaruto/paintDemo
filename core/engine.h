@@ -65,6 +65,12 @@ public:
     // （C API 调用线程）调用；纯等待 + 原子读，无新堆所有权。
     void flush();
 
+    // 非阻塞 catch-up（P7-1）：仅对 flush_requested_ 做一次 release store，立即返回，
+    // 不等待任何队列/composited_ 追平。用于 GUI/调用线程「顺路」催促渲染线程尽快
+    // 找机会合批，不像 flush() 那样阻塞到 drain 完成。可在引擎运行期间任意线程调用，
+    // 无堆分配、无锁、无跨线程等待。
+    void requestFlush() noexcept;
+
     // 默认笔刷句柄（D6-3）：start() 内同步创建，返回前即有效，供 C API
     // dgcSetBrushColor(DGC_DEFAULT_BRUSH, ...) 等无需等待 brushLoop 异步创建
     // （消除设色早于笔刷建成的竞态，风险 R3）。start() 前调用返回值未定义。
@@ -114,8 +120,13 @@ private:
     std::atomic<std::size_t> submitted_{0};
     std::atomic<std::size_t> composited_{0};
 
-    // 批量 composite（性能根因一）：flush() 置位，渲染线程据此把已攒批尽早合入一次提交，
-    // 避免「生产者持续投递、队列不空」时屏障等不到 composite 而饿死。
+    // 批量 composite（性能根因一）：renderLoop() 据此把已攒批尽早合入一次提交，避免
+    // 「生产者持续投递、队列不空」时屏障等不到 composite 而饿死。三条触发条件（P7-1）：
+    //   1) flush_requested_ 被置位——由 flush()（drain 屏障）或 requestFlush()（非阻塞
+    //      catch-up，见 dgcReadbackPixels/dgcExportPNG）任一途径 store(true)；
+    //   2) 攒批已超上限（stamp 数或时长阈值，见 engine.cpp 匿名命名空间常量）——
+    //      不依赖 1)，兜底"队列理论上永不空、无人置位 flush_requested_"的连续输入场景；
+    //   3) brush_to_render_ 已空（当前输入暂告一段落）。
     std::atomic<bool> flush_requested_{false};
 
     std::atomic<bool> stop_{false};

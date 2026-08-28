@@ -334,11 +334,17 @@ int dgcExportPNG(DgcContext* ctx, const char* path) {
         g_last_error = DGC_ERR_NOT_IMPLEMENTED;
         return DGC_ERR_NOT_IMPLEMENTED;
     }
-    // 导出前先 drain：exportPNG 内部即画布读回，引擎三线程异步合成有滞后，
-    // 必须先 flush 等全部已提交输入合成完成，否则导出缺最近 dab（线条空洞）。
-    // 与 dgcFlush 同逻辑；flush 幂等，无未决输入时直接返回。
+    // P7-1（契约变化）：不再阻塞 drain。导出内部走与 dgcReadbackPixels 相同的快照缓存，
+    // 可能比最新输入落后 ≤1 个攒批周期（renderLoop 攒批上限兜底，见 core/engine.cpp，
+    // 上限 kMaxBatchDuration/kMaxBatchStamps）。这里只对 flush_requested_ 做一次非阻塞
+    // catch-up——顺路催促渲染线程尽快把已攒批合入下一次提交，绝不等待（不调用
+    // engine->flush()），故本调用耗时恒等于一次原子 store + 一次纯内存拷贝导出，不随
+    // 渲染线程攒批大小波动。调用方若需要"精确到最后一笔"的完整导出（如批处理
+    // 脚本/CLI/确定性测试的 golden 对比），须显式先调 dgcFlush() 再调本函数——现有
+    // cli/script_runner.cpp、tests/test_c_api_headless.c、tests/test_determinism.cpp
+    // 均已遵循此模式，故此契约变化不破坏任何现有调用方。
     if (ctx->impl_->engine->running()) {
-        ctx->impl_->engine->flush();
+        ctx->impl_->engine->requestFlush();
     }
     ctx->impl_->backend->exportPNG(path);
     g_last_error = DGC_OK;
@@ -365,6 +371,13 @@ int dgcReadbackPixels(DgcContext* ctx, void* rgbaOut) {
     // 快照缓存保证：缓存只在渲染线程完整 composite/clear 一批提交完成后才刷新，因此这里
     // 永远读到"完整画布"（可能比最新输入落后一批，但不会缺 dab），且是纯内存拷贝，不等
     // 渲染线程。
+    // P7-1：非阻塞 catch-up——顺路催促渲染线程尽快把已攒批合入下一次提交，供
+    // VkBackend::cache_ 更快刷新（配合 renderLoop 的攒批上限兜底，缩短连续不间断输入
+    // 场景下的缓存滞后窗口）；绝不等待（不调用 engine->flush()），故本调用耗时恒等于
+    // 一次原子 store + 一次纯内存 memcpy，不随渲染线程攒批大小波动。
+    if (ctx->impl_->engine->running()) {
+        ctx->impl_->engine->requestFlush();
+    }
     ctx->impl_->backend->readback(rgbaOut);
     g_last_error = DGC_OK;
     return DGC_OK;
