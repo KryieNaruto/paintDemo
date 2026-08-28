@@ -35,6 +35,8 @@ description: Use when the user asks to claim and drive DGCPaint SDK tasks from d
 - **等待不轮询**：派 agent 一律**前台阻塞**（不要 `run_in_background`）；要并行就同一条消息发多个 `Agent()` 调用。有未终态 agent 就保持等待，不要 `sleep` 轮询。
 - **IDE clang 诊断是误报口**：host 无 compile_commands.json 时，IDE/clangd 会报 `pp_file_not_found`/`unknown_typename` 等一屏假错，实际 `g++ -I.` / `cmake` 构建是通过的。看到此类诊断别当实现问题追，以实际构建 + ctest 为准；传给 `task-test` 的提示里带上「以实际构建为准」口径。
 - **SDK 工程约束（RAII/Pimpl/零泄漏）**：SDK（dgc_paint 库）内所有权一律 RAII，禁止裸 `new`/`delete` 所有权（一律 `make_unique`/`unique_ptr`）；SDK 对外功能一律经不透明句柄 Pimpl 隐藏实现（C ABI 不暴露任何内部类型）。派给 `task-plan`/`task-execute`/`task-test`/`task-review`/`task-plan-review`/`task-test-review` 的提示都带上此口径；两个评审 agent 的 rubric 里各有对应分项。
+- **真机/硬件实测数据是硬门槛，不是形式豁免**：任务书验收标准里凡出现真机/硬件实测指标（fps、耗时等），`task-test-review` 只有在能明确指出"某个已跑通的自动化测试真实复现了同等负载场景"（同等调用频率、同等调用方用法，不是量级近似）时，才可以把真机数据缺失当"沙箱局限"豁免、打 `SCORE=100`；否则一律视为未达标不通过，不能仅凭"有先例"或"计划阶段已如实标注"就放行。派给 `task-test`/`task-test-review` 的提示要带上这条口径。（教训：P7-1 曾以「沙箱局限、有 D6-3/U2-real-paint 先例」豁免真机记录缺失并打 100 分通过合并，事后真机实测 Windows 70fps/Android 7fps 均未达标，问题被隐藏到合并之后才由人工发现——host ctest 的负载模式其实和真实消费者用法差异很大。）
+- **新方案若与既有优化/设计冲突，必须停下报人，门禁通过不算数**：派 `task-plan`/`task-plan-review` 时要求其对照项目 memory 与既有任务书里记录的性能优化/架构决策，核查新方案是否会打回、绕开或削弱它们（例如新方案让某个此前靠"批量/攒批"才达标的路径变成逐条处理）。一旦识别到这种冲突，不能让评分门禁"通过"就当默认接受这个取舍——`task-plan-review` 要在 `FEEDBACK=` 里明确点出冲突，主会话看到后必须停下把冲突和取舍报告人工定夺，不能直接派下一阶段。（教训：P7-1 的非阻塞 `requestFlush()` 方案在高频 readback 场景下会让渲染线程逐 stamp flush，直接打回此前"批量 composite"优化的收益，计划评审没识别为冲突就通过了。）
 - **`RESULT=need-human` / `stuck` 停下报给人**：撞到「≥2 个站得住脚的选项」或「无技术路径」时，停下把问题与选项报给人，不自己挑一个继续。
 - **收尾后停下等人工，不自动申领**：`task-finish` 报回终态后，汇报并停下等人工审核。只有人工明确说「继续/推进」才回第 1 步看 `available` 并申领。别拿「还有可领任务」当继续的理由——可领 ≠ 该领。
 
