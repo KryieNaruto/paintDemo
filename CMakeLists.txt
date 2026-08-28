@@ -28,6 +28,11 @@ option(DGCPAIN_BUILD_CLI      "Build CLI host (host only)"          ON)
 # B5-4：RenderDoc 程序化抓帧（运行时注入，默认关，需 env DGC_RENDERDOC 才生效）。
 option(DGCPAIN_RENDERDOC      "RenderDoc runtime injection (programmatic capture)" ON)
 
+# Bug3（dab 合成孔洞）回归：把 VkBackend::CompositeLocked 的 dispatch/barrier 计数 hook
+# 编进库，供 tests/test_composite_barrier_repro 断言「每次 dispatch 后都插了一次 barrier」。
+# 仅测试构建开启（默认 OFF）；生产/发布构建保持 0 开销、不暴露测试专用符号。
+option(DGCPAIN_TEST_HOOKS     "Compile VkBackend composite dispatch/barrier counters (test only)" OFF)
+
 # 所有权/内存安全验证：ASan + LSan（host GCC/Clang 调试构建；Android 下不适用，勿加）。
 option(DGCPAIN_SANITIZE "Enable AddressSanitizer + LeakSanitizer (host debug)" OFF)
 if(DGCPAIN_SANITIZE)
@@ -85,6 +90,9 @@ target_include_directories(dgc_paint
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/sdk_api   # 唯一对外 include（B1-4 才放头）
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}           # 让 #include "core/..." 生效
 )
+if(DGCPAIN_TEST_HOOKS)
+    target_compile_definitions(dgc_paint PRIVATE DGCPAIN_TEST_HOOKS=1)
+endif()
 
 # ── 路线分发：E0-3 各子目录尚不存在，`if(EXISTS ...)` 守卫生效为空操作；
 #    Null 桩已在库目标内无条件编译，作为当前默认 L4/L5。B2-1/B3-1 落地后：
