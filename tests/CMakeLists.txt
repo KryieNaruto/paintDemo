@@ -96,6 +96,12 @@ if(DGCPAIN_KERNEL_BRUSH AND EXISTS ${CMAKE_SOURCE_DIR}/kernels/brush/CMakeLists.
         target_include_directories(test_perf_regression PRIVATE ${CMAKE_SOURCE_DIR})
         target_link_libraries(test_perf_regression PRIVATE dgc_paint)
         add_test(NAME test_perf_regression COMMAND test_perf_regression)
+
+        # P7-1：真正连续不间断输入下的孔洞修复 + GUI 侧读回无阻塞尖峰回归测试。
+        add_executable(test_continuous_input_regression test_continuous_input_regression.cpp)
+        target_include_directories(test_continuous_input_regression PRIVATE ${CMAKE_SOURCE_DIR})
+        target_link_libraries(test_continuous_input_regression PRIVATE dgc_paint)
+        add_test(NAME test_continuous_input_regression COMMAND test_continuous_input_regression)
     endif()
 endif()
 
