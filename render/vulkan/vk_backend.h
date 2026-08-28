@@ -3,6 +3,10 @@
 #include <memory>
 #include <mutex>
 
+#ifdef DGCPAIN_TEST_HOOKS
+#include <cstdint>
+#endif
+
 #include "core/interfaces/i_render_backend.h"
 
 // VkBackend：真实 Vulkan 渲染后端（B2-1）。
@@ -41,8 +45,17 @@ public:
     void readback(void* rgbaOut) override;
     void exportPNG(const char* path) override;
 
+#ifdef DGCPAIN_TEST_HOOKS
+    // Bug3（dab 合成孔洞）回归（仅测试编译可见）：CompositeLocked 里 dispatch/barrier 的
+    // 实际调用计数，供 test_composite_barrier_repro 断言「每次 dispatch 后都跟了一次 barrier」。
+    // 生产构建（未定义 DGCPAIN_TEST_HOOKS）看不到这两个方法，也零开销。
+    std::uint64_t testDispatchCount() const;
+    std::uint64_t testBarrierCount() const;
+#endif
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
-    std::mutex mutex_;  // 串行化 GPU 提交 / 读回（render 线程 vs C API 线程）。
+    // mutable：testDispatchCount/testBarrierCount 两个 const 测试 hook 需要加锁读计数。
+    mutable std::mutex mutex_;  // 串行化 GPU 提交 / 读回（render 线程 vs C API 线程）。
 };
