@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -370,12 +371,27 @@ struct VkBackend::Impl {
     bool deviceReady = false;
     bool canvasReady = false;
 
+    // Bug #3（快照刷新节流）：消费者请求快照刷新的非阻塞标志。requestSnapshotRefresh()
+    // 只 store(true)，不碰 GPU；CompositeLocked 末尾 exchange(false) 消费——已置位才实际
+    // 执行 RefreshReadbackCacheLocked()。跨线程安全（engine 渲染线程 vs C API 调用线程），
+    // 不参与 GPU 提交串行化（不占用 mutex_ 语义：store/exchange 均无锁）。
+    std::atomic<bool> snapshotRefreshRequested_{false};
+
 #ifdef DGCPAIN_TEST_HOOKS
     // Bug3（dab 合成孔洞）回归：CompositeLocked 里实际 dispatch / barrier 的调用计数，
     // 供 test_composite_barrier_repro 断言「每次 dispatch 后都插了一次 image barrier」。
     // 仅测试编译（顶层 CMake 选项 DGCPAIN_TEST_HOOKS），生产构建零开销。
     std::uint64_t dispatchCount_ = 0;
     std::uint64_t barrierCount_ = 0;
+
+    // Bug #3（快照刷新节流）回归计数：
+    //   compositeCount_      = 每次非空 composite 批提交 +1（CompositeLocked 通过空检查后）。
+    //   snapshotRefreshCount_= 每次实际全画布 GPU→CPU 快照拷贝（RefreshReadbackCacheLocked）
+    //                          +1，含 CompositeLocked 末尾与 ClearCanvasLocked 的刷新。
+    // 修复前（红）：每次 composite 都无条件刷新 → snapshotRefreshCount ≈ compositeCount。
+    // 修复后（绿）：仅在消费者请求/结算时才刷新 → snapshotRefreshCount ≪ compositeCount。
+    std::uint64_t snapshotRefreshCount_ = 0;
+    std::uint64_t compositeCount_ = 0;
 #endif
 
     void EnsureDevice() {
@@ -721,6 +737,9 @@ struct VkBackend::Impl {
         if (stamps.empty()) {
             return;
         }
+#ifdef DGCPAIN_TEST_HOOKS
+        ++compositeCount_;  // 通过空检查 = 一次实际 composite 批提交（test hook，仅测试构建）。
+#endif
         // B5-4：RenderDoc 程序化抓帧 —— Start/End 包住整段 composite commandBuffer
         // （bind pipeline/descriptor/push constants/vkCmdDispatch + 提交完成），与 dispatch
         // 同线程（render 线程）且被 mutex_ 串行。Vulkan 的 RenderDoc device pointer 是
@@ -826,7 +845,19 @@ struct VkBackend::Impl {
 #endif
         // bugfix（20fps 回退）：composite 批提交完成后顺手发布快照，供 readback() 直接
         // memcpy——放在 RenderDoc capture 窗口结束之后，不把这次内部拷贝计入抓帧。
-        RefreshReadbackCacheLocked();
+        //
+        // Bug #3（快照刷新节流）：不再**无条件**刷新——连续绘制时渲染线程每 ≤4ms
+        // （kMaxBatchDurationMs overCap）composite 一次，若每次都付全画布 GPU→CPU 拷贝
+        // （Mali 上数 ms），弱 GPU 被打饱和 → Android 60→30 掉帧（PC 桌面 GPU 拷贝 ~1ms
+        // 不掉帧，解释「PC 没这个问题」）。改为：仅当消费者请求过（requestSnapshotRefresh()
+        // 置位，见 engine.cpp 的 requestFlush/flush/renderLoop 排空联动）才在此刷新；
+        // overCap 自动合批的 composite 不再付拷贝。exchange 原子清位，一次请求结算一次
+        // 刷新（同批多次请求折叠为一次，语义不变）。确定性不变：内容仍由渲染线程在完整
+        // 批提交后发布 → 读回永远读到「完整画布」（≤1 批滞后）；drain 请求强制刷新 →
+        // 精确像素路径不变。
+        if (snapshotRefreshRequested_.exchange(false, std::memory_order_acq_rel)) {
+            RefreshReadbackCacheLocked();
+        }
     }
 
     void ClearCanvasLocked(float r, float g, float b, float a) {
@@ -909,6 +940,9 @@ struct VkBackend::Impl {
         if (!canvasReady) {
             return;
         }
+#ifdef DGCPAIN_TEST_HOOKS
+        ++snapshotRefreshCount_;  // 每次实际快照拷贝 +1（test hook，仅测试构建）。
+#endif
         BeginCommands();
         VkBufferImageCopy region{};
         region.bufferOffset = 0;
@@ -1008,6 +1042,25 @@ void VkBackend::present() {
     // 离屏模式 no-op（§4.0.5）。
 }
 
+void VkBackend::requestSnapshotRefresh() {
+    // Bug #3（快照刷新节流）：非阻塞置位——只 store 一个原子标志，不碰 GPU、不等渲染线程。
+    // 标志由 CompositeLocked 末尾 exchange(false) 消费（详见该处注释）；若消费时已置位才
+    // 实际执行全画布 GPU→CPU 快照拷贝。连续绘制中 overCap 自动合批的 composite 不再付
+    // 拷贝（Mali 弱 GPU 饱和 → 60→30 掉帧的根因）。
+    impl_->snapshotRefreshRequested_.store(true, std::memory_order_release);
+}
+
+void VkBackend::flushReadbackCache() {
+    // Bug #3（快照刷新节流）drain 收尾：同步执行一次全画布快照拷贝（加 mutex_ 串行化 GPU
+    // 提交，与 composite/clear 同锁）。仅由阻塞的 dgcFlush（Engine::flush）在排空后调用——
+    // 此刻渲染线程已排空（composited_==submitted_），mutex_ 空闲，无锁竞争；该路径本就
+    // 阻塞、非每帧，追加一次 GPU 等待与既有 drain 语义一致。保证「最后一次 composite 之后
+    // 的输入尾部」也被捕获进快照缓存（requestFlush 的原子标志只会被 drain 首个 post-request
+    // composite 消费，无法覆盖尾部多批）。
+    std::lock_guard<std::mutex> lock(mutex_);
+    impl_->RefreshReadbackCacheLocked();
+}
+
 void VkBackend::shutdown() {
     std::lock_guard<std::mutex> lock(mutex_);
     impl_->DestroyDevice();
@@ -1062,5 +1115,16 @@ std::uint64_t VkBackend::testDispatchCount() const {
 std::uint64_t VkBackend::testBarrierCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return impl_->barrierCount_;
+}
+
+// Bug #3 回归 hook（仅测试编译）：读快照刷新 / composite 批提交计数。
+std::uint64_t VkBackend::testSnapshotRefreshCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return impl_->snapshotRefreshCount_;
+}
+
+std::uint64_t VkBackend::testCompositeCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return impl_->compositeCount_;
 }
 #endif

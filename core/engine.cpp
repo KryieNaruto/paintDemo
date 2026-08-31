@@ -92,6 +92,11 @@ bool Engine::submitInput(const StrokeEvent& ev) {
 
 void Engine::requestFlush() noexcept {
     flush_requested_.store(true, std::memory_order_release);
+    // Bug #3（快照刷新节流）：消费端要新鲜快照（dgcReadbackPixels/dgcExportPNG 的非阻塞
+    // catch-up，以及 flush() 的 drain 屏障经此联动）——同时请求后端在下次 composite 批提交
+    // 末尾实际刷新 readback 快照缓存（后端默认空实现 no-op；VkBackend 置位非阻塞原子标志）。
+    // 保证「读回 ≈ 输入结算」语义不变：drain 请求强制刷新 → 精确像素路径与既有契约一致。
+    backend_->requestSnapshotRefresh();
 }
 
 void Engine::flush() {
@@ -122,6 +127,14 @@ void Engine::flush() {
            submitted_.load(std::memory_order_acquire)) {
         std::this_thread::yield();
     }
+    // Bug #3（快照刷新节流）收尾强制刷新：drain 排空后由调用线程（C API 线程，非渲染线程）
+    // 直接执行一次全画布快照拷贝，把"最后一次 composite 之后的输入尾部"也捕获进 readback
+    // 快照缓存——requestFlush 的 requestSnapshotRefresh 标志只会被 drain 的**首个**
+    // post-request composite 消费，无法覆盖尾部多批。dgcFlush 本就是阻塞 drain 屏障（等待
+    // composited_ 追平），此处追加一次 GPU 拷贝的阻塞与既有语义一致（非每帧路径，无 20fps
+    // 回退风险）。渲染线程此刻已排空（composited_==submitted_），后端 mutex_ 空闲，无锁竞争。
+    // 后端默认空实现（Null 桩）no-op；VkBackend 覆写为加锁执行 RefreshReadbackCacheLocked。
+    backend_->flushReadbackCache();
 }
 
 void Engine::inputLoop() {
@@ -311,6 +324,15 @@ void Engine::renderLoop() {
             continue;
         }
         if (!batch.empty()) {
+            // Bug #3（快照刷新节流）：队列排空分支只合批提交，**不**在此请求快照刷新。
+            // 快照刷新仅由消费者请求驱动（requestFlush → requestSnapshotRefresh）与
+            // dgcFlush 的收尾强制刷新（flushReadbackCache）——见 Engine::flush()。若在
+            // 此也请求刷新，连续输入中渲染线程每次追上输入（时刻不定）都触发一次全画布
+            // 快照拷贝，刷新次数变成时序相关（曾致回归测试 flaky：refresh 在 4~23 间
+            // 抖动）。移除后刷新频率 = clear + 消费者请求次数 + drain 收尾，确定性可断言。
+            // 正确性：dgcFlush（drain）在排空后强制刷新快照（flushReadbackCache），
+            // 精确像素路径不受影响；读回路径经 requestFlush 请求由下一次 composite 消费
+            // （≤1 批滞后，语义不变）。
             flushBatch();  // 条件 3)：队列已空，当前输入暂告一段落，合批提交。
             continue;
         }
