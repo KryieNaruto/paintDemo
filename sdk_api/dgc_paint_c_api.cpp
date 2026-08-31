@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <memory>
 #include <unordered_map>
 
@@ -18,6 +19,9 @@
 #endif
 #include "kernels/brush/brush_settings.h"  // brush::SettingId（bugfix：0-2 落地内核的枚举）
 #include "render/render_backend_factory.h"
+#if defined(DGCPAIN_TEST_HOOKS) && defined(DGCPAIN_HAVE_VULKAN)
+#include "render/vulkan/vk_backend.h"  // 仅测试编译：dgcTestSnapshotRefreshCount/CompositeCount dynamic_cast 用。
+#endif
 
 // DgcContext 为不透明句柄，内部定义不对外暴露。经典 Pimpl：唯一数据成员是
 // std::unique_ptr<Impl>，Impl 定义留在本 cpp 内。kernel/backend 用 unique_ptr 持有，
@@ -550,5 +554,27 @@ int dgcFlush(DgcContext* ctx) {
     g_last_error = DGC_OK;
     return DGC_OK;
 }
+
+#if defined(DGCPAIN_TEST_HOOKS) && defined(DGCPAIN_HAVE_VULKAN)
+// Bug #3（快照刷新节流）回归 hook（仅测试编译，生产构建零开销、不暴露符号）：
+// 读 VkBackend 的快照刷新 / composite 批提交计数。dynamic_cast 对齐既有
+// dgcSetRandomSeed 里 BrushKernel 的 dynamic_cast 模式（425-427 行）；非 VkBackend
+// 后端（Null 桩等）返回 0。
+std::uint64_t dgcTestSnapshotRefreshCount(DgcContext* ctx) {
+    if (ctx == nullptr || !ctx->impl_) {
+        return 0;
+    }
+    auto* vk = dynamic_cast<VkBackend*>(ctx->impl_->backend.get());
+    return vk ? vk->testSnapshotRefreshCount() : 0;
+}
+
+std::uint64_t dgcTestCompositeCount(DgcContext* ctx) {
+    if (ctx == nullptr || !ctx->impl_) {
+        return 0;
+    }
+    auto* vk = dynamic_cast<VkBackend*>(ctx->impl_->backend.get());
+    return vk ? vk->testCompositeCount() : 0;
+}
+#endif
 
 }  // extern "C"

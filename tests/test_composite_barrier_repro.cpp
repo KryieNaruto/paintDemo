@@ -97,6 +97,9 @@ int main() {
         backend.initOffscreen(kW, kH);
 
         backend.clearCanvas(0.0f, 0.0f, 0.0f, 0.0f);  // 透明底
+        // Bug #3 节流：composite 不再无条件刷新快照缓存，直连后端测试要在 composite 后
+        // readback 取最新内容，须先 requestSnapshotRefresh()。
+        backend.requestSnapshotRefresh();
         backend.composite(stamps);
         std::vector<std::uint8_t> rgba((size_t)kW * kH * 4, 0);
         backend.readback(rgba.data());

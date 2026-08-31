@@ -68,6 +68,15 @@ if(DGCPAIN_RENDER_VULKAN AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../render/vulkan
         target_link_libraries(test_composite_barrier_repro PRIVATE dgc_paint)
         target_compile_definitions(test_composite_barrier_repro PRIVATE DGCPAIN_TEST_HOOKS=1)
         add_test(NAME test_composite_barrier_repro COMMAND test_composite_barrier_repro)
+
+        # Bug #3（快照刷新节流）回归：依赖 DGCPAIN_TEST_HOOKS 编进库的 VkBackend 快照刷新/
+        # composite 批计数 hook（dgcTestSnapshotRefreshCount/dgcTestCompositeCount），
+        # 随 option 一起注册（默认 OFF 不注册，与顶层 option 对齐）。
+        add_executable(test_snapshot_refresh_throttle test_snapshot_refresh_throttle.cpp)
+        target_include_directories(test_snapshot_refresh_throttle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+        target_link_libraries(test_snapshot_refresh_throttle PRIVATE dgc_paint)
+        target_compile_definitions(test_snapshot_refresh_throttle PRIVATE DGCPAIN_TEST_HOOKS=1)
+        add_test(NAME test_snapshot_refresh_throttle COMMAND test_snapshot_refresh_throttle)
     endif()
 
     # B5-4：RenderDoc 程序化抓帧 —— 降级等价 + 所有权循环（无 renderdoc 库环境）。

@@ -41,6 +41,9 @@ int DiffOneDab(const StampData& s) {
     VkBackend backend;
     backend.initOffscreen(kW, kH);
     backend.clearCanvas(1.0f, 1.0f, 1.0f, 1.0f);  // 不透明白底
+    // Bug #3 节流：composite 不再无条件刷新快照缓存，直连后端测试要在 composite 后 readback
+    // 取最新内容，须先 requestSnapshotRefresh()。
+    backend.requestSnapshotRefresh();
     backend.composite({s});
     std::vector<std::uint8_t> gpu((size_t)kW * kH * 4, 0);
     backend.readback(gpu.data());
@@ -87,6 +90,7 @@ int main() {
         VkBackend backend;
         backend.initOffscreen(kW, kH);
         backend.clearCanvas(1.0f, 1.0f, 1.0f, 1.0f);
+        backend.requestSnapshotRefresh();  // Bug #3 节流：composite 后 readback 需新鲜快照
         backend.composite({s});
         std::vector<std::uint8_t> gpu((size_t)kW * kH * 4, 0);
         backend.readback(gpu.data());
@@ -108,6 +112,7 @@ int main() {
         VkBackend backend;
         backend.initOffscreen(kW, kH);
         backend.clearCanvas(1.0f, 1.0f, 1.0f, 1.0f);
+        backend.requestSnapshotRefresh();  // Bug #3 节流：composite 后 readback 需新鲜快照
         backend.composite({s});
         std::vector<std::uint8_t> gpu((size_t)kW * kH * 4, 0);
         backend.readback(gpu.data());
@@ -131,6 +136,7 @@ int main() {
         backend.initOffscreen(kW, kH);
         backend.clearCanvas(1.0f, 1.0f, 1.0f, 1.0f);
         StampData s{32.0f, 32.0f, 10.0f, 0.5f, 1.0f, 0.2f, 0.4f, 0.6f, 0.1f};
+        backend.requestSnapshotRefresh();  // Bug #3 节流：composite 后 readback 需新鲜快照
         backend.composite({s});
         std::vector<std::uint8_t> buf((size_t)kW * kH * 4, 0);
         backend.readback(buf.data());
