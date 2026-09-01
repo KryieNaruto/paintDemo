@@ -90,3 +90,15 @@ void BrushKernel::setBrushColor(BrushHandle handle, float r, float g, float b, f
     brush::rgb_to_hsv_float(r, g, b, &h, &s, &v);
     brush->setColor(h, s, v);
 }
+
+void BrushKernel::setBrushSetting(BrushHandle handle, brush::SettingId id, float value) {
+    impl_->mutex.lock();
+    auto it = impl_->brushes.find(handle);
+    if (it == impl_->brushes.end()) {
+        impl_->mutex.unlock();
+        return;
+    }
+    Brush* brush = it->second.get();
+    impl_->mutex.unlock();
+    brush->setBase(id, value);
+}

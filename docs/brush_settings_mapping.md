@@ -3,17 +3,21 @@
 > 对应 `sdk_api/dgc_paint_c_api.h` 的 `DgcBrushSetting` 枚举与 `dgcSetBrushSetting(ctx, brush, settingId, value)`。
 > 默认值字面量来自 `core/stroke_predictor.h` 的 `StrokeModelParams`（settingId 4-12）。
 
-## 笔刷内核基础参数（settingId 0-3，B3-1 语义，本任务不改）
+## 笔刷内核基础参数（settingId 0-3，B3-1 语义，bugfix 起实时生效）
 
 | settingId | 名称 | 含义 | 默认值 | 单位 | 消费端滑杆建议范围 |
 |---|---|---|---|---|---|
-| 0 | `DGC_SETTING_RADIUS` | 半径 | — | px | 1 – 100 |
-| 1 | `DGC_SETTING_HARDNESS` | 硬度 | — | 0-1 | 0.0 – 1.0 |
-| 2 | `DGC_SETTING_OPACITY` | 不透明度 | — | 0-1 | 0.0 – 1.0 |
+| 0 | `DGC_SETTING_RADIUS` | 半径 | 10 | px | 1 – 100 |
+| 1 | `DGC_SETTING_HARDNESS` | 硬度 | 0.7 | 0-1 | 0.0 – 1.0 |
+| 2 | `DGC_SETTING_OPACITY` | 不透明度 | 1.0 | 0-1 | 0.0 – 1.0 |
 | 3 | `DGC_SETTING_RADIUS_LOG` | 半径（对数刻度别名） | — | px（log） | 1 – 100 |
 
-> 注：0-3 目前仅存参（`Impl::brush_settings`），不作用于默认笔刷渲染（见任务书 D6-1 范围说明），
-> 调试面板可保留控件但不承诺画面变化；本任务的「改参后笔迹明显变化」验收由下表 4-12 项承载。
+> bugfix 起 0-3 **不再仅存参**：`dgcSetBrushSetting` 在写入 `Impl::brush_settings` 表的同时
+> 直接桥接到内核 `IPaintKernel::setBrushSetting` → `Brush::setBase`，下一笔 `strokeTo` 即作用于
+> 渲染。映射：`0 radius` → `RadiusLogarithmic = log(max(value, 1e-3))`；`1 hardness` → `Hardness =
+> clamp01(value)`；`2 opacity` → `Opaque = clamp01(value)`；`3 radius_log` → `RadiusLogarithmic =
+> value`（直通）。语义/线程约定与 `dgcSetBrushColor` 相同：**笔画之间生效**，消费端建议在
+> `strokeActive == false` 时提交。
 
 ## Stroke Modeler 参数（settingId 4-12，D6-1 新增，透传到 `core/stroke_predictor.h`）
 
@@ -28,8 +32,8 @@ settingId 调用 `dgcSetBrushSetting`，SDK 才会 `make_unique<StrokeModeler>()
 | 5 | `DGC_SETTING_WOBBLE_SPEED_FLOOR` | 抖动消除最低速度（静止判定阈值） | 1.31 | mm/s | 0 – 10 | 越大越容易判定为「静止抖动」而被压平 |
 | 6 | `DGC_SETTING_MIN_OUTPUT_RATE_HZ` | 最小输出采样率（上采样密度下限） | 180.0 | Hz | 20 – 500 | 越大补点越密、曲线越平滑，也决定预测点间距 |
 | 7 | `DGC_SETTING_END_OF_STROKE_STOPPING_DISTANCE_MM` | 抬笔停止距离（停笔点判定阈值） | 0.1 | mm | 0.01 – 5 | 越大末端预测点越倾向继续外推 |
-| 8 | `DGC_SETTING_SPRING_MASS_CONSTANT` | 弹簧质量常量 K/m | 400.0 | 1/s² | 10 – 2000 | 越大响应越快、越跟手 |
-| 9 | `DGC_SETTING_SPRING_DRAG_CONSTANT` | 弹簧阻尼常量 C/m | 40.0 | 1/s | 1 – 200 | 越大抑制过冲越强、运动越「粘滞」 |
+| 8 | `DGC_SETTING_SPRING_MASS_CONSTANT` | 弹簧质量常量 K/m | 40000.0 | 1/s² | 1000 – 100000 | 越大响应越快、越跟手 |
+| 9 | `DGC_SETTING_SPRING_DRAG_CONSTANT` | 弹簧阻尼常量 C/m | 400.0 | 1/s | 10 – 2000 | 越大抑制过冲越强、运动越「粘滞」 |
 | 10 | `DGC_SETTING_KALMAN_PROCESS_NOISE` | 卡尔曼过程噪声 | 0.0005 | — | 0.00001 – 0.01 | 越大越信任最新输入，速度估计更灵敏但更抖 |
 | 11 | `DGC_SETTING_KALMAN_MEASUREMENT_NOISE` | 卡尔曼测量噪声 | 0.004 | — | 0.0001 – 0.1 | 越大越不信任单次量测，估计速度越平滑但滞后 |
 | 12 | `DGC_SETTING_PREDICTION_INTERVAL_MS` | 预测间隔（Predict 外推时长） | 16.0 | ms | 0 – 100 | 越大预测点越远（越易见"抢跑"漂移） |
