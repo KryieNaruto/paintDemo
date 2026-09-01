@@ -42,7 +42,11 @@ if(DGCPAIN_ANDROID)
     find_program(GLSLC_BIN NAMES glslc)
     if(NOT GLSLC_BIN)
         # NDK 自带 glslc（shader-tools/<host-tag>/glslc），通常不在宿主 PATH，显式探测。
+        # Windows 下文件是 glslc.exe：不带 .exe 会让 EXISTS 判假 → glslc not found → configure 失败。
         set(_ndk_glslc "${CMAKE_ANDROID_NDK}/shader-tools/${ANDROID_HOST_TAG}/glslc")
+        if(NOT EXISTS "${_ndk_glslc}")
+            set(_ndk_glslc "${_ndk_glslc}.exe")
+        endif()
         if(EXISTS "${_ndk_glslc}")
             set(GLSLC_BIN "${_ndk_glslc}")
         endif()
