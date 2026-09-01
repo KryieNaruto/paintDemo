@@ -75,6 +75,9 @@ int main() {
         s.g = 0.0f;
         s.b = 0.0f;
         stamps.push_back(s);
+        // Bug #3 节流：composite 不再无条件刷新快照缓存，直连后端测试要在 composite 后
+        // readback 取最新内容，须先 requestSnapshotRefresh()。
+        backend.requestSnapshotRefresh();
         backend.composite(stamps);
 
         std::vector<std::uint8_t> buf((size_t)32 * 32 * 4, 0);

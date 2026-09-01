@@ -102,11 +102,13 @@ DGC_API int dgcClear(DgcContext* ctx, float r, float g, float b, float a);
 DGC_API const char* dgcGetLastError(void);
 
 /* 笔刷参数化 settingId 常量：0-3 为笔刷内核基础参数（真实内核语义归 B3-1，
- * 当前仅存参、不作用于默认笔刷）；4-12 为 stroke modeler 参数（D6-1 补齐，
+ * bugfix 起经内核 Brush::setBase 实时生效：dgcSetBrushSetting(0-2) 在下一笔 strokeTo
+ * 即作用于渲染，半径/硬度/不透明度/radius_log 分别映射 RadiusLogarithmic/Hardness/
+ * Opaque/RadiusLogarithmic，笔画之间生效）；4-12 为 stroke modeler 参数（D6-1 补齐，
  * 透传到 core/stroke_predictor.h 的 StrokeModelParams，惰性激活——首次设置任一
  * modeler 项才创建/注入预测器，默认参数下渲染路径与不调用本组 settingId 完全
- * 一致，零回归）。参数含义/默认值/单位/消费端滑杆建议范围见
- * docs/brush_settings_mapping.md。 */
+ * 一致，零回归；激活后未 dgcSetFixedTime 时 SDK 自动以固定默认时间步驱动点流）。
+ * 参数含义/默认值/单位/消费端滑杆建议范围见 docs/brush_settings_mapping.md。 */
 typedef enum {
     DGC_SETTING_RADIUS     = 0, /* 半径 */
     DGC_SETTING_HARDNESS   = 1, /* 硬度 */
