@@ -29,6 +29,21 @@ constexpr std::size_t kMaxPendingInput = 1024;
 constexpr std::size_t kMaxBatchStamps = 512;
 constexpr auto kMaxBatchDurationMs = std::chrono::milliseconds(4);
 
+// flush_requested_ 节流窗口（P7-2）。刻意与 kMaxBatchDurationMs 取同一值并直接复用
+// 该常量（不引入独立数字）——理由见 docs/plans/P7-2.md §1.2：既有攒批时长上限已经
+// 在“持续繁忙输入”场景独立保证 ≤kMaxBatchDurationMs 的滞后上界，节流窗口取更小的
+// 值只会让 flush_requested_ 快速路径抢在该上界生效前提前触发、重新压小批大小（P7-1
+// 回归的病理）；取更大的值则在“输入稀疏、overCap 时间检查得不到新 stamp 触发机会”
+// 场景下让读回多等，没有收益。两者相等是唯一能让该路径最大触发频率不超过既有兜底
+// 承诺频率、因而不会打回批量吞吐的取值。
+constexpr auto kMinFlushIntervalMs = kMaxBatchDurationMs;
+
+// P7-2 × Bug#3：快照刷新请求节流窗口（纳秒），与 kMinFlushIntervalMs 同值（复用同一
+// 常量，见 requestFlush() 内注释）。高频 readback 的 catch-up 不迫使每次 composite 都
+// 付全画布 GPU→CPU 拷贝，快照刷新请求被限到与 flush 相同的节奏（≤ 一次/4ms）。
+constexpr auto kMinSnapshotRefreshIntervalNs =
+    std::chrono::duration_cast<std::chrono::nanoseconds>(kMinFlushIntervalMs);
+
 }  // namespace
 
 Engine::Engine(IPaintKernel* kernel, IRenderBackend* backend)
@@ -92,11 +107,31 @@ bool Engine::submitInput(const StrokeEvent& ev) {
 
 void Engine::requestFlush() noexcept {
     flush_requested_.store(true, std::memory_order_release);
-    // Bug #3（快照刷新节流）：消费端要新鲜快照（dgcReadbackPixels/dgcExportPNG 的非阻塞
-    // catch-up，以及 flush() 的 drain 屏障经此联动）——同时请求后端在下次 composite 批提交
-    // 末尾实际刷新 readback 快照缓存（后端默认空实现 no-op；VkBackend 置位非阻塞原子标志）。
-    // 保证「读回 ≈ 输入结算」语义不变：drain 请求强制刷新 → 精确像素路径与既有契约一致。
-    backend_->requestSnapshotRefresh();
+    // P7-2 × Bug#3（节流交互回归修复）：对 backend_->requestSnapshotRefresh() 的联动按
+    // kMinFlushIntervalMs 节流（与 flush_requested_ 同节奏），而不是每次调用都无条件置位。
+    //
+    // 背景：Bug#3 把 composite 末尾的快照刷新从「无条件」改为「仅消费者请求时刷」，并假设
+    // 消费者是低频（每帧一次读回）。P7-2 的高频 readback（PC 关 vsync 后 dgcReadbackPixels
+    // 忙循环）使 flush_requested_ 被反复 store(true)（几乎恒真）；若每次调用都联动
+    // requestSnapshotRefresh()，snapshotRefreshRequested_ 也几乎恒真 → 每次 composite（含
+    // overCap 自动合批与队列排空的合批）末尾都付一次全画布 GPU→CPU 拷贝 + SubmitAndWait →
+    // 渲染线程被拖垮，重现 P7-1「小批量 + 同步昂贵 composite」病态（读回 0.2-0.7ms →
+    // 13-20ms、孔洞 4.6-10% → 13.5-18.1%）。
+    //
+    // 修复：用「距上次快照刷新请求的时间戳」节流 requestSnapshotRefresh() 的置位频率到
+    // ≤ kMinFlushIntervalMs。快照刷新标志本身仍是粘性 bool：一旦置位、未被消费前持续为真，
+    // 请求不丢失（P7-2 硬要求）；drain 路径经 Engine::flush() 末尾的 flushReadbackCache()
+    // 同步强制刷新，精确像素语义不变。lastSnapshotRefreshRequestNs_ 的并发读写是良性竞态
+    // （最坏是同一 4ms 窗口内多置一次标志 → 多一次刷新，正确性不变），故用 relaxed 即可。
+    const auto nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    const std::int64_t lastNs =
+        lastSnapshotRefreshRequestNs_.load(std::memory_order_relaxed);
+    if (nowNs - lastNs >= kMinSnapshotRefreshIntervalNs.count()) {
+        lastSnapshotRefreshRequestNs_.store(nowNs, std::memory_order_relaxed);
+        backend_->requestSnapshotRefresh();
+    }
 }
 
 void Engine::flush() {
@@ -253,11 +288,14 @@ void Engine::renderLoop() {
     // 两条 + 新增攒批上限兜底，共三条）：
     //   1) flush_requested_ 已置位——由 flush()（drain 屏障，正在等合成完成）或
     //      requestFlush()（非阻塞 catch-up，见 dgcReadbackPixels/dgcExportPNG）任一
-    //      途径置位，语义仍是「尽快找机会合批」；
+    //      途径置位，语义仍是「尽快找机会合批」；P7-2 起该条件额外受
+    //      kMinFlushIntervalMs 节流（见下），未达节流间隔不响应也不清零标志；
     //   2) 攒批已超上限（本批 stamp 数 ≥ kMaxBatchStamps 或攒批时长 ≥
-    //      kMaxBatchDurationMs）——不依赖条件 1) 是否曾被置位，兜底"连续不间断输入
-    //      下队列理论上永不空、且置位可能被更快输入抢跑清空"的病理场景（P7-1 背景）；
-    //   3) brush_to_render_ 已空（当前输入暂告一段落，见下方 try_pop 失败分支）。
+    //      kMaxBatchDurationMs）——不依赖条件 1) 是否曾被置位，也不受节流影响，兜底
+    //      "连续不间断输入下队列理论上永不空、且置位可能被更快输入抢跑清空"的病理
+    //      场景（P7-1 背景）；
+    //   3) brush_to_render_ 已空（当前输入暂告一段落，见下方 try_pop 失败分支），
+    //      不受节流影响。
     // composited_ 按批内 count_submission==true 的条目数（D6-1：= 外部 StrokePoint
     // 提交次数，而非批数本身，见 StrokeEvent::count_submission / RenderBatch 注释）
     // 递增，屏障追平语义不变；predictor 关闭（passthrough）时 count_submission
@@ -265,6 +303,9 @@ void Engine::renderLoop() {
     std::vector<RenderBatch> batch;
     std::size_t batchStampCount = 0;
     std::chrono::steady_clock::time_point batchStart{};
+    // P7-2：仅渲染线程本地读写（无跨线程访问），不需要原子/锁；初值设为 epoch
+    // 确保 start() 后第一次收到请求即可立即响应，不因初值巧合被节流。
+    auto lastFlushTime = std::chrono::steady_clock::time_point{};
     auto flushBatch = [&]() {
         if (batch.empty()) {
             return;
@@ -313,13 +354,23 @@ void Engine::renderLoop() {
             }
             batchStampCount += stamps.stamps.size();
             batch.push_back(std::move(stamps));
-            // 三条触发条件（P7-1，见上方注释）之 1) 与 2)；原子交换顺便清标志，幂等。
-            const bool requested = flush_requested_.exchange(false, std::memory_order_acq_rel);
+            // 三条触发条件（P7-1，见上方注释）之 1) 与 2)。P7-2：条件 1) 只 peek
+            // 不清零（是否清零取决于本次是否真的触发 flush，见下），并额外受
+            // kMinFlushIntervalMs 节流。
+            const bool haveRequest = flush_requested_.load(std::memory_order_acquire);
+            const auto now = std::chrono::steady_clock::now();
+            const bool intervalOk = (now - lastFlushTime) >= kMinFlushIntervalMs;
             const bool overCap = batchStampCount >= kMaxBatchStamps ||
-                                  (std::chrono::steady_clock::now() - batchStart) >=
-                                      kMaxBatchDurationMs;
-            if (requested || overCap) {
+                                  (now - batchStart) >= kMaxBatchDurationMs;
+            if (overCap || (haveRequest && intervalOk)) {
+                // 仅在“本次确实要 flush”时才消费该请求：overCap 触发时若 haveRequest
+                // 也为真，说明这次 flush 同样满足了那次 catch-up 诉求，一并清零；
+                // 未触发 flush 时绝不清零，保证请求不被静默丢弃（P7-2 硬要求）。
+                if (haveRequest) {
+                    flush_requested_.store(false, std::memory_order_release);
+                }
                 flushBatch();
+                lastFlushTime = std::chrono::steady_clock::now();
             }
             continue;
         }
@@ -333,7 +384,8 @@ void Engine::renderLoop() {
             // 正确性：dgcFlush（drain）在排空后强制刷新快照（flushReadbackCache），
             // 精确像素路径不受影响；读回路径经 requestFlush 请求由下一次 composite 消费
             // （≤1 批滞后，语义不变）。
-            flushBatch();  // 条件 3)：队列已空，当前输入暂告一段落，合批提交。
+            flushBatch();  // 条件 3)：队列已空，当前输入暂告一段落，合批提交，不受节流影响。
+            lastFlushTime = std::chrono::steady_clock::now();
             continue;
         }
         std::this_thread::yield();
