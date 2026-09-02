@@ -26,6 +26,13 @@ target_include_directories(test_engine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_link_libraries(test_engine PRIVATE dgc_paint)
 add_test(NAME test_engine COMMAND test_engine)
 
+# P7-2：白盒 Engine 级回归——高频 requestFlush() 不应把批量 composite 打回接近
+# 逐条处理的水平（量化平均批大小），无 Vulkan 依赖，host 无条件构建/跑。
+add_executable(test_flush_throttle_engine test_flush_throttle_engine.cpp)
+target_include_directories(test_flush_throttle_engine PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_flush_throttle_engine PRIVATE dgc_paint)
+add_test(NAME test_flush_throttle_engine COMMAND test_flush_throttle_engine)
+
 # 纯 C 冒烟：验证对外头可被 C 编译器解析且实现已链接进 dgc_paint。
 add_executable(test_c_api_header test_c_api_header.c)
 target_link_libraries(test_c_api_header PRIVATE dgc_paint)
@@ -126,6 +133,13 @@ if(DGCPAIN_KERNEL_BRUSH AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/brush/
         target_include_directories(test_continuous_input_regression PRIVATE ${CMAKE_SOURCE_DIR})
         target_link_libraries(test_continuous_input_regression PRIVATE dgc_paint)
         add_test(NAME test_continuous_input_regression COMMAND test_continuous_input_regression)
+
+        # P7-2：黑盒 C API 级回归——紧凑循环高频调用 dgcReadbackPixels（去掉逐次
+        # CountInk 的天然限速），验证 flush_requested_ 节流生效后仍不回归孔洞。
+        add_executable(test_flush_throttle_readback test_flush_throttle_readback.cpp)
+        target_include_directories(test_flush_throttle_readback PRIVATE ${CMAKE_SOURCE_DIR})
+        target_link_libraries(test_flush_throttle_readback PRIVATE dgc_paint)
+        add_test(NAME test_flush_throttle_readback COMMAND test_flush_throttle_readback)
 
         # bugfix：笔刷内核基础参数 0-2 必须真实作用于渲染（红：设 RADIUS=40 无效果）。
         add_executable(test_brush_setting_applies test_brush_setting_applies.cpp)

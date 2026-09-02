@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -65,10 +66,13 @@ public:
     // （C API 调用线程）调用；纯等待 + 原子读，无新堆所有权。
     void flush();
 
-    // 非阻塞 catch-up（P7-1）：仅对 flush_requested_ 做一次 release store，立即返回，
+    // 非阻塞 catch-up（P7-1）：对 flush_requested_ 做一次置位（store(true)），立即返回，
     // 不等待任何队列/composited_ 追平。用于 GUI/调用线程「顺路」催促渲染线程尽快
     // 找机会合批，不像 flush() 那样阻塞到 drain 完成。可在引擎运行期间任意线程调用，
     // 无堆分配、无锁、无跨线程等待。
+    // P7-2 × Bug#3：快照刷新联动（backend_->requestSnapshotRefresh）按 kMinFlushIntervalMs
+    // 节流（见 engine.cpp），使高频 readback 的 catch-up 不迫使每次 composite 都付全画布
+    // GPU 拷贝；drain 的精确像素路径仍由 flush() 末尾的 flushReadbackCache() 同步保证。
     void requestFlush() noexcept;
 
     // 默认笔刷句柄（D6-3）：start() 内同步创建，返回前即有效，供 C API
@@ -127,7 +131,22 @@ private:
     //   2) 攒批已超上限（stamp 数或时长阈值，见 engine.cpp 匿名命名空间常量）——
     //      不依赖 1)，兜底"队列理论上永不空、无人置位 flush_requested_"的连续输入场景；
     //   3) brush_to_render_ 已空（当前输入暂告一段落）。
+    //
+    // flush_requested_ 节流（P7-2）：非阻塞置位可能来自远高于 renderLoop 攒批节奏的
+    // 调用频率（如 PC 关 vsync 后 dgcReadbackPixels 的忙循环调用）。renderLoop() 对
+    // 该标志的“响应”频率做了节流（kMinFlushIntervalMs，见 engine.cpp），未达节流
+    // 间隔时不清零该标志（保留请求，不静默丢弃），下一次循环检查间隔已过时会补上；
+    // 节流窗口与既有 kMaxBatchDurationMs 攒批时长上限取同一数值（复用常量），使
+    // 该路径的最大触发频率不超过既有攒批兜底本就承诺的上界，理论上不会比 P7-1
+    // 验收通过时的批量吞吐更差（详见 docs/plans/P7-2.md §1.2）。
     std::atomic<bool> flush_requested_{false};
+
+    // P7-2 × Bug#3：上次联动 backend_->requestSnapshotRefresh() 的 wall-clock 纳秒时间戳
+    // （steady_clock 相对 epoch，0 初值 = 很久以前，首次调用即可置位）。requestFlush()
+    // 据此把快照刷新请求节流到 ≤ kMinFlushIntervalMs（与 flush 同节奏），避免高频 readback
+    // 让 snapshotRefreshRequested_ 几乎恒真、每次 composite 都付全画布 GPU 拷贝。仅
+    // requestFlush() 读写（调用线程），并发是良性竞态（见 engine.cpp requestFlush 注释）。
+    std::atomic<std::int64_t> lastSnapshotRefreshRequestNs_{0};
 
     std::atomic<bool> stop_{false};
     std::atomic<bool> running_{false};
