@@ -159,7 +159,12 @@ struct PositionModeler {
             has_ = true;
             return target;
         }
-        const double dt_s = double(target.t_us - last_t_us_) / 1e6;
+        // bugfix（P7-4）：真实时间戳可能乱序/倒退，uint64 相减会下溢成巨大正数，
+        // 使下方 while 以 kStepS 步长积分巨大 dt → 实际死循环。先按 dt=0 归一
+        // （触发 integrate_dt<=0 → kStepS 防御分支），与 Resampler 的 >= 口径一致。
+        const double dt_s = (target.t_us >= last_t_us_)
+            ? double(target.t_us - last_t_us_) / 1e6
+            : 0.0;
         // 防御分支（bugfix Fix B 备选）：dt<=0（全 0/负时间戳，本应被 C API 的 Fix A 消除）
         // 时按一个固定微步推进弹簧，避免把每个点钉死在首点（修复前笔画塌缩成点的根因），
         // 防未来再次出现全零时间戳时退化。dt>0 的正常路径（override/fixedtime）不变。
@@ -222,7 +227,11 @@ struct KalmanPredictor {
             has_ = true;
             return;
         }
-        const double dt = double(p.t_us - last_t_us_) / 1e6;
+        // bugfix（P7-4）：乱序/倒退时间戳下 uint64 相减下溢成巨大正数，会绕过下方
+        // dt<=0 防御、把卡尔曼状态量推到离谱值。按 dt=0 归一走防御分支（跳过更新）。
+        const double dt = (p.t_us >= last_t_us_)
+            ? double(p.t_us - last_t_us_) / 1e6
+            : 0.0;
         last_t_us_ = p.t_us;
         if (dt <= 0.0) {
             return;
