@@ -80,6 +80,16 @@ DGC_API int dgcResize(DgcContext* ctx, int w, int h);
 /* 笔画事件流。isPredicted 非 0 表示预测点。 */
 DGC_API int dgcBeginStroke(DgcContext* ctx, float x, float y, float pressure, float tiltX, float tiltY);
 DGC_API int dgcStrokeTo(DgcContext* ctx, float x, float y, float pressure, float tiltX, float tiltY, int isPredicted);
+/* 真实时间戳输入（P7-4）：t_us 为真实事件时间（微秒，笔画内需单调不减；绝对或
+ * 笔画内相对均可）。提供后 modeler 的卡尔曼速度/预测长度按真实输入节奏校准，
+ * 不再用合成固定步长（dgcBeginStroke 的 default_step 只作非 At 路径回退）。
+ * 与 dgcSetFixedTime（override）互斥：override 时 t_us 被忽略、仍走固定时间步，
+ * 保证 CLI/批处理/确定性测试的 golden 可复现。同刻/乱序 t_us（dt<=0）由
+ * PositionModeler/KalmanPredictor 既有防御分支处理，不崩溃。
+ * 建议：真机交互（非 override）路径用 MotionEvent 时间戳；无真实时间的调用方
+ * 继续用 dgcStrokeTo（合成步长回退）。 */
+DGC_API int dgcStrokeToAt(DgcContext* ctx, float x, float y, float pressure,
+                          float tiltX, float tiltY, int isPredicted, double t_us);
 DGC_API int dgcEndStroke(DgcContext* ctx);
 
 /* 笔刷管理。dgcCreateBrush 自 D6-1 起返回有效发号器句柄（自增，非 0），供
