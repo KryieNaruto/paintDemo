@@ -188,6 +188,13 @@ target_include_directories(test_stroke_predictor PRIVATE ${CMAKE_CURRENT_SOURCE_
 target_link_libraries(test_stroke_predictor PRIVATE dgc_paint)
 add_test(NAME test_stroke_predictor COMMAND test_stroke_predictor)
 
+# P7-4：真实时间戳入口回归（60Hz 速度校准 + 预测不抢跑 + dt<=0 边界 + override 等价）。
+# 白盒部分无条件（无 Vulkan 依赖）；C API override 等价在 Null 后端下跳过像素断言。
+add_executable(test_stroke_predictor_real_time test_stroke_predictor_real_time.cpp)
+target_include_directories(test_stroke_predictor_real_time PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_link_libraries(test_stroke_predictor_real_time PRIVATE dgc_paint)
+add_test(NAME test_stroke_predictor_real_time COMMAND test_stroke_predictor_real_time)
+
 # B5-2：CLI 集成测试（shell 调 dgc_cli 二进制，不编译 script_runner.cpp 进本目标）。
 # 需 dgc_cli 已建（DGCPAIN_BUILD_CLI=ON 且顶层 add_subdirectory(cli) 先于 tests）。
 if(DGCPAIN_BUILD_CLI AND TARGET dgc_cli)
