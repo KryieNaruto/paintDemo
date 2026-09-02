@@ -244,6 +244,31 @@ int dgcStrokeTo(DgcContext* ctx, float x, float y, float pressure, float tiltX, 
     return DGC_OK;
 }
 
+int dgcStrokeToAt(DgcContext* ctx, float x, float y, float pressure,
+                  float tiltX, float tiltY, int isPredicted, double t_us) {
+    if (ctx == nullptr) {
+        g_last_error = DGC_ERR_NULL_CONTEXT;
+        return DGC_ERR_NULL_CONTEXT;
+    }
+    // P7-4：确定性优先——override 时忽略真实 t_us，走固定时间步（与 dgcStrokeTo 同源
+    // time_stepper.next()，golden 可复现）；否则直填真实 t_us，供 modeler 按真实节奏
+    // 校准卡尔曼速度/预测长度。
+    std::uint64_t ts;
+    if (ctx->impl_->determinism.override_time) {
+        ts = ctx->impl_->time_stepper.next();
+    } else {
+        ts = static_cast<std::uint64_t>(t_us);
+    }
+    StrokePoint p{x, y, pressure, tiltX, tiltY, ts, (isPredicted != 0)};
+    StrokeEvent ev{StrokeEventType::StrokePoint, p};
+    if (!ctx->impl_->engine->submitInput(ev)) {
+        g_last_error = DGC_ERR_QUEUE_FULL;
+        return DGC_ERR_QUEUE_FULL;
+    }
+    g_last_error = DGC_OK;
+    return DGC_OK;
+}
+
 int dgcEndStroke(DgcContext* ctx) {
     if (ctx == nullptr) {
         g_last_error = DGC_ERR_NULL_CONTEXT;
