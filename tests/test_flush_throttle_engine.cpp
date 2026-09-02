@@ -54,6 +54,7 @@ public:
     }
     void endStroke(BrushHandle) override {}
     void setBrushColor(BrushHandle, float, float, float, float) override {}
+    void setBrushSetting(BrushHandle, brush::SettingId, float) override {}
 };
 
 // BatchCountingBackend：记录 composite() 调用次数与每次调用的 stamp 数总和，

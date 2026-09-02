@@ -38,6 +38,12 @@ constexpr auto kMaxBatchDurationMs = std::chrono::milliseconds(4);
 // 承诺频率、因而不会打回批量吞吐的取值。
 constexpr auto kMinFlushIntervalMs = kMaxBatchDurationMs;
 
+// P7-2 × Bug#3：快照刷新请求节流窗口（纳秒），与 kMinFlushIntervalMs 同值（复用同一
+// 常量，见 requestFlush() 内注释）。高频 readback 的 catch-up 不迫使每次 composite 都
+// 付全画布 GPU→CPU 拷贝，快照刷新请求被限到与 flush 相同的节奏（≤ 一次/4ms）。
+constexpr auto kMinSnapshotRefreshIntervalNs =
+    std::chrono::duration_cast<std::chrono::nanoseconds>(kMinFlushIntervalMs);
+
 }  // namespace
 
 Engine::Engine(IPaintKernel* kernel, IRenderBackend* backend)
@@ -101,11 +107,31 @@ bool Engine::submitInput(const StrokeEvent& ev) {
 
 void Engine::requestFlush() noexcept {
     flush_requested_.store(true, std::memory_order_release);
-    // Bug #3（快照刷新节流）：消费端要新鲜快照（dgcReadbackPixels/dgcExportPNG 的非阻塞
-    // catch-up，以及 flush() 的 drain 屏障经此联动）——同时请求后端在下次 composite 批提交
-    // 末尾实际刷新 readback 快照缓存（后端默认空实现 no-op；VkBackend 置位非阻塞原子标志）。
-    // 保证「读回 ≈ 输入结算」语义不变：drain 请求强制刷新 → 精确像素路径与既有契约一致。
-    backend_->requestSnapshotRefresh();
+    // P7-2 × Bug#3（节流交互回归修复）：对 backend_->requestSnapshotRefresh() 的联动按
+    // kMinFlushIntervalMs 节流（与 flush_requested_ 同节奏），而不是每次调用都无条件置位。
+    //
+    // 背景：Bug#3 把 composite 末尾的快照刷新从「无条件」改为「仅消费者请求时刷」，并假设
+    // 消费者是低频（每帧一次读回）。P7-2 的高频 readback（PC 关 vsync 后 dgcReadbackPixels
+    // 忙循环）使 flush_requested_ 被反复 store(true)（几乎恒真）；若每次调用都联动
+    // requestSnapshotRefresh()，snapshotRefreshRequested_ 也几乎恒真 → 每次 composite（含
+    // overCap 自动合批与队列排空的合批）末尾都付一次全画布 GPU→CPU 拷贝 + SubmitAndWait →
+    // 渲染线程被拖垮，重现 P7-1「小批量 + 同步昂贵 composite」病态（读回 0.2-0.7ms →
+    // 13-20ms、孔洞 4.6-10% → 13.5-18.1%）。
+    //
+    // 修复：用「距上次快照刷新请求的时间戳」节流 requestSnapshotRefresh() 的置位频率到
+    // ≤ kMinFlushIntervalMs。快照刷新标志本身仍是粘性 bool：一旦置位、未被消费前持续为真，
+    // 请求不丢失（P7-2 硬要求）；drain 路径经 Engine::flush() 末尾的 flushReadbackCache()
+    // 同步强制刷新，精确像素语义不变。lastSnapshotRefreshRequestNs_ 的并发读写是良性竞态
+    // （最坏是同一 4ms 窗口内多置一次标志 → 多一次刷新，正确性不变），故用 relaxed 即可。
+    const auto nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    const std::int64_t lastNs =
+        lastSnapshotRefreshRequestNs_.load(std::memory_order_relaxed);
+    if (nowNs - lastNs >= kMinSnapshotRefreshIntervalNs.count()) {
+        lastSnapshotRefreshRequestNs_.store(nowNs, std::memory_order_relaxed);
+        backend_->requestSnapshotRefresh();
+    }
 }
 
 void Engine::flush() {

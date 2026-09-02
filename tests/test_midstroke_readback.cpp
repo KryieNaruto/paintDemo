@@ -51,8 +51,14 @@ int main() {
         finalInk > 0 ? 100.0 * (finalInk - prevInk) / finalInk : 0.0);
 
     dgcDestroy(ctx);
-    // 通过条件：末次逐帧读回已接近最终完整画布（<5% 缺），且过程中无"倒退"（单调不减）。
-    bool pass = (finalInk - prevInk) < finalInk / 20 && monotonicViolations == 0;
+    // 通过条件：过程中无"倒退"（单调不减，捕捉阻塞 drain / 丢 dab 的真实孔洞），且末次逐帧
+    // 读回相对权威完整画布的滞后有界。P7-2 × Bug#3 修复把快照刷新节流到 ≤kMinFlushIntervalMs
+    // （4ms），读回缓存因此允许「≤4ms + 渲染线程积压」的有界滞后（非永久孔洞——flush 后
+    // finalInk 仍完整）；本用例是 121 点的小笔画、逐点读回，该有界滞后约占 10%~40%。故滞后
+    // 阈值从原先假设「≈1 点滞后」的 5% 放宽到 50%，用于区分「有界滞后」与「阻塞型回归」
+    // （历史 20fps 病理下末次读回接近 0% 墨迹、滞后 ≈100%）。单调不减断言不放松，仍可捕捉
+    // 真实孔洞/倒退。
+    bool pass = (finalInk - prevInk) < finalInk / 2 && monotonicViolations == 0;
     std::fprintf(stderr, pass ? "[midstroke] PASS\n" : "[midstroke] FAIL\n");
     return pass ? 0 : 1;
 }
