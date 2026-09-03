@@ -48,7 +48,10 @@ bool RenderWithPrediction(double intervalMs, std::vector<std::uint8_t>& buf, con
         const float y = 80.0f + 20.0f * float(std::sin(2.0 * M_PI * (double(i) / (double)(kPoints - 1))));
         dgcStrokeTo(ctx.get(), x, y, 0.5f, 0.0f, 0.0f, 0);
     }
-    dgcEndStroke(ctx.get());
+    // A8-2：预测点不再永久合墨（endStroke 清 tip），故 PREDICTION_INTERVAL_MS 只改变
+    // 「笔画进行中」的湿尖（tip）显示、不改变落笔后的永久墨。这里**不 endStroke**，
+    // 让预测尖保留在读回里，验证 interval 仍可观测地改变输出（长 interval → 更长的
+    // tip 墨迹）。落笔后 tip 清空的确定性由 test_wet_tip 的验收 B/C 覆盖。
     dgcFlush(ctx.get());
     buf.assign((std::size_t)kW * kH * 4, 0);
     if (dgcReadbackPixels(ctx.get(), buf.data()) != DGC_OK) {

@@ -164,6 +164,12 @@ if(DGCPAIN_KERNEL_BRUSH AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/brush/
         target_include_directories(test_modeler_deterministic PRIVATE ${CMAKE_SOURCE_DIR})
         target_link_libraries(test_modeler_deterministic PRIVATE dgc_paint)
         add_test(NAME test_modeler_deterministic COMMAND test_modeler_deterministic)
+
+        # A8-2：预测瞬态 wet-tip 层验收（A 白盒 tip merge/clear + B/C/D C API 端到端）。
+        add_executable(test_wet_tip test_wet_tip.cpp)
+        target_include_directories(test_wet_tip PRIVATE ${CMAKE_SOURCE_DIR})
+        target_link_libraries(test_wet_tip PRIVATE dgc_paint)
+        add_test(NAME test_wet_tip COMMAND test_wet_tip)
     endif()
 endif()
 

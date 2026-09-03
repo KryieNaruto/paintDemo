@@ -8,7 +8,8 @@ public:
     void init(PlatformSurface surface, int w, int h) override;
     void resize(int w, int h) override;
     void beginFrame() override;
-    void composite(const std::vector<StampData>& stamps) override;
+    void composite(const std::vector<StampData>& stamps, bool predicted = false) override;
+    void clearTip() override;
     void clearCanvas(float r, float g, float b, float a) override;
     void present() override;
     void shutdown() override;

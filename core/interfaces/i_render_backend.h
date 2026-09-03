@@ -11,7 +11,12 @@ public:
     virtual void init(PlatformSurface, int w, int h) = 0;
     virtual void resize(int w, int h) = 0;
     virtual void beginFrame() = 0;
-    virtual void composite(const std::vector<StampData>&) = 0;
+    // A8-2：predicted=true 表示本批 stamp 是预测点——后端应把它们 composite 到瞬态 tip
+    // 层（只临时显示、不永久合墨），predicted=false 走既有画布路径。默认 false 保证既有
+    // 调用点（renderLoop 旧路径）与 Null 桩编译不破。
+    virtual void composite(const std::vector<StampData>& stamps, bool predicted = false) = 0;
+    // A8-2：清空 tip 层（endStroke/落笔丢弃预测尖）。默认空实现（Null 桩无 tip 层）。
+    virtual void clearTip() {}
     virtual void clearCanvas(float r, float g, float b, float a) = 0;
     virtual void present() = 0;
     virtual void shutdown() = 0;

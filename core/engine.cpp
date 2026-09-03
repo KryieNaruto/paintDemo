@@ -96,9 +96,13 @@ bool Engine::submitInput(const StrokeEvent& ev) {
         return false;
     }
     pending_input_.push_back(ev);
-    // B5-2：仅 StrokePoint 事件同步递增 submitted_（与渲染线程 composite 轮数一一对应；
-    // Begin/End 不产 stamp 批，不计入，否则 flush 屏障永远追不平）。
-    if (ev.type == StrokeEventType::StrokePoint) {
+    // B5-2：StrokePoint 事件同步递增 submitted_（与渲染线程 composite 轮数一一对应；
+    // Begin 不产 stamp 批，不计入，否则 flush 屏障永远追不平）。
+    // A8-2（MUST-FIX 方案 A）：EndStroke 也递增 submitted_——brushLoop 在 endStroke 后
+    // 压一个 count_submission=true 的 clearTip 批，故 EndStroke 现在有对应的渲染侧计数，
+    // flush 屏障会等到 tip 清完（见 RenderBatch::clearTip 注释）。
+    if (ev.type == StrokeEventType::StrokePoint ||
+        ev.type == StrokeEventType::EndStroke) {
         submitted_.fetch_add(1, std::memory_order_relaxed);
     }
     input_cv_.notify_one();
@@ -218,16 +222,26 @@ void Engine::inputLoop() {
                 pred->Predict(&out);
                 // D6-1：一次外部 StrokePoint 提交展开成 out.size() 个内部事件，
                 // 破坏了「1 提交 = 1 composited_ 计数」的 1:1 关系（见
-                // StrokeEvent::count_submission 注释）。只把展开出的最后一个
-                // 事件标记为 count_submission=true，其余全为 false：SPSC 单消费者
-                // 严格 FIFO，故它被合成时，本次提交展开出的全部前序事件必已合成。
-                // Update()/Predict() 的管线设计下 out 恒非空（resampler 首点必发、
-                // 稀疏/密集分支均至少落 1 点），故无需处理 out.empty() 的兜底路径；
-                // 若未来管线改动导致可能为空，需在此补发一个 count-only 事件，
+                // StrokeEvent::count_submission 注释）。
+                // A8-2：count_submission 改标「最后一个非预测点」——Predict() 产出的
+                // 预测点（out 尾部 is_predicted=true）不计入外部提交（预测事件不计数，
+                // 见 RenderBatch::predicted 注释）。SPSC 单消费者严格 FIFO，故最后一个
+                // 真实点被合成时，本次提交展开出的全部前序事件必已合成（含它之后追加的
+                // 预测点？否——预测点排在真实点之后，被合成顺序也在其之后；但预测点
+                // 只进 tip 层、不进 composited_ 屏障计数，其完成度由 flush 的
+                // flushReadbackCache 兜底，屏障语义不变）。
+                // Update()/Predict() 的管线设计下 out 恒非空且恒含 ≥1 真实点（resampler
+                // 首点必发、稀疏/密集分支均至少落 1 点，预测点恒排在真实点之后），故
+                // realCount ≥ 1 恒成立，无需处理 out 全为预测点的兜底路径；若未来管线
+                // 改动导致某次提交 0 真实点（纯预测），需在此补发一个 count-only 事件，
                 // 否则 submitted_/composited_ 将永久失配、flush() 卡死。
+                std::size_t realCount = out.size();
+                while (realCount > 0 && out[realCount - 1].is_predicted) {
+                    --realCount;
+                }
                 for (std::size_t i = 0; i < out.size(); ++i) {
                     StrokeEvent oev{StrokeEventType::StrokePoint, out[i],
-                                    /*count_submission=*/(i + 1 == out.size())};
+                                    /*count_submission=*/(i + 1 == realCount)};
                     if (!pushEvent(oev)) {
                         return;
                     }
@@ -246,6 +260,14 @@ void Engine::brushLoop() {
     // 内核线程：beginStroke/endStroke 有状态，必须在此线程执行。
     // 默认笔刷已在 start() 同步创建（default_brush_），此处直接复用，不再重复 createBrush。
     const BrushHandle brush = default_brush_;
+    // A8-2：最近真实 dab 的外观缓存（半径/硬度/不透明度/颜色/软边）。预测点**不走有状态
+    // 的 strokeTo**——Brush::strokeTo 会推进 last_x/last_y/dabs_moved 并按 dab 消耗 RNG
+    // （kernels/brush/brush.cpp:210-253），若把预测点喂给它，预测点会反向污染真实点的
+    // dab 间距与 RNG 序列，导致「ON 的真实墨 ≠ OFF 的真实墨」，破坏验收 B/C 的逐位一致。
+    // 故预测点直接用最近真实 dab 的外观在预测位置合成一个 tip dab（只进 tip 层），
+    // 真实点照常走 strokeTo，ON/OFF 的真实墨逐位一致。
+    StampData last_real_dab{};
+    bool has_last_real_dab = false;
     while (true) {
         if (stop_.load(std::memory_order_acquire)) {
             return;
@@ -260,10 +282,36 @@ void Engine::brushLoop() {
                 kernel_->beginStroke(brush, ev.point);
                 break;
             case StrokeEventType::StrokePoint: {
-                std::vector<StampData> stamps = kernel_->strokeTo(brush, ev.point);
+                std::vector<StampData> stamps;
+                if (ev.point.is_predicted) {
+                    // 预测点：合成 tip dab（见函数头部注释），不碰有状态 brush。
+                    if (has_last_real_dab) {
+                        StampData tip{};
+                        tip.x = ev.point.x;
+                        tip.y = ev.point.y;
+                        tip.radius = last_real_dab.radius;
+                        tip.hardness = last_real_dab.hardness;
+                        tip.opacity = last_real_dab.opacity;
+                        tip.r = last_real_dab.r;
+                        tip.g = last_real_dab.g;
+                        tip.b = last_real_dab.b;
+                        tip.softness = last_real_dab.softness;
+                        stamps.push_back(tip);
+                    }
+                } else {
+                    stamps = kernel_->strokeTo(brush, ev.point);
+                    if (!stamps.empty()) {
+                        last_real_dab = stamps.back();
+                        has_last_real_dab = true;
+                    }
+                }
                 // count_submission 原样透传（D6-1）：从触发本批的 StrokeEvent 带到
                 // renderLoop，供 composited_ 按「外部提交数」而非「批数」计数。
-                RenderBatch batch_item{std::move(stamps), ev.count_submission};
+                // A8-2：predicted 从 ev.point.is_predicted 打标（预测点 → tip 层）。
+                RenderBatch batch_item;
+                batch_item.stamps = std::move(stamps);
+                batch_item.count_submission = ev.count_submission;
+                batch_item.predicted = ev.point.is_predicted;
                 // 有界等待：满则 yield 重试，期间响应 stop_。
                 while (!brush_to_render_.try_push(std::move(batch_item))) {
                     if (stop_.load(std::memory_order_acquire)) {
@@ -275,6 +323,24 @@ void Engine::brushLoop() {
             }
             case StrokeEventType::EndStroke:
                 kernel_->endStroke(brush);
+                has_last_real_dab = false;  // 下一笔重新积累真实 dab 外观
+                // A8-2（MUST-FIX 方案 A）：endStroke 后压一个 count_submission=true 的
+                // clearTip 批进渲染 FIFO——保证「所有预测批 composite 之后才清 tip」
+                // （SPSC 严格 FIFO，无跨线程竞态），且 flush 屏障会等到它完成（EndStroke
+                // 在 submitInput 已同步 +1）。clearTip 批无 stamp，渲染线程据此只调
+                // backend_->clearTip()。
+                {
+                    RenderBatch tip_batch;
+                    tip_batch.count_submission = true;
+                    tip_batch.predicted = false;
+                    tip_batch.clearTip = true;
+                    while (!brush_to_render_.try_push(std::move(tip_batch))) {
+                        if (stop_.load(std::memory_order_acquire)) {
+                            return;
+                        }
+                        std::this_thread::yield();
+                    }
+                }
                 break;
         }
     }
@@ -310,31 +376,62 @@ void Engine::renderLoop() {
         if (batch.empty()) {
             return;
         }
-        std::vector<StampData> flat;
+        // A8-2：拆 real / pred 两路 + clearTip。真实批 → canvasImage（行为零变），
+        // 预测批 → tipImage（只临时显示），clearTip 批 → backend_->clearTip()。
+        // 顺序：预测批在 FIFO 中先于 clearTip，flushAccum 先 composite 攒好的 real/pred，
+        // 再清 tip，保证「所有预测批 composite 之后才清」（无跨线程竞态）。
+        // counted 仍按 count_submission 计数（含 clearTip 批 = EndStroke 的 +1，MUST-FIX）。
         std::size_t counted = 0;
-        {
-            std::size_t total = 0;
-            for (const auto& b : batch) {
-                total += b.stamps.size();
-                if (b.count_submission) {
-                    ++counted;
+        std::size_t realTotal = 0;
+        std::size_t predTotal = 0;
+        for (const auto& b : batch) {
+            if (b.count_submission) {
+                ++counted;
+            }
+            if (!b.clearTip) {
+                if (b.predicted) {
+                    predTotal += b.stamps.size();
+                } else {
+                    realTotal += b.stamps.size();
                 }
             }
-            flat.reserve(total);
         }
-        for (const auto& b : batch) {
-            flat.insert(flat.end(), b.stamps.begin(), b.stamps.end());
-        }
+        std::vector<StampData> realStamps;
+        std::vector<StampData> predStamps;
+        realStamps.reserve(realTotal);
+        predStamps.reserve(predTotal);
+
+        auto flushAccum = [&]() {
+            if (!realStamps.empty()) {
+                backend_->composite(realStamps, /*predicted=*/false);
+                realStamps.clear();
+            }
+            if (!predStamps.empty()) {
+                backend_->composite(predStamps, /*predicted=*/true);
+                predStamps.clear();
+            }
+        };
 #ifdef DGCPAIN_PERF
         auto r0 = std::chrono::steady_clock::now();
 #endif
-        backend_->composite(flat);
+        for (const auto& b : batch) {
+            if (b.clearTip) {
+                // 先落掉已攒 real/pred，再清 tip（预测批先 composite，后清 tip）。
+                flushAccum();
+                backend_->clearTip();
+                continue;
+            }
+            auto& dst = b.predicted ? predStamps : realStamps;
+            dst.insert(dst.end(), b.stamps.begin(), b.stamps.end());
+        }
+        flushAccum();
         backend_->present();
 #ifdef DGCPAIN_PERF
         auto r1 = std::chrono::steady_clock::now();
-        std::fprintf(stderr, "[PERF] engine::renderLoop composite=%.3f ms stamps=%zu batches=%zu\n",
-                     std::chrono::duration<double, std::milli>(r1 - r0).count(), flat.size(),
-                     batch.size());
+        std::fprintf(stderr,
+                     "[PERF] engine::renderLoop composite=%.3f ms real=%zu pred=%zu batches=%zu\n",
+                     std::chrono::duration<double, std::milli>(r1 - r0).count(),
+                     realTotal, predTotal, batch.size());
 #endif
         // B5-2/D6-1：每合批提交一轮后按「外部提交计数」递增 composited_
         // （release，供 flush 屏障 acquire 追平），而非批内条目总数。
