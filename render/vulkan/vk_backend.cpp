@@ -19,9 +19,11 @@
 
 #ifdef DGCPAIN_PRECOMPILED_SPV
 #include "brush_composite_spv.h"  // Android：构建期 glslc 预编译内嵌（单一权威源仍是 .comp）
+#include "merge_spv.h"            // A8-2：merge.comp（canvas+tip→display）预编译内嵌
 #else
 #include <shaderc/shaderc.hpp>
 #include "brush_composite_glsl.h"  // 由 CMake 从 brush_composite.comp 生成（单一权威源）
+#include "merge_glsl.h"            // A8-2：merge.comp 运行时 shaderc 编译源
 #endif
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -74,6 +76,38 @@ std::vector<uint32_t> CompileBrushShader(bool useDerivatives, std::string* err) 
     shaderc::SpvCompilationResult result = compiler.CompileGlslToSpv(
         kBrushCompositeGlsl, std::strlen(kBrushCompositeGlsl),
         shaderc_compute_shader, "brush_composite.comp", options);
+    if (result.GetCompilationStatus() != shaderc_compilation_status_success) {
+        if (err) {
+            *err = result.GetErrorMessage();
+        }
+        return {};
+    }
+    return std::vector<uint32_t>(result.begin(), result.end());
+#endif
+}
+
+// A8-2：merge.comp（canvas + tip → displayImage）全画布 over 合成 shader 编译。
+// 与 brush_composite 不同：无 derivative/fwidth、无 push constant（fullscreen 用
+// gl_GlobalInvocationID 直接当像素坐标 + 普通 vkCmdDispatch，对齐 Mali dispatch-base
+// gotcha），故两条路径都只需一次直接编译，无 useDerivatives 分支。
+std::vector<uint32_t> CompileMergeShader(std::string* err) {
+#ifdef DGCPAIN_PRECOMPILED_SPV
+    (void)err;  // 预编译 SPIR-V 无运行时编译错误路径
+    const size_t nbytes = sizeof(kMergeSpv);
+    static_assert(sizeof(kMergeSpv) % sizeof(uint32_t) == 0,
+                  "embedded merge SPIR-V byte array must be 4-byte aligned");
+    std::vector<uint32_t> spv(nbytes / sizeof(uint32_t));
+    std::memcpy(spv.data(), kMergeSpv, nbytes);
+    return spv;
+#else
+    shaderc::Compiler compiler;
+    shaderc::CompileOptions options;
+    options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1);
+    options.SetOptimizationLevel(shaderc_optimization_level_performance);
+    options.SetGenerateDebugInfo();
+    shaderc::SpvCompilationResult result = compiler.CompileGlslToSpv(
+        kMergeGlsl, std::strlen(kMergeGlsl),
+        shaderc_compute_shader, "merge.comp", options);
     if (result.GetCompilationStatus() != shaderc_compilation_status_success) {
         if (err) {
             *err = result.GetErrorMessage();
@@ -359,6 +393,28 @@ struct VkBackend::Impl {
     VkDeviceSize readbackSize = 0;
     bool readbackCached_ = false;  // 读回 buffer 用 HOST_CACHED 内存 → 读前须 invalidate
 
+    // ── A8-2 wet-tip 层 ──
+    // tipImage：预测 dab 的瞬态 storage（predictor 激活期显示，落笔/clear 清空）。
+    // tipDescriptorSet 与 descriptorSet 共用同一 descriptorPool（池句柄，无独立守卫），
+    // 只是 binding 0 指向 tipView——复用 brush_composite 管线，内核/shader 零改动。
+    VkDeviceHandle<VkImage, vkDestroyImage> tipImage;
+    VkDeviceHandle<VkDeviceMemory, vkFreeMemory> tipMemory;
+    VkDeviceHandle<VkImageView, vkDestroyImageView> tipView;
+    VkDescriptorSet tipDescriptorSet = VK_NULL_HANDLE;
+    bool tipHasContent_ = false;  // 有预测 dab 已画进 tipImage（merge 才需要读它）
+
+    // displayImage：merge（canvas+tip）输出的全画布 storage，读回源（有 tip 时）。
+    VkDeviceHandle<VkImage, vkDestroyImage> displayImage;
+    VkDeviceHandle<VkDeviceMemory, vkFreeMemory> displayMemory;
+    VkDeviceHandle<VkImageView, vkDestroyImageView> displayView;
+
+    // merge 管线（3 张 storage image：canvas/tip/display），无 push constant。
+    VkDeviceHandle<VkDescriptorSetLayout, vkDestroyDescriptorSetLayout> mergeDescriptorLayout;
+    VkDeviceHandle<VkPipelineLayout, vkDestroyPipelineLayout> mergePipelineLayout;
+    VkDeviceHandle<VkPipeline, vkDestroyPipeline> mergePipeline;
+    VkDeviceHandle<VkDescriptorPool, vkDestroyDescriptorPool> mergeDescriptorPool;
+    VkDescriptorSet mergeDescriptorSet = VK_NULL_HANDLE;
+
     // bugfix（20fps 回退）：readback 快照缓存 —— 渲染线程每次 composite/clear 完成后
     // "顺手"把画布发布进这里；VkBackend::readback() 只从这里 memcpy，不碰 GPU、不等
     // 渲染线程。cache_mutex_ 与上面串行化 GPU 提交的 mutex_（VkBackend 成员）分开，
@@ -602,11 +658,78 @@ struct VkBackend::Impl {
         pipeline.assign(device, pipe);
         vkDestroyShaderModule(device, module, nullptr);
 
+        // ── A8-2 merge 管线（canvas + tip → displayImage）fullscreen over 合成 ──
+        // 无 push constant：merge.comp 用 gl_GlobalInvocationID 直接当像素坐标 + 普通
+        // vkCmdDispatch（对齐 Mali dispatch-base gotcha，见 merge.comp 注释）。
+        {
+            std::array<VkDescriptorSetLayoutBinding, 3> mergeBindings{};
+            mergeBindings[0].binding = 0;
+            mergeBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            mergeBindings[0].descriptorCount = 1;
+            mergeBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            mergeBindings[1].binding = 1;
+            mergeBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            mergeBindings[1].descriptorCount = 1;
+            mergeBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            mergeBindings[2].binding = 2;
+            mergeBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            mergeBindings[2].descriptorCount = 1;
+            mergeBindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            VkDescriptorSetLayoutCreateInfo mlayoutInfo{};
+            mlayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            mlayoutInfo.bindingCount = (uint32_t)mergeBindings.size();
+            mlayoutInfo.pBindings = mergeBindings.data();
+            VkDescriptorSetLayout mdsl = VK_NULL_HANDLE;
+            vkCreateDescriptorSetLayout(device, &mlayoutInfo, nullptr, &mdsl);
+            mergeDescriptorLayout.assign(device, mdsl);
+
+            VkPipelineLayoutCreateInfo mplInfo{};
+            mplInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+            mplInfo.setLayoutCount = 1;
+            VkDescriptorSetLayout msetLayouts[] = {mergeDescriptorLayout};
+            mplInfo.pSetLayouts = msetLayouts;
+            mplInfo.pushConstantRangeCount = 0;
+            mplInfo.pPushConstantRanges = nullptr;
+            VkPipelineLayout mpl = VK_NULL_HANDLE;
+            vkCreatePipelineLayout(device, &mplInfo, nullptr, &mpl);
+            mergePipelineLayout.assign(device, mpl);
+
+            std::string merr;
+            std::vector<uint32_t> mspv = CompileMergeShader(&merr);
+            if (mspv.empty()) {
+                std::fprintf(stderr, "[VkBackend] merge shaderc compile failed: %s\n", merr.c_str());
+                return;
+            }
+            VkShaderModuleCreateInfo mmoduleInfo{};
+            mmoduleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            mmoduleInfo.codeSize = mspv.size() * sizeof(uint32_t);
+            mmoduleInfo.pCode = mspv.data();
+            VkShaderModule mmodule = VK_NULL_HANDLE;
+            if (vkCreateShaderModule(device, &mmoduleInfo, nullptr, &mmodule) != VK_SUCCESS) {
+                std::fprintf(stderr, "[VkBackend] vkCreateShaderModule(merge) failed\n");
+                return;
+            }
+            VkComputePipelineCreateInfo mpipeInfo{};
+            mpipeInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+            mpipeInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            mpipeInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            mpipeInfo.stage.module = mmodule;
+            mpipeInfo.stage.pName = "main";
+            mpipeInfo.layout = mergePipelineLayout;
+            VkPipeline mpipe = VK_NULL_HANDLE;
+            if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &mpipeInfo, nullptr, &mpipe) !=
+                VK_SUCCESS) {
+                std::fprintf(stderr, "[VkBackend] vkCreateComputePipelines(merge) failed\n");
+            }
+            mergePipeline.assign(device, mpipe);
+            vkDestroyShaderModule(device, mmodule, nullptr);
+        }
+
         deviceReady = true;
     }
 
     void DestroyCanvas() {
-        // descriptorPool 销毁 → 隐式释放 descriptorSet（池子句柄，无独立守卫）。
+        // descriptorPool 销毁 → 隐式释放 descriptorSet / tipDescriptorSet（池子句柄，无独立守卫）。
         descriptorPool.reset();
         descriptorSet = VK_NULL_HANDLE;
         canvasView.reset();
@@ -614,6 +737,17 @@ struct VkBackend::Impl {
         canvasMemory.reset();
         readbackBuffer.reset();
         readbackMemory.reset();
+        // A8-2：tip/display 资源 + merge descriptor pool 随画布一起重建/销毁。
+        tipDescriptorSet = VK_NULL_HANDLE;
+        tipView.reset();
+        tipImage.reset();
+        tipMemory.reset();
+        tipHasContent_ = false;
+        displayView.reset();
+        displayImage.reset();
+        displayMemory.reset();
+        mergeDescriptorPool.reset();
+        mergeDescriptorSet = VK_NULL_HANDLE;
         width = height = 0;
         readbackSize = 0;
         readbackCached_ = false;
@@ -646,6 +780,37 @@ struct VkBackend::Impl {
             return;
         }
 
+        // A8-2 tip 层：预测 dab 的瞬态 storage（同格式同尺寸）。需要 STORAGE（brush_composite
+        // 写）+ SAMPLED（merge 读）+ TRANSFER_DST（vkCmdClearColorImage 清）。
+        VkImage tipImg = VK_NULL_HANDLE;
+        VkDeviceMemory tipMem = VK_NULL_HANDLE;
+        CreateImage(device, physicalDevice, (uint32_t)w, (uint32_t)h, kCanvasFormat,
+                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                    VK_IMAGE_LAYOUT_GENERAL, tipImg, tipMem);
+        tipImage.assign(device, tipImg);
+        tipMemory.assign(device, tipMem);
+        tipView.assign(device, CreateImageView(device, tipImg, kCanvasFormat));
+        if (tipImg == VK_NULL_HANDLE || tipView == VK_NULL_HANDLE) {
+            std::fprintf(stderr, "[VkBackend] tip layer creation failed\n");
+            return;
+        }
+
+        // A8-2 display 层：merge（canvas+tip）输出的全画布 storage，读回源。
+        // STORAGE（merge 写）+ TRANSFER_SRC（CopyImageToBuffer 读）。
+        VkImage dispImg = VK_NULL_HANDLE;
+        VkDeviceMemory dispMem = VK_NULL_HANDLE;
+        CreateImage(device, physicalDevice, (uint32_t)w, (uint32_t)h, kCanvasFormat,
+                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                    VK_IMAGE_LAYOUT_GENERAL, dispImg, dispMem);
+        displayImage.assign(device, dispImg);
+        displayMemory.assign(device, dispMem);
+        displayView.assign(device, CreateImageView(device, dispImg, kCanvasFormat));
+        if (dispImg == VK_NULL_HANDLE || displayView == VK_NULL_HANDLE) {
+            std::fprintf(stderr, "[VkBackend] display image creation failed\n");
+            return;
+        }
+
         readbackSize = (VkDeviceSize)w * (VkDeviceSize)h * 4;
         VkBuffer rbuf = VK_NULL_HANDLE;
         VkDeviceMemory rmem = VK_NULL_HANDLE;
@@ -663,10 +828,10 @@ struct VkBackend::Impl {
 
         std::array<VkDescriptorPoolSize, 1> poolSizes{};
         poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        poolSizes[0].descriptorCount = 1;
+        poolSizes[0].descriptorCount = 2;  // A8-2：canvas + tip 两个 storage image 描述符
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        poolInfo.maxSets = 1;
+        poolInfo.maxSets = 2;
         poolInfo.poolSizeCount = (uint32_t)poolSizes.size();
         poolInfo.pPoolSizes = poolSizes.data();
         VkDescriptorPool dpool = VK_NULL_HANDLE;
@@ -676,22 +841,79 @@ struct VkBackend::Impl {
         VkDescriptorSetAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         allocInfo.descriptorPool = descriptorPool;
-        allocInfo.descriptorSetCount = 1;
-        VkDescriptorSetLayout setLayouts[] = {descriptorLayout};
+        allocInfo.descriptorSetCount = 2;
+        VkDescriptorSetLayout setLayouts[] = {descriptorLayout, descriptorLayout};
         allocInfo.pSetLayouts = setLayouts;
-        vkAllocateDescriptorSets(device, &allocInfo, &descriptorSet);
+        VkDescriptorSet sets[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+        vkAllocateDescriptorSets(device, &allocInfo, sets);
+        descriptorSet = sets[0];
+        tipDescriptorSet = sets[1];
 
         VkDescriptorImageInfo canvasInfo{};
         canvasInfo.imageView = canvasView;
         canvasInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        VkWriteDescriptorSet write{};
-        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        write.dstSet = descriptorSet;
-        write.dstBinding = 0;
-        write.descriptorCount = 1;
-        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        write.pImageInfo = &canvasInfo;
-        vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+        VkWriteDescriptorSet canvasWrite{};
+        canvasWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        canvasWrite.dstSet = descriptorSet;
+        canvasWrite.dstBinding = 0;
+        canvasWrite.descriptorCount = 1;
+        canvasWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        canvasWrite.pImageInfo = &canvasInfo;
+
+        VkDescriptorImageInfo tipInfo{};
+        tipInfo.imageView = tipView;
+        tipInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkWriteDescriptorSet tipWrite{};
+        tipWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        tipWrite.dstSet = tipDescriptorSet;
+        tipWrite.dstBinding = 0;
+        tipWrite.descriptorCount = 1;
+        tipWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        tipWrite.pImageInfo = &tipInfo;
+
+        VkWriteDescriptorSet writes[2] = {canvasWrite, tipWrite};
+        vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+
+        // A8-2 merge descriptor set：binding 0=canvas、1=tip、2=display。
+        {
+            std::array<VkDescriptorPoolSize, 1> mergePoolSizes{};
+            mergePoolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            mergePoolSizes[0].descriptorCount = 3;
+            VkDescriptorPoolCreateInfo mpoolInfo{};
+            mpoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+            mpoolInfo.maxSets = 1;
+            mpoolInfo.poolSizeCount = (uint32_t)mergePoolSizes.size();
+            mpoolInfo.pPoolSizes = mergePoolSizes.data();
+            VkDescriptorPool mpool = VK_NULL_HANDLE;
+            vkCreateDescriptorPool(device, &mpoolInfo, nullptr, &mpool);
+            mergeDescriptorPool.assign(device, mpool);
+
+            VkDescriptorSetAllocateInfo mAlloc{};
+            mAlloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            mAlloc.descriptorPool = mergeDescriptorPool;
+            mAlloc.descriptorSetCount = 1;
+            VkDescriptorSetLayout msetLayouts[] = {mergeDescriptorLayout};
+            mAlloc.pSetLayouts = msetLayouts;
+            vkAllocateDescriptorSets(device, &mAlloc, &mergeDescriptorSet);
+
+            VkDescriptorImageInfo mInfos[3]{};
+            mInfos[0].imageView = canvasView;
+            mInfos[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            mInfos[1].imageView = tipView;
+            mInfos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            mInfos[2].imageView = displayView;
+            mInfos[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            VkWriteDescriptorSet mWrites[3]{};
+            for (int i = 0; i < 3; ++i) {
+                mWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                mWrites[i].dstSet = mergeDescriptorSet;
+                mWrites[i].dstBinding = (uint32_t)i;
+                mWrites[i].descriptorCount = 1;
+                mWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                mWrites[i].pImageInfo = &mInfos[i];
+            }
+            vkUpdateDescriptorSets(device, 3, mWrites, 0, nullptr);
+        }
 
         canvasReady = true;
 
@@ -730,7 +952,7 @@ struct VkBackend::Impl {
         vkBeginCommandBuffer(commandBuffer, &begin);
     }
 
-    void CompositeLocked(const std::vector<StampData>& stamps) {
+    void CompositeLocked(const std::vector<StampData>& stamps, bool predicted) {
         if (!canvasReady) {
             return;
         }
@@ -758,9 +980,38 @@ struct VkBackend::Impl {
 #endif
         BeginCommands();
         // 每 stamp 只变 push constant；pipeline/descriptor 绑定提出循环（避免逐 dab 重绑）。
+        // A8-2：predicted 批绑定 tip 描述符（binding 0 指向 tipView），复用同一 brush 管线。
+        const VkDescriptorSet ds = predicted ? tipDescriptorSet : descriptorSet;
+        VkImage targetImage = predicted ? tipImage.get() : canvasImage.get();
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0,
-                                1, &descriptorSet, 0, nullptr);
+                                1, &ds, 0, nullptr);
+        if (predicted) {
+            // 预测批每次重推前先清 tipImage（旧预测尖作废），再画当批。clear 是 transfer 写、
+            // 后续 dispatch 是 shader 读，同 command buffer 内需一次 barrier。
+            VkClearColorValue clear{};
+            VkImageSubresourceRange range{};
+            range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            range.baseMipLevel = 0;
+            range.levelCount = 1;
+            range.baseArrayLayer = 0;
+            range.layerCount = 1;
+            vkCmdClearColorImage(commandBuffer, tipImage, VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
+                                 &range);
+            VkImageMemoryBarrier clearBarrier{};
+            clearBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            clearBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            clearBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            clearBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            clearBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            clearBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            clearBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            clearBarrier.image = tipImage;
+            clearBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+                                 1, &clearBarrier);
+        }
         size_t dispatches = 0;
         for (const StampData& s : stamps) {
             BrushPushConstant pc{};
@@ -820,7 +1071,7 @@ struct VkBackend::Impl {
             barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
             barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.image = canvasImage;
+            barrier.image = targetImage;
             barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
@@ -843,6 +1094,11 @@ struct VkBackend::Impl {
             initCaptureOpen_ = false;
         }
 #endif
+        // A8-2：预测批提交完成后置位 tipHasContent_，读回快照才会走 merge 路径。
+        // 真实批不置位（tip 内容不变）。
+        if (predicted) {
+            tipHasContent_ = true;
+        }
         // bugfix（20fps 回退）：composite 批提交完成后顺手发布快照，供 readback() 直接
         // memcpy——放在 RenderDoc capture 窗口结束之后，不把这次内部拷贝计入抓帧。
         //
@@ -877,10 +1133,44 @@ struct VkBackend::Impl {
         range.baseArrayLayer = 0;
         range.layerCount = 1;
         vkCmdClearColorImage(commandBuffer, canvasImage, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+        // A8-2：dgcClear 同清 tip 层（预测尖一并丢弃）。
+        VkClearColorValue tipClear{};
+        vkCmdClearColorImage(commandBuffer, tipImage, VK_IMAGE_LAYOUT_GENERAL, &tipClear, 1,
+                             &range);
         SubmitAndWait();
+        tipHasContent_ = false;
         // 清屏后画布内容立即变化，快照缓存必须同步刷新，否则 readback() 在下一次
         // composite 之前会一直读到清屏前的旧内容。
         RefreshReadbackCacheLocked();
+    }
+
+    // A8-2：endStroke 清 tip（丢弃预测尖）。渲染线程 FIFO 顺序保证在所有预测批 composite
+    // 之后才被调（engine clearTip 批）。清完刷新读回快照，使落笔后显示立即回到纯真实墨。
+    void ClearTipLocked() {
+        if (!canvasReady) {
+            return;
+        }
+        const bool hadTip = tipHasContent_;
+        if (hadTip) {
+            BeginCommands();
+            VkClearColorValue clear{};
+            VkImageSubresourceRange range{};
+            range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            range.baseMipLevel = 0;
+            range.levelCount = 1;
+            range.baseArrayLayer = 0;
+            range.layerCount = 1;
+            vkCmdClearColorImage(commandBuffer, tipImage, VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
+                                 &range);
+            SubmitAndWait();
+        }
+        tipHasContent_ = false;
+        // 落笔后 tip 消失，读回快照必须同步回纯真实（否则 cache_ 仍残留 merge 过的 tip）。
+        // 仅当此前确有 tip 才付这次 GPU 拷贝；prediction OFF 路径（tipHasContent_ 恒 false）
+        // 零额外开销，不改变 test_snapshot_refresh_throttle 的刷新计数。
+        if (hadTip) {
+            RefreshReadbackCacheLocked();
+        }
     }
 
     void ReadbackLocked(void* rgbaOut) {
@@ -944,6 +1234,31 @@ struct VkBackend::Impl {
         ++snapshotRefreshCount_;  // 每次实际快照拷贝 +1（test hook，仅测试构建）。
 #endif
         BeginCommands();
+        // A8-2：有 tip 时先 fullscreen merge（canvas+tip → displayImage），读回源改为
+        // displayImage；无 tip 时读回源仍为 canvasImage（与改造前逐位一致、零额外 GPU 拷贝）。
+        VkImage srcImage = canvasImage.get();
+        if (tipHasContent_) {
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, mergePipeline);
+            vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    mergePipelineLayout, 0, 1, &mergeDescriptorSet, 0, nullptr);
+            vkCmdDispatch(commandBuffer, (uint32_t)((width + 7) / 8),
+                          (uint32_t)((height + 7) / 8), 1);
+            // merge 写 displayImage（shader write）→ CopyImageToBuffer 读（transfer read）。
+            VkImageMemoryBarrier mergeBarrier{};
+            mergeBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            mergeBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            mergeBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            mergeBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            mergeBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            mergeBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            mergeBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            mergeBarrier.image = displayImage;
+            mergeBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                 &mergeBarrier);
+            srcImage = displayImage.get();
+        }
         VkBufferImageCopy region{};
         region.bufferOffset = 0;
         region.bufferRowLength = 0;
@@ -954,7 +1269,7 @@ struct VkBackend::Impl {
         region.imageSubresource.layerCount = 1;
         region.imageOffset = {0, 0, 0};
         region.imageExtent = {(uint32_t)width, (uint32_t)height, 1};
-        vkCmdCopyImageToBuffer(commandBuffer, canvasImage, VK_IMAGE_LAYOUT_GENERAL, readbackBuffer,
+        vkCmdCopyImageToBuffer(commandBuffer, srcImage, VK_IMAGE_LAYOUT_GENERAL, readbackBuffer,
                                1, &region);
         SubmitAndWait();
         void* data = nullptr;
@@ -992,6 +1307,9 @@ struct VkBackend::Impl {
         pipeline.reset();
         pipelineLayout.reset();
         descriptorLayout.reset();
+        mergePipeline.reset();
+        mergePipelineLayout.reset();
+        mergeDescriptorLayout.reset();
         commandPool.reset();
         commandBuffer = VK_NULL_HANDLE;
         device.reset();
@@ -1028,9 +1346,14 @@ void VkBackend::beginFrame() {
     // 离屏无需每帧 begin/end。
 }
 
-void VkBackend::composite(const std::vector<StampData>& stamps) {
+void VkBackend::composite(const std::vector<StampData>& stamps, bool predicted) {
     std::lock_guard<std::mutex> lock(mutex_);
-    impl_->CompositeLocked(stamps);
+    impl_->CompositeLocked(stamps, predicted);
+}
+
+void VkBackend::clearTip() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    impl_->ClearTipLocked();
 }
 
 void VkBackend::clearCanvas(float r, float g, float b, float a) {

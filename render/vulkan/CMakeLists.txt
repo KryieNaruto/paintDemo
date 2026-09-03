@@ -73,6 +73,22 @@ if(DGCPAIN_ANDROID)
     string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," SPV_C_ARRAY "${_spv}")
     configure_file(${CMAKE_CURRENT_SOURCE_DIR}/brush_composite_spv.h.in
                    ${CMAKE_CURRENT_BINARY_DIR}/brush_composite_spv.h @ONLY)
+
+    # A8-2：merge.comp（canvas+tip→display）同款预编译 SPIR-V + 内嵌头。
+    execute_process(
+        COMMAND ${GLSLC_BIN} -g -fshader-stage=compute
+            ${CMAKE_CURRENT_SOURCE_DIR}/merge.comp
+            -o ${CMAKE_CURRENT_BINARY_DIR}/merge.spv
+        RESULT_VARIABLE _merge_glslc_rc
+        OUTPUT_VARIABLE _merge_glslc_out
+        ERROR_VARIABLE _merge_glslc_err)
+    if(NOT _merge_glslc_rc EQUAL 0)
+        message(FATAL_ERROR "glslc failed compiling merge.comp:\n${_merge_glslc_err}")
+    endif()
+    file(READ ${CMAKE_CURRENT_BINARY_DIR}/merge.spv _merge_spv HEX)
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," MERGE_SPV_C_ARRAY "${_merge_spv}")
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/merge_spv.h.in
+                   ${CMAKE_CURRENT_BINARY_DIR}/merge_spv.h @ONLY)
     target_compile_definitions(dgc_paint PRIVATE DGCPAIN_PRECOMPILED_SPV=1)
 else()
     # ── host：运行时 shaderc 编译（B2-1 不变）──
@@ -98,6 +114,11 @@ else()
     file(READ ${CMAKE_CURRENT_SOURCE_DIR}/brush_composite.comp GLSL_SOURCE)
     configure_file(${CMAKE_CURRENT_SOURCE_DIR}/brush_composite_glsl.h.in
                    ${CMAKE_CURRENT_BINARY_DIR}/brush_composite_glsl.h @ONLY)
+
+    # A8-2：merge.comp 内嵌头（运行时 shaderc 编译；复用 @GLSL_SOURCE@ 占位符）。
+    file(READ ${CMAKE_CURRENT_SOURCE_DIR}/merge.comp GLSL_SOURCE)
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/merge_glsl.h.in
+                   ${CMAKE_CURRENT_BINARY_DIR}/merge_glsl.h @ONLY)
 
     target_include_directories(dgc_paint PRIVATE ${SHADERC_INCLUDE_DIR})
     target_link_libraries(dgc_paint PRIVATE ${SHADERC_LIBRARY})

@@ -73,7 +73,7 @@ public:
     void init(PlatformSurface, int, int) override {}
     void resize(int, int) override {}
     void beginFrame() override {}
-    void composite(const std::vector<StampData>& stamps) override {
+    void composite(const std::vector<StampData>& stamps, bool) override {
         std::this_thread::sleep_for(std::chrono::microseconds(700));
         ++compositeCalls;
         totalStamps.fetch_add(stamps.size(), std::memory_order_relaxed);
