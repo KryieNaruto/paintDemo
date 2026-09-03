@@ -27,6 +27,9 @@ struct Vec2 {
     double y = 0.0;
 };
 
+// 模平方（减速不过冲用：比较卡尔曼 v 与最近真实速度的大小，取较小者作外推速度）。
+static double Norm2(const Vec2& v) { return v.x * v.x + v.y * v.y; }
+
 // ── WobbleSmoother ──────────────────────────────────────────────────────────
 // 镜像 ink_stroke_modeler::WobbleSmoother：低通滤波（运动）→ 时间变权移动平均
 // （静止 dwell 分支累积平均）。抑制手抖（高频分量）。
@@ -402,7 +405,27 @@ void StrokeModeler::Update(const StrokePoint& raw, std::vector<StrokePoint>* out
     for (const StrokePoint& r : resampled) {
         StrokePoint pos = impl_->position_.Update(r);
         impl_->kalman_.Update(pos);
-        impl_->end_pred_.Update(pos, impl_->kalman_.velocity());
+        // 减速不过冲（bugfix-prediction-decel）：喂给 StrokeEndPredictor 的停笔点速度取
+        // 「卡尔曼 v 与最近真实速度的较小者」。稳态运动两者≈相等 → 停笔点保留 v·interval
+        // 量级；减速/停笔时真实位移坍缩 → 停笔点随之坍缩，不留下越出真实轨迹的永久凸尾
+        // （预测点永久合墨、无擦除）。最近真实速度 = (本 pos − 前一个真实输出)/Δt；
+        // Δt 乱序/0 时退化卡尔曼 v。
+        const Vec2 v_k = impl_->kalman_.velocity();
+        Vec2 v_eff = v_k;
+        if (impl_->has_output_) {
+            const std::uint64_t d = (pos.t_us >= impl_->last_output_.t_us)
+                                        ? pos.t_us - impl_->last_output_.t_us
+                                        : 0u;
+            if (d > 0u) {
+                Vec2 v_t;
+                v_t.x = (double(pos.x) - double(impl_->last_output_.x)) / (double(d) / 1e6);
+                v_t.y = (double(pos.y) - double(impl_->last_output_.y)) / (double(d) / 1e6);
+                if (Norm2(v_t) < Norm2(v_k)) {
+                    v_eff = v_t;
+                }
+            }
+        }
+        impl_->end_pred_.Update(pos, v_eff);
         if (impl_->has_output_) {  // 已存在前一个真实输出：滚动窗口供机制 A 判据用
             impl_->prev_output_ = impl_->last_output_;
             impl_->has_prev_ = true;
@@ -419,7 +442,29 @@ void StrokeModeler::Predict(std::vector<StrokePoint>* out) {
         return;
     }
     const StrokePoint& last = impl_->last_output_;
-    const Vec2 v = impl_->kalman_.velocity();
+    const Vec2 v_kalman = impl_->kalman_.velocity();
+
+    // 减速不过冲（bugfix-prediction-decel）：外推速度取「卡尔曼 v 与最近真实速度的较小者」。
+    // 稳态运动两者≈相等 → 保留 v·interval 领先；减速/停笔时最近真实位移坍缩 → v_pred 随之
+    // 坍缩，末批预测点落在最近真实点附近，不留下越出真实轨迹的永久凸尾（预测点永久合墨、
+    // 无擦除）。最近真实速度 = (last_output_ − prev_output_)/Δt；无 prev / Δt 乱序时退化
+    // 卡尔曼 v。
+    // 注意：外推用 v_pred，但机制 A 的转向夹角门仍用 v_kalman —— 只有滞后的卡尔曼 v 才能
+    // 暴露高曲率转角（v_pred 在减速段≈真实位移方向，夹角≈0 会漏拦转角，回归凸点）。
+    Vec2 v_pred = v_kalman;
+    if (impl_->has_prev_) {
+        const std::uint64_t d = (last.t_us >= impl_->prev_output_.t_us)
+                                    ? last.t_us - impl_->prev_output_.t_us
+                                    : 0u;
+        if (d > 0u) {
+            Vec2 v_true;
+            v_true.x = (double(last.x) - double(impl_->prev_output_.x)) / (double(d) / 1e6);
+            v_true.y = (double(last.y) - double(impl_->prev_output_.y)) / (double(d) / 1e6);
+            if (Norm2(v_true) < Norm2(v_kalman)) {
+                v_pred = v_true;
+            }
+        }
+    }
 
     const double period_us = 1e6 / double(impl_->params_.min_output_rate_hz);
     const double interval_us = impl_->params_.prediction_interval_ms * 1000.0;
@@ -441,6 +486,8 @@ void StrokeModeler::Predict(std::vector<StrokePoint>* out) {
     //   θ = ∠(d, v)（无符号，atan2(|d×v|, d·v)）。
     // 直线/低曲率段 v≈真实切线 → θ≈0，照常走下方 v·interval 领先；90° 转角/高曲率处
     // v 滞后真实切线 → θ>50°，本轮不产出任何预测点（uniform 外推与停笔点一起抑制）。
+    // 夹角门用 v_kalman（而非外推的 v_pred）——减速段 v_pred≈真实位移方向，用它判夹角
+    // 会把转角漏放成凸点（bugfix-prediction-decel 归位）。
     //
     // 注：不加「卡尔曼 |v| < 阈值」无条件早退——会在笔划起步 ~40ms（卡尔曼速度未收敛
     // 暂态）把 Predict 拦空，违反「has_output_ 后产出领先点」契约并打回 test_stroke_predictor
@@ -450,8 +497,8 @@ void StrokeModeler::Predict(std::vector<StrokePoint>* out) {
         const double dx = double(last.x) - double(impl_->prev_output_.x);
         const double dy = double(last.y) - double(impl_->prev_output_.y);
         if (dx != 0.0 || dy != 0.0) {
-            const double cross = dx * v.y - dy * v.x;
-            const double dot = dx * v.x + dy * v.y;
+            const double cross = dx * v_kalman.y - dy * v_kalman.x;
+            const double dot = dx * v_kalman.x + dy * v_kalman.y;
             const double lagDeg = std::atan2(std::fabs(cross), dot) * 180.0 / kPi;
             if (lagDeg > 40.0) {  // 启动阈值(CALIB40)；校准带 40°–60°，零越框白盒断言为门
                 return;
@@ -467,8 +514,8 @@ void StrokeModeler::Predict(std::vector<StrokePoint>* out) {
     for (std::uint64_t k = 1; k <= n; ++k) {
         const double dt_s = double(k) * period_us / 1e6;
         StrokePoint p = last;
-        p.x = float(last.x + v.x * dt_s);
-        p.y = float(last.y + v.y * dt_s);
+        p.x = float(last.x + v_pred.x * dt_s);
+        p.y = float(last.y + v_pred.y * dt_s);
         p.t_us = last.t_us + std::uint64_t(k * period_us);
         p.is_predicted = true;
         out->push_back(p);

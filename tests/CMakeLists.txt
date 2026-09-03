@@ -214,3 +214,10 @@ add_executable(test_predictor_corner_clean test_predictor_corner_clean.cpp)
 target_include_directories(test_predictor_corner_clean PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(test_predictor_corner_clean PRIVATE dgc_paint)
 add_test(NAME test_predictor_corner_clean COMMAND test_predictor_corner_clean)
+
+# bugfix-prediction-decel 正式回归：预测「开」快速直线减速到停，外推尾不越出真实轨迹。
+# 纯 CPU 白盒（A 越界尾 ≤ max(8px, 25%*v*interval) + B 稳态领先守卫），两档速度。
+add_executable(test_predictor_decel_clean test_predictor_decel_clean.cpp)
+target_include_directories(test_predictor_decel_clean PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_predictor_decel_clean PRIVATE dgc_paint)
+add_test(NAME test_predictor_decel_clean COMMAND test_predictor_decel_clean)
