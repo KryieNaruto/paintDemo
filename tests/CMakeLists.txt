@@ -207,3 +207,10 @@ if(DGCPAIN_BUILD_CLI AND TARGET dgc_cli)
     add_dependencies(test_cli dgc_cli)
     add_test(NAME test_cli COMMAND test_cli)
 endif()
+
+# bugfix-prediction-clean 正式回归：预测「开/关」两态转角干净可逆。
+# 白盒几何硬门恒跑（纯 CPU 确定性）；PNG 五态越界墨 ≈ P 在离屏后端可用时跑。
+add_executable(test_predictor_corner_clean test_predictor_corner_clean.cpp)
+target_include_directories(test_predictor_corner_clean PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_predictor_corner_clean PRIVATE dgc_paint)
+add_test(NAME test_predictor_corner_clean COMMAND test_predictor_corner_clean)
