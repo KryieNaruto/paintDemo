@@ -89,6 +89,15 @@ if(DGCPAIN_ANDROID)
     string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," MERGE_SPV_C_ARRAY "${_merge_spv}")
     configure_file(${CMAKE_CURRENT_SOURCE_DIR}/merge_spv.h.in
                    ${CMAKE_CURRENT_BINARY_DIR}/merge_spv.h @ONLY)
+    # 回归：merge_spv.h 必须内嵌 merge.spv 的字节，不是 brush_composite 的。模板
+    # merge_spv.h.in 若误用 @SPV_C_ARRAY@（brush 变量）会灌进 brush 的 SPIR-V，导致
+    # merge 管线在 Mali 上编译失败 → 预测激活时绑空管线崩溃（见 A8-2 真机 SIGSEGV）。
+    file(READ ${CMAKE_CURRENT_BINARY_DIR}/merge_spv.h _merge_hdr)
+    string(FIND "${_merge_hdr}" "${MERGE_SPV_C_ARRAY}" _merge_spv_pos)
+    if(_merge_spv_pos EQUAL -1)
+        message(FATAL_ERROR
+            "merge_spv.h 内嵌 SPIR-V 与 merge.spv 不一致（merge_spv.h.in 变量串用回归）")
+    endif()
     target_compile_definitions(dgc_paint PRIVATE DGCPAIN_PRECOMPILED_SPV=1)
 else()
     # ── host：运行时 shaderc 编译（B2-1 不变）──
