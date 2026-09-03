@@ -18,6 +18,10 @@
 
 namespace {
 
+// 跨平台 π（审阅建议 1）：M_PI 在 MSVC（无 _USE_MATH_DEFINES）与 Android bionic
+// 头文件间可用性不一致；std::acos 又非标准 constexpr（MSVC 拒编）。用字面量最稳。
+constexpr double kPi = 3.14159265358979323846;
+
 struct Vec2 {
     double x = 0.0;
     double y = 0.0;
@@ -345,6 +349,8 @@ struct StrokeModeler::Impl {
         end_pred_.Reset();
         has_output_ = false;
         last_output_ = {};
+        has_prev_ = false;
+        prev_output_ = {};
     }
 
     std::mutex mutex_;  // 守卫以下全部状态；四个公开方法各自加锁，互斥执行。
@@ -360,6 +366,12 @@ struct StrokeModeler::Impl {
     // last_output_，Predict 只从 last_output_ 重外推，故「真实点到达即覆盖同段预测点」。
     bool has_output_ = false;
     StrokePoint last_output_{};  // 最近一次 Update 产出的真实点（Predict 外推基准）
+
+    // 机制 A 的极小窗口状态：最近 2 个真实输出。判据用「最近真实行进方向」=
+    // last_output_ − prev_output_ 与卡尔曼 v 的夹角检测高曲率/转向（预测外溢根因）。
+    // 必须随 ResetLocked() 清零（可逆/确定性）；无任何跨笔画 latch / 计数器。
+    bool has_prev_ = false;
+    StrokePoint prev_output_{};  // Update() 每次推真实点时滚动成前一个
 };
 
 StrokeModeler::StrokeModeler() : impl_(std::make_unique<Impl>()) {
@@ -391,6 +403,10 @@ void StrokeModeler::Update(const StrokePoint& raw, std::vector<StrokePoint>* out
         StrokePoint pos = impl_->position_.Update(r);
         impl_->kalman_.Update(pos);
         impl_->end_pred_.Update(pos, impl_->kalman_.velocity());
+        if (impl_->has_output_) {  // 已存在前一个真实输出：滚动窗口供机制 A 判据用
+            impl_->prev_output_ = impl_->last_output_;
+            impl_->has_prev_ = true;
+        }
         impl_->last_output_ = pos;
         impl_->has_output_ = true;
         out->push_back(pos);
@@ -407,6 +423,42 @@ void StrokeModeler::Predict(std::vector<StrokePoint>* out) {
 
     const double period_us = 1e6 / double(impl_->params_.min_output_rate_hz);
     const double interval_us = impl_->params_.prediction_interval_ms * 1000.0;
+
+    // ── 机制 B（OFF，审阅建议 4：置于 has_output_ 检查之后，首点行为两态一致）──
+    // interval<=0 → Predict 完全旁通：不产出任何均匀外推点，也不追加
+    // StrokeEndPredictor 停笔点（旧逻辑 :411-414 的 n=0→1 与 :425-431 无条件停笔点
+    // 两条路径都会被这里挡住）。Update() 不受影响（平滑照常），OFF 输出 = 纯真实
+    // 平滑点。正的小 interval（如 1ms）仍走下方既有 n 计算（n=0→1 兜底保留给
+    // (0, period) 正区间，不动 test_modeler_param_changes_output 的 1ms 分支预期）。
+    if (interval_us <= 0.0) {
+        return;
+    }
+
+    // ── 机制 A（抑制高曲率/转向处外推）──
+    // 本引擎把每个预测点永久合进墨（无擦除），故任何「方向偏离真实轨迹」的预测都会
+    // 在转角留下抹不掉的凸点。判据 = 卡尔曼 v 方向是否还贴着最近真实行进方向：
+    //   last_output_ − prev_output_ = 最近真实位移方向 d；
+    //   θ = ∠(d, v)（无符号，atan2(|d×v|, d·v)）。
+    // 直线/低曲率段 v≈真实切线 → θ≈0，照常走下方 v·interval 领先；90° 转角/高曲率处
+    // v 滞后真实切线 → θ>50°，本轮不产出任何预测点（uniform 外推与停笔点一起抑制）。
+    //
+    // 注：不加「卡尔曼 |v| < 阈值」无条件早退——会在笔划起步 ~40ms（卡尔曼速度未收敛
+    // 暂态）把 Predict 拦空，违反「has_output_ 后产出领先点」契约并打回 test_stroke_predictor
+    // 直线暖机样本。低速/停笔时 v→0，外推点自然坍缩到最近真实点附近（延伸 ∝ v），
+    // 不会留下外凸漂移点，转角凸点由下方夹角门（机制 A）+ 机制 B 负责。
+    if (impl_->has_prev_) {
+        const double dx = double(last.x) - double(impl_->prev_output_.x);
+        const double dy = double(last.y) - double(impl_->prev_output_.y);
+        if (dx != 0.0 || dy != 0.0) {
+            const double cross = dx * v.y - dy * v.x;
+            const double dot = dx * v.x + dy * v.y;
+            const double lagDeg = std::atan2(std::fabs(cross), dot) * 180.0 / kPi;
+            if (lagDeg > 40.0) {  // 启动阈值(CALIB40)；校准带 40°–60°，零越框白盒断言为门
+                return;
+            }
+        }
+    }
+
     // 均匀外推点数：预测区间内按 min_output_rate 布点（至少 1 个）。
     std::uint64_t n = std::uint64_t(interval_us / period_us);
     if (n == 0) {
