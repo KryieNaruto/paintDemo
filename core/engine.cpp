@@ -460,6 +460,17 @@ void Engine::renderLoop() {
             const bool overCap = batchStampCount >= kMaxBatchStamps ||
                                   (now - batchStart) >= kMaxBatchDurationMs;
             if (overCap || (haveRequest && intervalOk)) {
+#ifdef DGCPAIN_PERF
+                const double waitMs =
+                    std::chrono::duration<double, std::milli>(now - batchStart).count();
+                const bool byStampCap = batchStampCount >= kMaxBatchStamps;
+                const bool byTimeCap = (now - batchStart) >= kMaxBatchDurationMs;
+                std::fprintf(stderr,
+                             "[PERF] batch-wait=%.3fms stamps=%zu byStampCap=%d "
+                             "byTimeCap=%d byRequest=%d\n",
+                             waitMs, batchStampCount, int(byStampCap), int(byTimeCap),
+                             int(haveRequest && intervalOk));
+#endif
                 // 仅在“本次确实要 flush”时才消费该请求：overCap 触发时若 haveRequest
                 // 也为真，说明这次 flush 同样满足了那次 catch-up 诉求，一并清零；
                 // 未触发 flush 时绝不清零，保证请求不被静默丢弃（P7-2 硬要求）。
