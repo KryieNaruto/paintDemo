@@ -227,3 +227,10 @@ add_executable(test_predictor_decel_clean test_predictor_decel_clean.cpp)
 target_include_directories(test_predictor_decel_clean PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(test_predictor_decel_clean PRIVATE dgc_paint)
 add_test(NAME test_predictor_decel_clean COMMAND test_predictor_decel_clean)
+
+# bugfix-prediction-curve-overshoot 正式回归：预测「开」中等曲率圆弧处切线外推径向越界
+# （瞬态毛边）≤ 3px + 领先守卫。纯 CPU 白盒（无 GPU 依赖），无条件构建/跑。
+add_executable(test_predictor_curve_overshoot test_predictor_curve_overshoot.cpp)
+target_include_directories(test_predictor_curve_overshoot PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_predictor_curve_overshoot PRIVATE dgc_paint)
+add_test(NAME test_predictor_curve_overshoot COMMAND test_predictor_curve_overshoot)
