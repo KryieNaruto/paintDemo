@@ -57,6 +57,18 @@ constexpr auto kMinSnapshotRefreshIntervalNs =
 
 }  // namespace
 
+void CompositeOrdered(IRenderBackend* backend, std::vector<StampData>* predStamps,
+                      std::vector<StampData>* realStamps) {
+    if (!predStamps->empty()) {
+        backend->composite(*predStamps, /*predicted=*/true);
+        predStamps->clear();
+    }
+    if (!realStamps->empty()) {
+        backend->composite(*realStamps, /*predicted=*/false);
+        realStamps->clear();
+    }
+}
+
 Engine::Engine(IPaintKernel* kernel, IRenderBackend* backend)
     : kernel_(kernel), backend_(backend) {}
 
@@ -413,14 +425,7 @@ void Engine::renderLoop() {
         predStamps.reserve(predTotal);
 
         auto flushAccum = [&]() {
-            if (!realStamps.empty()) {
-                backend_->composite(realStamps, /*predicted=*/false);
-                realStamps.clear();
-            }
-            if (!predStamps.empty()) {
-                backend_->composite(predStamps, /*predicted=*/true);
-                predStamps.clear();
-            }
+            CompositeOrdered(backend_, &predStamps, &realStamps);
         };
 #ifdef DGCPAIN_PERF
         auto r0 = std::chrono::steady_clock::now();

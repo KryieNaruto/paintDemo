@@ -16,6 +16,15 @@ class IPaintKernel;
 class IRenderBackend;
 class StrokeModeler;
 
+// bugfix-stale-tip（白盒可测）：预测批必须先于真实批 composite。VkBackend::CompositeLocked()
+// 每次 composite() 结尾都会检查一个跨两次调用共享的原子刷新标志，谁先执行到检查点谁就把它
+// 消费掉；若真实批先于预测批执行、又恰好消费了该标志，读回合成用的是「上一批」残留的旧
+// tip（预测尖显示慢半拍）。预测批先行可保证无论标志被哪次调用消费，tipImage/tipHasContent_
+// 都已反映本批最新内容。定义于 core/engine.cpp，此处声明供 Engine::renderLoop() 内部调用，
+// 也供 tests/test_engine_composite_order.cpp 白盒单测（不经三线程，直接传受控 stamp 向量）。
+void CompositeOrdered(IRenderBackend* backend, std::vector<StampData>* predStamps,
+                      std::vector<StampData>* realStamps);
+
 // 输入事件：内核线程的 beginStroke/endStroke 有状态，必须在内核线程执行，
 // 故输入队列元素是完整事件（含 Begin/Point/End）而非裸 StrokePoint。
 enum class StrokeEventType { BeginStroke, StrokePoint, EndStroke };
