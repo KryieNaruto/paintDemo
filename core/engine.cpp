@@ -7,6 +7,17 @@
 #include "core/interfaces/i_render_backend.h"
 #include "core/stroke_predictor.h"
 
+#if defined(DGCPAIN_PERF) && defined(__ANDROID__)
+// 诊断专用：真机「user」固件不转发 native stderr 进 logcat（fprintf 无输出），改用
+// Android 原生日志 API（走系统日志服务，不受 stdio 重定向策略影响）。仅诊断构建
+// （DGCPAIN_PERF 开）+ Android 平台生效，host/其他平台仍用原 fprintf。
+#include <android/log.h>
+#define DGCPAIN_PERF_LOG(...) \
+    __android_log_print(ANDROID_LOG_INFO, "DGCPAIN_PERF", __VA_ARGS__)
+#else
+#define DGCPAIN_PERF_LOG(...) std::fprintf(stderr, __VA_ARGS__)
+#endif
+
 namespace {
 
 // 外部入队边界上限：pending_input_ 超过该值即返回 false（调用方可重试/丢弃），
@@ -428,10 +439,10 @@ void Engine::renderLoop() {
         backend_->present();
 #ifdef DGCPAIN_PERF
         auto r1 = std::chrono::steady_clock::now();
-        std::fprintf(stderr,
-                     "[PERF] engine::renderLoop composite=%.3f ms real=%zu pred=%zu batches=%zu\n",
-                     std::chrono::duration<double, std::milli>(r1 - r0).count(),
-                     realTotal, predTotal, batch.size());
+        DGCPAIN_PERF_LOG(
+            "[PERF] engine::renderLoop composite=%.3f ms real=%zu pred=%zu batches=%zu\n",
+            std::chrono::duration<double, std::milli>(r1 - r0).count(), realTotal, predTotal,
+            batch.size());
 #endif
         // B5-2/D6-1：每合批提交一轮后按「外部提交计数」递增 composited_
         // （release，供 flush 屏障 acquire 追平），而非批内条目总数。
@@ -465,11 +476,11 @@ void Engine::renderLoop() {
                     std::chrono::duration<double, std::milli>(now - batchStart).count();
                 const bool byStampCap = batchStampCount >= kMaxBatchStamps;
                 const bool byTimeCap = (now - batchStart) >= kMaxBatchDurationMs;
-                std::fprintf(stderr,
-                             "[PERF] batch-wait=%.3fms stamps=%zu byStampCap=%d "
-                             "byTimeCap=%d byRequest=%d\n",
-                             waitMs, batchStampCount, int(byStampCap), int(byTimeCap),
-                             int(haveRequest && intervalOk));
+                DGCPAIN_PERF_LOG(
+                    "[PERF] batch-wait=%.3fms stamps=%zu byStampCap=%d "
+                    "byTimeCap=%d byRequest=%d\n",
+                    waitMs, batchStampCount, int(byStampCap), int(byTimeCap),
+                    int(haveRequest && intervalOk));
 #endif
                 // 仅在“本次确实要 flush”时才消费该请求：overCap 触发时若 haveRequest
                 // 也为真，说明这次 flush 同样满足了那次 catch-up 诉求，一并清零；
