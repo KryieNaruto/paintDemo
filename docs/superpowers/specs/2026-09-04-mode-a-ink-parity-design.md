@@ -171,3 +171,64 @@
 设计新方案——按 §6 范围边界，管线延迟的进一步定位与曲率感知预测模型均留作后续独立任务
 （需要真机插桩+连续绘制场景下的合并命中率实测，作为下一轮 brainstorm 的输入）。4c 的
 stale-tip 修复本身仍然是有效且独立成立的正确性修复，不因 4d 未达标而回退。
+
+## 8. A8-3 Phase 0 验证结论（候选①host 侧核验完成；候选②/§5.1 真机数据待补）
+
+`docs/plans/A8-3.md` 的 Phase 0 承接本节 §7 留下的三个候选根因，逐条核验：
+
+### 8.1 候选①（4a 合并命中率在高频读回下是否退化）—— host 侧核验：证伪
+
+新增 `tests/test_readback_merge_under_load.cpp`（`DGCPAIN_TEST_HOOKS` 门控，ctest 注册名
+`test_readback_merge_under_load`）：在 `test_snapshot_refresh_throttle.cpp` 的 24 线连续
+stroke 场景基础上，**中途每 8 个笔点插入一次 `dgcReadbackPixels`**（整段笔画共 753 次高频
+交织读回，远高于消费端 `ReadbackScheduler` 现有 16ms 节流下单笔画的实际读回密度），断言
+`dgcTestSubmitAndWaitCount(ctx) - dgcTestCompositeCount(ctx)` 的增量不随读回调用次数
+线性增长。
+
+**实测结果**（host，`-DDGCPAIN_TEST_HOOKS=ON`，Debug + `-DDGCPAIN_SANITIZE=ON` 均跑过，
+ASan/LSan 零泄漏）：
+
+| | compositeCount | submitAndWaitCount | readbackCalls | 差值 |
+|---|---|---|---|---|
+| 无中途读回（`test_snapshot_refresh_throttle`，基线） | 22 | 26 | 0 | +4 |
+| 753 次高频中途读回（`test_readback_merge_under_load`，本任务新增） | 22-23 | 26-27 | 753 | +4 |
+
+`submitAndWaitCount - compositeCount` 在两种场景下**完全相同（恒为 +4，即 dgcClear 自身
+两次提交 + dgcFlush 收尾一次 + dgcExportPNG 一次的固定常数）**，与读回调用次数（0 →
+753）无关——4a 合并在高频读回交织场景下**没有退化**，命中率健康。这是 §2/§3.1 分析的
+「布尔事实、不依赖具体耗时数字」这一命题在 host 侧的确定性验证，与真机连续挥摆场景下
+应观测到的行为按代码路径一致性推断应当相同（合并逻辑是纯代码路径判断，不依赖 GPU 型号/
+真机时序）。
+
+**判定**：候选①**证伪**（与 §7/本计划 §3.1 的预判一致）。决策树按 §3.4「候选①否 → 继续」
+分支推进，不需要触碰 SDK 生产代码。
+
+### 8.2 候选②（瓶颈是否在 GPU 提交往返之外）与 §5.1（消费端节流值真机逐档实测）—— 阻塞：无真机会话
+
+`docs/plans/A8-3.md` §3.2 要求的验证（真机现有 HUD `readMs` vs `lagProbe.avgLagMs()` 对比、
+`drawLagProbe` 分解）与 §5.1 要求的（`paint-android` `ReadbackScheduler.kt` 节流值
+4ms/8ms/16ms 真机逐档 fps + lag 回归）**均依赖 MDP1221 物理真机 + adb 反向隧道会话**
+（见 memory `mdp1221-adb-reverse-tunnel`：端口/serial 需人工每会话现建）。
+
+本次任务执行环境（`task-execute` 子会话，作用域限定在 `demo`（SDK）仓库 worktree，且执行
+时 `adb devices` 为空、无人工建立的反向隧道）**不具备完成候选②真机测量与 §5.1 真机逐档
+调参的条件**——这两项按 §9 R4「真机数据为硬门槛人工验收项，不接受"沙箱局限"豁免」，不能
+用 host 数据替代或凭代码分析直接下真机结论。
+
+同时注意：`paint-android` 消费端改动（`ReadbackScheduler.kt`/`LatencyMetrics.kt`/
+`PaintScreen.kt` 等，见计划 §6 文件清单）属于另一个仓库，不在本次 `demo` 仓库
+`task/A8-3` worktree 的改动范围内（SDK 侧执行约束明确排除 `ui/`/`platform/`/`app/`/JNI）。
+
+**结论**：候选②的真机核验 + §5.1 的节流值最终选定，需要一次具备真机（MDP1221）+ adb
+反向隧道访问权限的人工协同会话，在 `paint-android` 仓库单独完成（携带本节 §8.1 的候选①
+host 核验结果作为「已排除 SDK 侧合并退化」的前提），本任务在 `demo` 仓库侧的 Phase 0/§5.2
+工作已完成并作为该后续会话的输入。**在候选②真机核验之前，不下修改
+`DEFAULT_MIN_INTERVAL_NS` 的最终结论**——不采用「假设候选②成立就直接改」的做法。
+
+### 8.3 §5.3/§5.4 评估结论（复用计划文档，无新增）
+
+「尽早换帧上屏」「必要时评估低延迟 present」两项的评估结论已在 `docs/plans/A8-3.md` §5.3/
+§5.4 给出并经 build-pipeline 审阅通过：Compose 单一 Choreographer 帧管线下 `bitmap = back`
+之后必须等下一个 vsync 才 recompose+draw，是 Bitmap+Compose 架构固有的 1-vsync 量级下限；
+真正消灭这段 CPU 侧链路的手段是 spec §4b（swapchain 直接上屏），已按 spec 既定交付顺序
+留给独立任务，不在 A8-3 范围内实现。本节不重复展开，结论以计划文档为准。
