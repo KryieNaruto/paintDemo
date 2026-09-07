@@ -1,0 +1,22 @@
+#version 450
+// A8-2：全画布 over 合成 shader：canvas + tip → display（显示读回用）。
+// 无 push constant、无 fwidth/derivative：用 gl_GlobalInvocationID 直接当像素坐标 +
+// 普通 vkCmdDispatch（不用 vkCmdDispatchBase——Mali 驱动实测 gl_GlobalInvocationID 不含
+// base workgroup，见 memory mali-dispatch-base-gotcha）。全画布 dispatch，无需偏移。
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rgba8) uniform readonly image2D u_Canvas;
+layout(set = 0, binding = 1, rgba8) uniform readonly image2D u_Tip;
+layout(set = 0, binding = 2, rgba8) uniform writeonly image2D u_Display;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(u_Display);
+    if (c.x >= sz.x || c.y >= sz.y) return;
+
+    // canvas 与 tip 都是 premultiplied RGBA8。tip over canvas（标准 premultiplied over）。
+    vec4 canvas = imageLoad(u_Canvas, c);
+    vec4 tip = imageLoad(u_Tip, c);
+    vec4 outC = vec4(tip.rgb + canvas.rgb * (1.0 - tip.a),
+                     tip.a + canvas.a * (1.0 - tip.a));
+    imageStore(u_Display, c, outC);
+}

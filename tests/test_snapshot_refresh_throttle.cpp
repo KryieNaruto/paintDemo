@@ -39,6 +39,7 @@
 // 测试访问器不在公开头（dgc_paint_c_api.h）中（仅测试编译进库），此处自行声明。
 extern "C" std::uint64_t dgcTestSnapshotRefreshCount(DgcContext* ctx);
 extern "C" std::uint64_t dgcTestCompositeCount(DgcContext* ctx);
+extern "C" std::uint64_t dgcTestSubmitAndWaitCount(DgcContext* ctx);
 #endif
 
 static int failures = 0;
@@ -170,6 +171,34 @@ int main() {
     CHECK(refresh <= kMaxRefreshBound,
           "snapshot refresh throttled: refresh <= kMaxRefreshBound "
           "(was ~composite before fix)");
+
+    // 4a 合并提交断言（先红后绿）：composite 触发的刷新（settle 那部分）不应再各自
+    // 额外付一次 GPU 提交——submitAndWaitCount 应约等于 compositeCount，只比它多出本场景
+    // 中与「composite 触发的刷新合并」完全无关的独立提交：
+    //   ① dgcClear 自己清画布/tip 那次 SubmitAndWait（ClearCanvasLocked 的 own-clear，
+    //      本任务不改）
+    //   ② dgcClear 内部调 RefreshReadbackCacheLocked（wrapper）刷新那次 SubmitAndWait
+    //   ③ dgcFlush 收尾 flushReadbackCache() 调 RefreshReadbackCacheLocked（wrapper）
+    //      刷新那次 SubmitAndWait
+    //   ④ dgcExportPNG 内部 ReadbackLocked 自己的 SubmitAndWait（与快照刷新缓存完全是
+    //      两条路径，本任务不改）
+    // 本场景无预测批（tipHasContent_ 恒 false），ClearTipLocked 不触发任何提交，故固定
+    // 是 ①②③④ = 4，与 composite 数量、调度波动无关（用 fprintf 打点核实过：无论「settle」
+    // 那次 composite-触发刷新是否真被某个 composite 消费，合并路径下它都不产生①②③④之外
+    // 的第 5 个提交）。
+    // 修复前：composite 触发的刷新（若发生）会额外调一次独立的 RefreshReadbackCacheLocked
+    //   （自己 Begin+Submit）→ submitAndWait = composite + 4 + 1 = composite + 5（红，
+    //   本次实测 pre-fix 应为 26 = 21+5 > composite+4=25）。
+    // 修复后：composite 触发的刷新合并进 composite 自己那次提交，不再额外计数
+    //   → submitAndWait = composite + 4（绿，本次实测 25 = 21+4）。
+    const std::uint64_t submitAndWait = dgcTestSubmitAndWaitCount(ctx);
+    std::fprintf(stderr,
+                 "[test_snapshot_refresh_throttle] submitAndWaitCount=%llu "
+                 "(composite+4 bound=%llu)\n",
+                 (unsigned long long)submitAndWait, (unsigned long long)(composite + 4));
+    CHECK(submitAndWait <= composite + 4,
+          "4a: composite-triggered refresh no longer costs an extra GPU submit "
+          "(submitAndWaitCount <= compositeCount + 4)");
 
     dgcDestroy(ctx);
 

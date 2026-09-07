@@ -16,6 +16,15 @@ class IPaintKernel;
 class IRenderBackend;
 class StrokeModeler;
 
+// bugfix-stale-tip（白盒可测）：预测批必须先于真实批 composite。VkBackend::CompositeLocked()
+// 每次 composite() 结尾都会检查一个跨两次调用共享的原子刷新标志，谁先执行到检查点谁就把它
+// 消费掉；若真实批先于预测批执行、又恰好消费了该标志，读回合成用的是「上一批」残留的旧
+// tip（预测尖显示慢半拍）。预测批先行可保证无论标志被哪次调用消费，tipImage/tipHasContent_
+// 都已反映本批最新内容。定义于 core/engine.cpp，此处声明供 Engine::renderLoop() 内部调用，
+// 也供 tests/test_engine_composite_order.cpp 白盒单测（不经三线程，直接传受控 stamp 向量）。
+void CompositeOrdered(IRenderBackend* backend, std::vector<StampData>* predStamps,
+                      std::vector<StampData>* realStamps);
+
 // 输入事件：内核线程的 beginStroke/endStroke 有状态，必须在内核线程执行，
 // 故输入队列元素是完整事件（含 Begin/Point/End）而非裸 StrokePoint。
 enum class StrokeEventType { BeginStroke, StrokePoint, EndStroke };
@@ -102,9 +111,20 @@ private:
     // StrokeEvent::count_submission 注释）——kernel_->strokeTo 的输出批数量与
     // input_to_brush_ 的 StrokePoint 事件数一一对应，count_submission 需从
     // 触发它的 StrokeEvent 原样带到 renderLoop 供 composited_ 计数。
+    //
+    // A8-2（预测瞬态 wet-tip 层）：
+    //   - predicted：本批 stamp 是预测点（is_predicted）产出 → 渲染线程 composite 到
+    //     tipImage 而非 canvasImage，只临时显示、不永久合墨。
+    //   - clearTip：本批无 stamp，仅标记「清空 tip 层」（endStroke 压入）。携带
+    //     count_submission=true（EndStroke 在 submitInput 也 +1），使 flush 屏障
+    //     composited_==submitted_ 会等到 tip 被清完——否则 drain 后的
+    //     flushReadbackCache 会在 tipHasContent_ 仍真时把 tip 误 merge 进快照
+    //     （计划门禁 MUST-FIX 方案 A）。
     struct RenderBatch {
         std::vector<StampData> stamps;
         bool count_submission = true;
+        bool predicted = false;
+        bool clearTip = false;
     };
 
     // 两段无锁 SPSC 队列

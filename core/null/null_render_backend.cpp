@@ -6,7 +6,9 @@ void NullRenderBackend::resize(int, int) {}
 
 void NullRenderBackend::beginFrame() {}
 
-void NullRenderBackend::composite(const std::vector<StampData>&) {}
+void NullRenderBackend::composite(const std::vector<StampData>&, bool) {}
+
+void NullRenderBackend::clearTip() {}
 
 void NullRenderBackend::clearCanvas(float, float, float, float) {}
 
