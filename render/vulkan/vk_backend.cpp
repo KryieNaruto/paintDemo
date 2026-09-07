@@ -448,6 +448,11 @@ struct VkBackend::Impl {
     // 修复后（绿）：仅在消费者请求/结算时才刷新 → snapshotRefreshCount ≪ compositeCount。
     std::uint64_t snapshotRefreshCount_ = 0;
     std::uint64_t compositeCount_ = 0;
+    // 4a 回归：SubmitAndWait() 实际调用次数（每次 GPU 提交+等 fence +1）。修复前每次
+    // composite-with-refresh 会付两次（composite 自己一次 + RefreshReadbackCacheLocked
+    // 自己一次）；修复后合并成一次（composite 触发的刷新不再额外付提交，仅 Clear*/
+    // flushReadbackCache 独立调用点仍各付一次）。
+    std::uint64_t submitAndWaitCount_ = 0;
 #endif
 
     void EnsureDevice() {
@@ -928,6 +933,9 @@ struct VkBackend::Impl {
     }
 
     void SubmitAndWait() {
+#ifdef DGCPAIN_TEST_HOOKS
+        ++submitAndWaitCount_;
+#endif
         if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
             std::fprintf(stderr, "[VkBackend] vkEndCommandBuffer failed\n");
             return;
@@ -1449,5 +1457,10 @@ std::uint64_t VkBackend::testSnapshotRefreshCount() const {
 std::uint64_t VkBackend::testCompositeCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return impl_->compositeCount_;
+}
+
+std::uint64_t VkBackend::testSubmitAndWaitCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return impl_->submitAndWaitCount_;
 }
 #endif
