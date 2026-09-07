@@ -1088,6 +1088,24 @@ struct VkBackend::Impl {
             ++barrierCount_;
 #endif
         }
+        // A8-2：预测批 dispatch 完成后置位 tipHasContent_（挪到 SubmitAndWait() 之前，
+        // 4a 合并提交需要——若本批同时命中刷新标志，下面 RecordRefreshCommands() 得读到
+        // 「这一批」刚置好的 tipHasContent_，不能是 SubmitAndWait 之后才置）。真实批不
+        // 置位（tip 内容不变）。
+        if (predicted) {
+            tipHasContent_ = true;
+        }
+        // 4a：把读回刷新（merge+copy）合进这次 composite 已经打开的 command buffer，
+        // 只 SubmitAndWait() 一次，不再像修复前那样「composite 自己提交一次 + 刷新
+        // 又单独提交一次」（真机 Mali 实测每次独立提交固定开销约 2-3ms，见
+        // docs/superpowers/specs/2026-09-04-mode-a-ink-parity-design.md §1/§4a）。
+        // Bug #3（快照刷新节流）语义不变：仍是「仅当消费者请求过才刷新」，只是刷新的
+        // GPU 提交现在跟 dab 合成共享同一次 submit。
+        const bool doRefresh =
+            snapshotRefreshRequested_.exchange(false, std::memory_order_acq_rel);
+        if (doRefresh) {
+            RecordRefreshCommands();
+        }
         SubmitAndWait();
 #ifdef DGCPAIN_PERF
         auto t1 = std::chrono::steady_clock::now();
@@ -1102,25 +1120,8 @@ struct VkBackend::Impl {
             initCaptureOpen_ = false;
         }
 #endif
-        // A8-2：预测批提交完成后置位 tipHasContent_，读回快照才会走 merge 路径。
-        // 真实批不置位（tip 内容不变）。
-        if (predicted) {
-            tipHasContent_ = true;
-        }
-        // bugfix（20fps 回退）：composite 批提交完成后顺手发布快照，供 readback() 直接
-        // memcpy——放在 RenderDoc capture 窗口结束之后，不把这次内部拷贝计入抓帧。
-        //
-        // Bug #3（快照刷新节流）：不再**无条件**刷新——连续绘制时渲染线程每 ≤4ms
-        // （kMaxBatchDurationMs overCap）composite 一次，若每次都付全画布 GPU→CPU 拷贝
-        // （Mali 上数 ms），弱 GPU 被打饱和 → Android 60→30 掉帧（PC 桌面 GPU 拷贝 ~1ms
-        // 不掉帧，解释「PC 没这个问题」）。改为：仅当消费者请求过（requestSnapshotRefresh()
-        // 置位，见 engine.cpp 的 requestFlush/flush/renderLoop 排空联动）才在此刷新；
-        // overCap 自动合批的 composite 不再付拷贝。exchange 原子清位，一次请求结算一次
-        // 刷新（同批多次请求折叠为一次，语义不变）。确定性不变：内容仍由渲染线程在完整
-        // 批提交后发布 → 读回永远读到「完整画布」（≤1 批滞后）；drain 请求强制刷新 →
-        // 精确像素路径不变。
-        if (snapshotRefreshRequested_.exchange(false, std::memory_order_acq_rel)) {
-            RefreshReadbackCacheLocked();
+        if (doRefresh) {
+            FinishRefreshReadback();
         }
     }
 
@@ -1234,14 +1235,14 @@ struct VkBackend::Impl {
     // 调用方（CompositeLocked/ClearCanvasLocked/initOffscreen）均已持有外层 mutex_（串行
     // 化 GPU 提交），此处只需保证 cache_ 本身的写入对 VkBackend::readback() 线程安全可见——
     // cache_mutex_ 临界区仅一次 memcpy，不含任何 GPU 等待，不会把这个等待传导给 GUI 线程。
-    void RefreshReadbackCacheLocked() {
-        if (!canvasReady) {
-            return;
-        }
+    // 4a：录制读回刷新的 GPU 命令（merge dispatch 条件性 + copy-to-buffer）到**当前已打开**
+    // 的 command buffer；调用方必须已调过 BeginCommands()，本函数不调 SubmitAndWait()——
+    // 可以是独立一次提交的一部分（RefreshReadbackCacheLocked 单独调用场景），也可以是
+    // CompositeLocked 自己那次提交的一部分（合并省一次 GPU 往返）。
+    void RecordRefreshCommands() {
 #ifdef DGCPAIN_TEST_HOOKS
-        ++snapshotRefreshCount_;  // 每次实际快照拷贝 +1（test hook，仅测试构建）。
+        ++snapshotRefreshCount_;  // 每次实际快照刷新 +1（test hook，仅测试构建）。
 #endif
-        BeginCommands();
         // A8-2：有 tip 时先 fullscreen merge（canvas+tip → displayImage），读回源改为
         // displayImage；无 tip 时读回源仍为 canvasImage（与改造前逐位一致、零额外 GPU 拷贝）。
         VkImage srcImage = canvasImage.get();
@@ -1279,7 +1280,11 @@ struct VkBackend::Impl {
         region.imageExtent = {(uint32_t)width, (uint32_t)height, 1};
         vkCmdCopyImageToBuffer(commandBuffer, srcImage, VK_IMAGE_LAYOUT_GENERAL, readbackBuffer,
                                1, &region);
-        SubmitAndWait();
+    }
+
+    // 4a：读回刷新的提交后 CPU 处理（map/invalidate/memcpy/unmap 进 cache_）。调用方必须
+    // 已在 RecordRefreshCommands() 之后调过 SubmitAndWait()（即 GPU 已完成拷贝）。
+    void FinishRefreshReadback() {
         void* data = nullptr;
         vkMapMemory(device, readbackMemory, 0, readbackSize, 0, &data);
         if (readbackCached_) {
@@ -1296,6 +1301,18 @@ struct VkBackend::Impl {
             std::memcpy(cache_.data(), data, (size_t)readbackSize);
         }
         vkUnmapMemory(device, readbackMemory);
+    }
+
+    // 独立调用点（ClearCanvasLocked/ClearTipLocked）保持原有语义：自己开一次完整的
+    // Begin→Record→Submit→Finish，不与任何 composite 合并（这两处频率低，不是本次优化目标）。
+    void RefreshReadbackCacheLocked() {
+        if (!canvasReady) {
+            return;
+        }
+        BeginCommands();
+        RecordRefreshCommands();
+        SubmitAndWait();
+        FinishRefreshReadback();
     }
 
     void DestroyDevice() {
