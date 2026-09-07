@@ -69,6 +69,9 @@ public:
     // test_snapshot_refresh_throttle 断言「刷新频率从每 composite 一次降为每请求/结算一次」。
     std::uint64_t testSnapshotRefreshCount() const;
     std::uint64_t testCompositeCount() const;
+    // 4a 回归：GPU 提交+等 fence 的实际调用次数，供 test_snapshot_refresh_throttle
+    // 断言「合并提交后不再比 compositeCount 多付太多次」。
+    std::uint64_t testSubmitAndWaitCount() const;
 #endif
 
 private:
