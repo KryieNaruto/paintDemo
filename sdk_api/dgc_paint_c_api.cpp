@@ -600,6 +600,14 @@ std::uint64_t dgcTestCompositeCount(DgcContext* ctx) {
     auto* vk = dynamic_cast<VkBackend*>(ctx->impl_->backend.get());
     return vk ? vk->testCompositeCount() : 0;
 }
+
+std::uint64_t dgcTestSubmitAndWaitCount(DgcContext* ctx) {
+    if (ctx == nullptr || !ctx->impl_) {
+        return 0;
+    }
+    auto* vk = dynamic_cast<VkBackend*>(ctx->impl_->backend.get());
+    return vk ? vk->testSubmitAndWaitCount() : 0;
+}
 #endif
 
 }  // extern "C"

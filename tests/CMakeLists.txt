@@ -26,6 +26,12 @@ target_include_directories(test_engine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_link_libraries(test_engine PRIVATE dgc_paint)
 add_test(NAME test_engine COMMAND test_engine)
 
+# bugfix-stale-tip：CompositeOrdered 白盒单测（无线程/无 GPU 依赖，host 无条件）。
+add_executable(test_engine_composite_order test_engine_composite_order.cpp)
+target_include_directories(test_engine_composite_order PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_link_libraries(test_engine_composite_order PRIVATE dgc_paint)
+add_test(NAME test_engine_composite_order COMMAND test_engine_composite_order)
+
 # P7-2：白盒 Engine 级回归——高频 requestFlush() 不应把批量 composite 打回接近
 # 逐条处理的水平（量化平均批大小），无 Vulkan 依赖，host 无条件构建/跑。
 add_executable(test_flush_throttle_engine test_flush_throttle_engine.cpp)
@@ -164,6 +170,12 @@ if(DGCPAIN_KERNEL_BRUSH AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/brush/
         target_include_directories(test_modeler_deterministic PRIVATE ${CMAKE_SOURCE_DIR})
         target_link_libraries(test_modeler_deterministic PRIVATE dgc_paint)
         add_test(NAME test_modeler_deterministic COMMAND test_modeler_deterministic)
+
+        # A8-2：预测瞬态 wet-tip 层验收（A 白盒 tip merge/clear + B/C/D C API 端到端）。
+        add_executable(test_wet_tip test_wet_tip.cpp)
+        target_include_directories(test_wet_tip PRIVATE ${CMAKE_SOURCE_DIR})
+        target_link_libraries(test_wet_tip PRIVATE dgc_paint)
+        add_test(NAME test_wet_tip COMMAND test_wet_tip)
     endif()
 endif()
 
@@ -221,3 +233,10 @@ add_executable(test_predictor_decel_clean test_predictor_decel_clean.cpp)
 target_include_directories(test_predictor_decel_clean PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(test_predictor_decel_clean PRIVATE dgc_paint)
 add_test(NAME test_predictor_decel_clean COMMAND test_predictor_decel_clean)
+
+# bugfix-prediction-curve-overshoot 正式回归：预测「开」中等曲率圆弧处切线外推径向越界
+# （瞬态毛边）≤ 3px + 领先守卫。纯 CPU 白盒（无 GPU 依赖），无条件构建/跑。
+add_executable(test_predictor_curve_overshoot test_predictor_curve_overshoot.cpp)
+target_include_directories(test_predictor_curve_overshoot PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_predictor_curve_overshoot PRIVATE dgc_paint)
+add_test(NAME test_predictor_curve_overshoot COMMAND test_predictor_curve_overshoot)

@@ -444,13 +444,17 @@ void StrokeModeler::Predict(std::vector<StrokePoint>* out) {
     const StrokePoint& last = impl_->last_output_;
     const Vec2 v_kalman = impl_->kalman_.velocity();
 
-    // 减速不过冲（bugfix-prediction-decel）：外推速度取「卡尔曼 v 与最近真实速度的较小者」。
-    // 稳态运动两者≈相等 → 保留 v·interval 领先；减速/停笔时最近真实位移坍缩 → v_pred 随之
-    // 坍缩，末批预测点落在最近真实点附近，不留下越出真实轨迹的永久凸尾（预测点永久合墨、
-    // 无擦除）。最近真实速度 = (last_output_ − prev_output_)/Δt；无 prev / Δt 乱序时退化
-    // 卡尔曼 v。
+    // 外推速度 v_pred：减速/停笔取真实位移方向（bugfix-prediction-decel），稳态/加速取
+    // 「最近真实行进方向（弦，≈圆周切线）+ 卡尔曼平滑速度幅值」。
+    //   - 减速/停笔：最近真实位移坍缩 → v_pred 随之坍缩，末批预测点落在最近真实点附近，
+    //     不留下越出真实轨迹的永久凸尾（0aa99e1 保证）。
+    //   - 稳态/加速（含圆弧）：卡尔曼速度方向滞后圆周切线 ~30–40°（恒定速度模型对圆弧各轴
+    //     正弦量测的相位滞后，幅值也被衰减），若照旧用 v_kalman 方向外推 interval=30ms 会把
+    //     预测尖横向推离曲线（弧外毛边，见 bugfix-prediction-curve-overshoot）。故方向改用
+    //     弦方向（仅落后半个采样转角 ~2–8°），幅值保留卡尔曼平滑速度。直线段弦方向=卡尔曼
+    //     方向 → 逐位不变。
     // 注意：外推用 v_pred，但机制 A 的转向夹角门仍用 v_kalman —— 只有滞后的卡尔曼 v 才能
-    // 暴露高曲率转角（v_pred 在减速段≈真实位移方向，夹角≈0 会漏拦转角，回归凸点）。
+    // 暴露高曲率转角（v_pred 方向=弦方向，夹角≈0 会漏拦转角，回归凸点）。
     Vec2 v_pred = v_kalman;
     if (impl_->has_prev_) {
         const std::uint64_t d = (last.t_us >= impl_->prev_output_.t_us)
@@ -460,9 +464,18 @@ void StrokeModeler::Predict(std::vector<StrokePoint>* out) {
             Vec2 v_true;
             v_true.x = (double(last.x) - double(impl_->prev_output_.x)) / (double(d) / 1e6);
             v_true.y = (double(last.y) - double(impl_->prev_output_.y)) / (double(d) / 1e6);
-            if (Norm2(v_true) < Norm2(v_kalman)) {
+            const double nk = Norm2(v_kalman);
+            const double nt = Norm2(v_true);
+            if (nt < nk) {
+                // 减速/停笔：外推速度取真实位移方向（含 v_true==0 → 外推塌缩，与 0aa99e1 一致）。
                 v_pred = v_true;
+            } else if (nt > 0.0) {
+                // 稳态/加速（含圆弧卡尔曼方向滞后）：方向取最近真实行进方向，幅值取卡尔曼速度。
+                const double scale = std::sqrt(nk / nt);  // |v_kalman| / |v_true|
+                v_pred.x = v_true.x * scale;
+                v_pred.y = v_true.y * scale;
             }
+            // nt == nk == 0（死停且卡尔曼也归零）：保持 v_pred = v_kalman ≈ 0，外推自然塌缩。
         }
     }
 

@@ -90,6 +90,11 @@ target_include_directories(dgc_paint
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/sdk_api   # 唯一对外 include（B1-4 才放头）
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}           # 让 #include "core/..." 生效
 )
+if(DGCPAIN_ANDROID)
+    # 诊断专用（DGCPAIN_PERF）：__android_log_print 需要 NDK liblog；真机 user 固件
+    # 不转发 native stderr 进 logcat，fprintf 无输出，改走 Android 原生日志 API。
+    target_link_libraries(dgc_paint PRIVATE log)
+endif()
 if(DGCPAIN_TEST_HOOKS)
     target_compile_definitions(dgc_paint PRIVATE DGCPAIN_TEST_HOOKS=1)
 endif()

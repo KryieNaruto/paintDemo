@@ -15,12 +15,16 @@
 namespace {
 
 // 计数后端：记录 composite 调用轮数（B5-2 flush 屏障单测用）。
+// A8-2：EndStroke 现在压一个 clearTip 批（count_submission=true），renderLoop 拆 real/pred
+// 分流后 composite 仅在非空 real/pred 时才调用（NullPaintKernel 产空 stamp → composite 不调）。
+// 为让「drain 确实发生了至少一次渲染侧结算」可观测，把 clearTip 也计入 composites 计数。
 class CountingBackend : public IRenderBackend {
 public:
     void init(PlatformSurface, int, int) override {}
     void resize(int, int) override {}
     void beginFrame() override {}
-    void composite(const std::vector<StampData>&) override { ++composites; }
+    void composite(const std::vector<StampData>&, bool) override { ++composites; }
+    void clearTip() override { ++composites; }
     void clearCanvas(float, float, float, float) override {}
     void present() override {}
     void shutdown() override {}
