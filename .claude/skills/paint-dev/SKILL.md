@@ -22,8 +22,9 @@ description: Use when the user asks to claim and drive DGCPaint SDK tasks from d
 
 ## 恢复会话 / 接管既有 worktree
 
-会话恢复或发现某任务已处于「执行中」时，**先查再派，别机械重跑**：
+会话恢复或发现某任务已处于「执行中」时，**先清进程、再查再派，别机械重跑**：
 
+- **第一步先查杀遗孤进程**：多次打断会攒下遗孤编译/adb/gradle 进程吃满 RSS（真实教训：反复中断后当前用户 RSS 冲到 80G）。用 `ps -eo pid,ppid,rss,etime,cmd --sort=-rss | grep -E 'cc1plus|clang|gradle|ninja|cmake|adb|qemu|emulator|gdb|lldb'` 找与本 worktree 路径相关、或 `ppid=1`（真孤儿）的进程，确认后按 pid 精确 `kill`（先 TERM 后 KILL，不按进程名全局 `pkill`，防误杀其它 worktree/其它任务）；gradle daemon 用 `./gradlew --stop`，adb 疑似残留用 `adb kill-server && adb start-server`。清理前后各记一次 RSS（`ps -eo rss --no-headers | awk '{s+=$1} END{print s/1024/1024" GB"}'`），确认确有下降。
 - 跑 `git log --oneline -5` + `git worktree list` + 看 `docs/plans/` 判断每个执行中任务的进度：已 claim 未 plan → 从 `task-plan` 接手；已 plan 未过 plan-review（或 plan-review 低分待重写）→ 从 `task-plan` / `task-plan-review` 接手；已过 plan-review 未实现 → 从 `task-execute` 接手；已实现未测试 → 从 `task-test` 接手；已测试未过 test-review → 从 `task-execute`（修复）→ `task-test` → `task-test-review` 接手；已过 test-review 未收尾 → 从 `task-finish` 接手。
 - 用 `python3 .exec/taskline.py status`（或 available）核实任务线状态，别只信 agent 回报——本会话曾出现测试阶段任务已被并发流程收尾、plan 文件写好未提交等情况。
 - 若发现某任务已被并发完成（`git log` 见 `finish <ID>`），直接跳过该任务的剩余阶段，不要再派 agent。
@@ -38,6 +39,7 @@ description: Use when the user asks to claim and drive DGCPaint SDK tasks from d
 - **真机/硬件实测数据是硬门槛，不是形式豁免**：任务书验收标准里凡出现真机/硬件实测指标（fps、耗时等），`task-test-review` 只有在能明确指出"某个已跑通的自动化测试真实复现了同等负载场景"（同等调用频率、同等调用方用法，不是量级近似）时，才可以把真机数据缺失当"沙箱局限"豁免、打 `SCORE=100`；否则一律视为未达标不通过，不能仅凭"有先例"或"计划阶段已如实标注"就放行。派给 `task-test`/`task-test-review` 的提示要带上这条口径。（教训：P7-1 曾以「沙箱局限、有 D6-3/U2-real-paint 先例」豁免真机记录缺失并打 100 分通过合并，事后真机实测 Windows 70fps/Android 7fps 均未达标，问题被隐藏到合并之后才由人工发现——host ctest 的负载模式其实和真实消费者用法差异很大。）
 - **新方案若与既有优化/设计冲突，必须停下报人，门禁通过不算数**：派 `task-plan`/`task-plan-review` 时要求其对照项目 memory 与既有任务书里记录的性能优化/架构决策，核查新方案是否会打回、绕开或削弱它们（例如新方案让某个此前靠"批量/攒批"才达标的路径变成逐条处理）。一旦识别到这种冲突，不能让评分门禁"通过"就当默认接受这个取舍——`task-plan-review` 要在 `FEEDBACK=` 里明确点出冲突，主会话看到后必须停下把冲突和取舍报告人工定夺，不能直接派下一阶段。（教训：P7-1 的非阻塞 `requestFlush()` 方案在高频 readback 场景下会让渲染线程逐 stamp flush，直接打回此前"批量 composite"优化的收益，计划评审没识别为冲突就通过了。）
 - **`RESULT=need-human` / `stuck` 停下报给人**：撞到「≥2 个站得住脚的选项」或「无技术路径」时，停下把问题与选项报给人，不自己挑一个继续。
+- **worktree 遗孤进程是 RSS 元凶，接管/编译/adb 调试前都要清**：除「恢复会话」里已定的接管第一步外，派 `task-execute` 若该任务要编译或连真机 adb 调试，派前提醒其在动手前按同样方法（`ps --sort=-rss` 定位本 worktree 路径相关或 `ppid=1` 的进程，确认后按 pid 精确 kill，`gradlew --stop`/`adb kill-server` 走各自正常停止命令，不做无差别 `pkill`）清一遍；`task-finish` 收尾摘要要求带上清理前后 RSS 对比，缺失视为收尾不完整。
 - **收尾后停下等人工，不自动申领**：`task-finish` 报回终态后，汇报并停下等人工审核。只有人工明确说「继续/推进」才回第 1 步看 `available` 并申领。别拿「还有可领任务」当继续的理由——可领 ≠ 该领。
 
 ## 收尾的裁决
