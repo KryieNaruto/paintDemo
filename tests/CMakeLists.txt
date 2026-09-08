@@ -90,6 +90,15 @@ if(DGCPAIN_RENDER_VULKAN AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../render/vulkan
         target_link_libraries(test_snapshot_refresh_throttle PRIVATE dgc_paint)
         target_compile_definitions(test_snapshot_refresh_throttle PRIVATE DGCPAIN_TEST_HOOKS=1)
         add_test(NAME test_snapshot_refresh_throttle COMMAND test_snapshot_refresh_throttle)
+
+        # A8-3 §5.2：候选①（4a 合并命中率在高频读回交织下是否退化）的永久护栏。
+        # test_snapshot_refresh_throttle.cpp 特意跳过了「连续 stroke 中途高频读回」这一
+        # 组合，本测试补上——断言 submitAndWaitCount 不随中途读回调用次数线性增长。
+        add_executable(test_readback_merge_under_load test_readback_merge_under_load.cpp)
+        target_include_directories(test_readback_merge_under_load PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+        target_link_libraries(test_readback_merge_under_load PRIVATE dgc_paint)
+        target_compile_definitions(test_readback_merge_under_load PRIVATE DGCPAIN_TEST_HOOKS=1)
+        add_test(NAME test_readback_merge_under_load COMMAND test_readback_merge_under_load)
     endif()
 
     # B5-4：RenderDoc 程序化抓帧 —— 降级等价 + 所有权循环（无 renderdoc 库环境）。
