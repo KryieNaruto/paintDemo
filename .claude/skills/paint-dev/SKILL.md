@@ -40,6 +40,7 @@ description: Use when the user asks to claim and drive DGCPaint SDK tasks from d
 - **新方案若与既有优化/设计冲突，必须停下报人，门禁通过不算数**：派 `task-plan`/`task-plan-review` 时要求其对照项目 memory 与既有任务书里记录的性能优化/架构决策，核查新方案是否会打回、绕开或削弱它们（例如新方案让某个此前靠"批量/攒批"才达标的路径变成逐条处理）。一旦识别到这种冲突，不能让评分门禁"通过"就当默认接受这个取舍——`task-plan-review` 要在 `FEEDBACK=` 里明确点出冲突，主会话看到后必须停下把冲突和取舍报告人工定夺，不能直接派下一阶段。（教训：P7-1 的非阻塞 `requestFlush()` 方案在高频 readback 场景下会让渲染线程逐 stamp flush，直接打回此前"批量 composite"优化的收益，计划评审没识别为冲突就通过了。）
 - **`RESULT=need-human` / `stuck` 停下报给人**：撞到「≥2 个站得住脚的选项」或「无技术路径」时，停下把问题与选项报给人，不自己挑一个继续。
 - **worktree 遗孤进程是 RSS 元凶，接管/编译/adb 调试前都要清**：除「恢复会话」里已定的接管第一步外，派 `task-execute` 若该任务要编译或连真机 adb 调试，派前提醒其在动手前按同样方法（`ps --sort=-rss` 定位本 worktree 路径相关或 `ppid=1` 的进程，确认后按 pid 精确 kill，`gradlew --stop`/`adb kill-server` 走各自正常停止命令，不做无差别 `pkill`）清一遍；`task-finish` 收尾摘要要求带上清理前后 RSS 对比，缺失视为收尾不完整。
+- **构建一律关闭 LTO（内存硬约束）**：所有构建（cmake、本机 g++/clang、NDK、消费端 VS 工程）不得开启链接期优化——`-flto`/`-flto=thin`、MSVC `/GL`+`/LTCG`、`thinlto` 一律不用，否则链接阶段把整程序 LTO 位码映射进内存，内存完全不够用会直接 OOM/失败（真实教训：host 内存被链接进程吃满，构建跑不完）。派给 `task-plan`/`task-execute`/`task-test`/`task-test-review` 的提示都要带上此口径；评审 rubric 遇 LTO 相关 flag 即扣分。
 - **收尾后停下等人工，不自动申领**：`task-finish` 报回终态后，汇报并停下等人工审核。只有人工明确说「继续/推进」才回第 1 步看 `available` 并申领。别拿「还有可领任务」当继续的理由——可领 ≠ 该领。
 
 ## 收尾的裁决
