@@ -46,3 +46,10 @@ description: Use when the user asks to claim and drive DGCPaint SDK tasks from d
 ## 收尾的裁决
 
 `task-finish` 只在 plan-review（>80）与 test-review（==100）两门禁都通过后才派发，它把最终评审结论落地：`通过` → 合并回目标 + 置「已完成/已通过」；`打回` → 置「执行中/打回」保留 worktree 供重做。你收到它的回报后，汇报任务结果并**停下等人工审核**，不自动回第 1 步申领下一个任务。人工说「继续」再回第 1 步。
+
+## 本文件维护（给改这份文件的人 / 维护会话看，不是流水线指令）
+
+- **权威副本**：本文件随 `paintDemo` 仓库提交（origin `github.com:KryieNaruto/paintDemo.git`），路径 `.claude/skills/paint-dev/SKILL.md`。改动一律**先在此仓库改并提交**。
+- **检出 / 镜像副本**（应保持与权威副本 md5 一致）：`/ssd/qiansenwei/workspace/mine/paintDemo`（SSD 主检出）、`/home/qiansenwei/workspace/demo`（home 旧检出）、`paint-pc/sdk` 与 `paint-android/sdk`（消费端仓库内嵌的同仓库子模块）、`~/.claude/skills/paint-dev/`（用户级全局镜像，2026-09-08 起装，让 `/paint-dev` 在任意目录的新会话可列出——会话根在顶层 `mine` 伞形目录时项目级技能不加载）。
+- **改动流程**：仓库改 → 提交 → `cp` 覆盖 `~/.claude/skills/paint-dev/` 及各检出副本。只改全局镜像会让版本分叉；用 `md5sum` 对副本校验一致。
+- **运行前提**：`/paint-dev` 用 cwd 相对路径 `.exec/taskline.py`；即使全局可列出，真正驱动流水线时 cwd 仍需在带 `.exec/` 的 SDK 检出内（paintDemo / paint-pc/sdk / paint-android/sdk）。
