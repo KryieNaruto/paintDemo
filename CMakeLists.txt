@@ -91,6 +91,12 @@ target_include_directories(dgc_paint
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}           # 让 #include "core/..." 生效
 )
 if(DGCPAIN_ANDROID)
+    # A8-5 修复（SWAPCHAIN 全黑）：DGCPAIN_ANDROID 此前仅作为 cmake 构建选项变量使用，
+    # 从未作为宏下发给编译器 → vk_backend 的 onscreen WSI 段（VkSurfaceKHR/swapchain/
+    # acquire→blit→present，见 render/vulkan/vk_backend.cpp 的 #ifdef DGCPAIN_ANDROID）被
+    # 整段裁掉，真机 dgcSetSurface(非空窗) 恒走 "requires Android build" 空实现 → SWAPCHAIN
+    # 永无上屏、画布全黑。此处补发 -DDGCPAIN_ANDROID，把 A8-5 onscreen 路径真正编进库。
+    target_compile_definitions(dgc_paint PRIVATE DGCPAIN_ANDROID=1)
     # 诊断专用（DGCPAIN_PERF）：__android_log_print 需要 NDK liblog；真机 user 固件
     # 不转发 native stderr 进 logcat，fprintf 无输出，改走 Android 原生日志 API。
     target_link_libraries(dgc_paint PRIVATE log)

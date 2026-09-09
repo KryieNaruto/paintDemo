@@ -8,6 +8,15 @@
 #include <vulkan/vulkan_android.h>  // vkCreateAndroidSurfaceKHR（VK_KHR_android_surface）
 #endif
 
+#ifdef __ANDROID__
+// A8-5 真机诊断：真机「user」固件不转发 native stderr 进 logcat（fprintf 无输出），
+// DGC-SWAP 走 Android 原生日志 API，用于确认 attach→swapchain→present 执行到哪一步。
+#include <android/log.h>
+#define DGC_SWAP_LOG(...) __android_log_print(ANDROID_LOG_INFO, "DGC-SWAP", __VA_ARGS__)
+#else
+#define DGC_SWAP_LOG(...) ((void)0)
+#endif
+
 #ifdef DGCPAIN_RENDERDOC_ENABLED
 #include "render/renderdoc/renderdoc_capture.h"
 #endif
@@ -477,8 +486,10 @@ struct VkBackend::Impl {
     std::vector<VkImage> swapchainImages;  // 当前 swapchain 的 images（blit 目标池）
     VkExtent2D swapchainExtent{};          // 当前 swapchain 尺寸（blit 目标区域）
     VkPresentModeKHR presentMode_ = VK_PRESENT_MODE_FIFO_KHR;  // 实际选中（MAILBOX 优先退 FIFO）
+    VkFormat swapchainFormat_ = VK_FORMAT_UNDEFINED;  // 实际选中 swapchain image 格式（DGC-SWAP 诊断）
     bool onscreen_ = false;       // 已绑 surface+swapchain → present() 走 onscreen 分支
     bool swapchainValid_ = false; // 当前 swapchain 可用；out-of-date/surface-lost 置否
+    uint32_t presentSeq_ = 0;     // A8-5 DGC-SWAP：present 序号（限频日志用，仅 onscreen 计数）
 #ifdef DGCPAIN_ANDROID
     ANativeWindow* androidWindow_ = nullptr;  // 建 surface 的窗口（同窗复用 / 换窗重建判定）
 #endif
@@ -1510,6 +1521,7 @@ struct VkBackend::Impl {
             }
         }
         presentMode_ = mode;
+        swapchainFormat_ = format.format;  // 记录实际选中格式（A8-5 DGC-SWAP 诊断：RGBA8=37 / BGRA8=44）
         std::fprintf(stderr, "[VkBackend] present mode: %s\n",
                      (mode == VK_PRESENT_MODE_MAILBOX_KHR) ? "MAILBOX" : "FIFO");
 
@@ -1612,6 +1624,11 @@ struct VkBackend::Impl {
         vkWaitForFences(device.get(), 1, &fence.h, VK_TRUE, UINT64_MAX);
         if (imageIndex >= swapchainImages.size()) {
             return;
+        }
+        ++presentSeq_;
+        if (presentSeq_ == 1 || presentSeq_ % 180 == 0) {
+            DGC_SWAP_LOG("present seq=%u image=%u extent=%dx%d", presentSeq_, imageIndex,
+                         (int)swapchainExtent.width, (int)swapchainExtent.height);
         }
 
         BeginCommands();
@@ -1772,6 +1789,18 @@ void VkBackend::init(PlatformSurface surface, int w, int h) {
         return;
     }
     impl_->CreateSwapchainLocked();
+    // A8-5 修复（SWAPCHAIN 全黑）：attach 后立即把当前 canvas present 一次——present() 原本
+    // 仅随输入驱动的 composite flush 触发，attach（dgcSetSurface 非空窗）后若无输入则永无
+    // 首帧，SurfaceView(BLAST) 恒黑。此处同步补一次「现状画布」blit→queuePresent，进
+    // SWAPCHAIN 即有可见画面；canvas 此刻已 clear/composite 过（消费端 nativeInit 后即 dgcClear
+    // 纸白、笔画实时 composite），内容有效。离屏/未绑不受影响（本分支仅非空窗走）。
+    DGC_SWAP_LOG("attach surface w=%d h=%d fmt=%d pmmode=%s valid=%d onscreen=%d", impl_->width,
+                 impl_->height, (int)impl_->swapchainFormat_,
+                 (impl_->presentMode_ == VK_PRESENT_MODE_MAILBOX_KHR) ? "MAILBOX" : "FIFO",
+                 int(impl_->swapchainValid_), int(impl_->onscreen_));
+    if (impl_->swapchainValid_ && impl_->onscreen_) {
+        impl_->PresentLocked();  // 立即上屏首帧（PresentLocked 内部已在 Onscreen 分支）
+    }
 #else
     std::fprintf(stderr, "[VkBackend] windowed present (A8-5) requires Android build\n");
 #endif
