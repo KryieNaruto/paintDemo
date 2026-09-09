@@ -347,6 +347,9 @@ int dgcClear(DgcContext* ctx, float r, float g, float b, float a) {
         return DGC_ERR_NULL_CONTEXT;
     }
     ctx->impl_->backend->clearCanvas(r, g, b, a);
+    // A8-5（SWAPCHAIN 全黑）：onscreen 绑定下立即 present 清空后的画布，避免清空后画面停留
+    // 旧帧/黑。离屏/未绑时 present() 内部早退，行为不变（readback/export 权威 canvas 不受影响）。
+    ctx->impl_->backend->present();
     g_last_error = DGC_OK;
     return DGC_OK;
 }
