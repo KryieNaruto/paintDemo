@@ -102,9 +102,11 @@ DGC_API int      dgcDestroyBrush(DgcContext* ctx, DgcBrush brush);
 DGC_API int      dgcSetBrush(DgcContext* ctx, DgcBrush brush);
 
 /* 渲染/清屏。
- * dgcRender 仅驱动 SDK 离屏合成（render/vulkan/vk_backend.h：无 swapchain，
- * present() no-op），不涉及上屏/垂直同步（vsync）——vsync 归属见 README「垂直同步
- * （vsync）归属」小节：由消费端 present 模式（如 GLFW glfwSwapInterval）负责。 */
+ * dgcRender 仅驱动 SDK 离屏合成（canvasImage 权威）；A8-5 起 SDK 提供可选 onscreen
+ * swapchain 路径：dgcSetSurface 收到非空 ANativeWindow* 时 VkBackend 建 VkSurfaceKHR +
+ * VkSwapchainKHR，engine 每轮 composite 后的 present() 走 acquire→blit→queuePresent
+ * 直接上屏（全程 GPU 内不读回，render/vulkan/vk_backend.h）。vsync 归属见 README
+ * 「垂直同步（vsync）归属」小节。 */
 DGC_API int dgcRender(DgcContext* ctx);
 DGC_API int dgcClear(DgcContext* ctx, float r, float g, float b, float a);
 

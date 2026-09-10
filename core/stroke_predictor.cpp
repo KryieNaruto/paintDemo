@@ -4,6 +4,10 @@
 #include <cmath>
 #include <mutex>
 
+// A8-5b 诊断插桩（临时）：DGCPAIN_PERF_LOG 真机走 __android_log_print。见该头文件注释，
+// 清理时连同下方 DiagPredict/DiagFlushStroke 调用点一起删除即可。
+#include "core/dgc_perf_log.h"
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 白盒移植 Ink Stroke Modeler 的内部组件（全部在匿名命名空间，值成员 + RAII）。
 //
@@ -22,6 +26,10 @@ namespace {
 // 头文件间可用性不一致；std::acos 又非标准 constexpr（MSVC 拒编）。用字面量最稳。
 constexpr double kPi = 3.14159265358979323846;
 
+// A8-5b 诊断（临时）：每 N 次 Predict() 调用打一条明细，避免真机 logcat 刷屏。
+// 一次 Predict 对应一次外部 StrokePoint 提交（~60–120 Hz），20 → 每秒约 3–6 条。
+constexpr int kDiagEvery = 20;
+
 struct Vec2 {
     double x = 0.0;
     double y = 0.0;
@@ -29,6 +37,44 @@ struct Vec2 {
 
 // 模平方（减速不过冲用：比较卡尔曼 v 与最近真实速度的大小，取较小者作外推速度）。
 static double Norm2(const Vec2& v) { return v.x * v.x + v.y * v.y; }
+
+// ── 减速/停笔判据（bugfix-prediction-underscale）──────────────────────────────
+// 语义：只有当「本批瞬时弦速度相对上一批、或相对卡尔曼平滑速度」发生显著坍缩时，才认定
+// 笔在减速/停笔，此时外推速度取真实位移方向（v_pred = v_true），末尾预测点随之坍缩、
+// 不留永久凸尾（0aa99e1 / bugfix-prediction-decel 契约）。
+//
+// 为什么不能沿用原来的 `|v_true| < |v_kalman|`：v_true 是**单个重采样间隔**的瞬时弦速度。
+// 稳态匀速段两者本应相等，但只要样本时间戳带一点抖动（真机必然），单间隔弦长就会忽长忽
+// 短，|v_true| 在一半样本上低于 |v_kalman| → 原判据在匀速段恒命中，把 v_pred 压到弦速度
+// 之下（真机实测 v_pred/|v_kalman| 中位 0.88，抑制 12–14%），外推距离系统性不足。
+//
+// 新判据两条并联，任一条成立即判减速：
+//   (1) 相对卡尔曼显著坍缩：|v_true| < |v_kalman| · kDecelRatioVsKalman。相对量纲，
+//       速度快慢通吃；稳态弦速度抖动幅度由「抖动 / 半采样间隔」决定，恒 < 30%，
+//       故 0.55 的余量不会被抖动吃穿。
+//   (2) 相对上一批显著坍缩：|v_true| < |v_true_prev| · kDecelRatioVsPrev。真减速是
+//       逐样本单调坍缩，两批之间必然跌破一半；时间戳抖动只影响单批，不改变批间趋势。
+// 停笔（本批 v_true == 0）两条都天然命中。
+//
+// 取 0.55 而非更低，是为了保住原判据在「人为无抖动、纯线性减速」档案里的逐位行为
+// （见 test_predictor_decel_clean：该档案下 |v_true|/|v_kalman| 在尾部降到 0.198，
+// 0.55 处仍有 5 个样本如实判减速，与修复前一致）。
+constexpr double kDecelRatioVsKalman = 0.55;
+constexpr double kDecelRatioVsPrev = 0.50;
+
+static bool IsDecel(double nk, double nt, bool has_prev_true, double prev_v_true_mag) {
+    if (nt <= 0.0) {
+        return true;  // 完全停住：外推塌缩到最近真实点。
+    }
+    if (nt < nk * kDecelRatioVsKalman) {
+        return true;
+    }
+    if (has_prev_true && prev_v_true_mag > 0.0 &&
+        std::sqrt(nt) < prev_v_true_mag * kDecelRatioVsPrev) {
+        return true;
+    }
+    return false;
+}
 
 // ── WobbleSmoother ──────────────────────────────────────────────────────────
 // 镜像 ink_stroke_modeler::WobbleSmoother：低通滤波（运动）→ 时间变权移动平均
@@ -343,8 +389,87 @@ struct StrokeModeler::Impl {
                             params_.end_of_stroke_stopping_distance_mm);
     }
 
+    // ── A8-5b 诊断（临时）───────────────────────────────────────────────────
+    // 每次 Predict() 汇总一次调用；每 kDiagEvery 次打一条明细；每笔结束（ResetLocked）
+    // 打一条汇总。diag_interval_ms_last_ 记录本笔实际生效的 interval（避免 Configure
+    // 先改 params_ 再 ResetLocked 导致汇总被下一态的新参数误标）。
+    //
+    // lead_far：本批产出预测点中距最近真实点最远者 —— 这才是用户肉眼能看到的「笔尖
+    //   前移量」（tip 层画的 dabs 取最远者定义可见笔尖）。
+    // lead_tail：批次末点距离 —— 末点是 StrokeEndPredictor 停笔点（位移 |v|/drag），
+    //   在 v 较大时它反而**小于**均匀外推末点（v/drag ≪ v·interval），故不能拿它当
+    //   可见前移量，需与 lead_far 分开记。
+    void DiagPredict(double interval_us, int n_pred, double v_kal, double v_true,
+                     double v_pred, double theta_deg, double lead_far, double lead_tail,
+                     const char* reason, double lx, double ly, double ltu) {
+        ++diag_calls_;
+        diag_lx_last_ = lx;
+        diag_ly_last_ = ly;
+        diag_ltu_last_ = ltu;
+        diag_npred_total_ += n_pred;
+        if (n_pred == 0) {
+            ++diag_suppressed_;
+        }
+        if (lead_far > diag_lead_max_) {
+            diag_lead_max_ = lead_far;
+        }
+        diag_lead_last_ = lead_far;
+        diag_leadtail_last_ = lead_tail;
+        if (v_pred > diag_vpred_max_) {
+            diag_vpred_max_ = v_pred;
+        }
+        diag_vpred_last_ = v_pred;
+        diag_vkal_last_ = v_kal;
+        diag_vtrue_last_ = v_true;
+        diag_theta_last_ = theta_deg;
+        diag_interval_ms_last_ = interval_us / 1000.0;
+        if (kDiagEvery > 0 && (diag_calls_ % kDiagEvery) == 0) {
+#ifdef DGCPAIN_PERF
+            DGCPAIN_PERF_LOG(
+                "[PRED] call=%d interval_us=%.0f n_pred=%d v_kal=%.1fmm/s "
+                "v_true=%.1fmm/s v_pred=%.1fmm/s theta=%.1fdeg lead_far=%.1fpx "
+                "lead_tail=%.1fpx last_x=%.1f last_y=%.1f last_t_us=%.0f reason=%s\n",
+                diag_calls_, interval_us, n_pred, v_kal, v_true, v_pred, theta_deg,
+                lead_far, lead_tail, lx, ly, ltu, reason);
+#endif
+        }
+    }
+
+    void DiagFlushStroke() {
+        if (diag_calls_ == 0) {
+            return;
+        }
+#ifdef DGCPAIN_PERF
+        DGCPAIN_PERF_LOG(
+            "[PRED-SUM] calls=%d interval_ms=%.1f n_pred_total=%d suppressed=%d "
+            "lead_far_max=%.1fpx lead_far_last=%.1fpx lead_tail_last=%.1fpx "
+            "v_kal_last=%.1fmm/s v_true_last=%.1fmm/s v_pred_max=%.1fmm/s "
+            "v_pred_last=%.1fmm/s theta_last=%.1fdeg\n",
+            diag_calls_, diag_interval_ms_last_, diag_npred_total_, diag_suppressed_,
+            diag_lead_max_, diag_lead_last_, diag_leadtail_last_, diag_vkal_last_,
+            diag_vtrue_last_, diag_vpred_max_,
+            diag_vpred_last_, diag_theta_last_);
+#endif
+        diag_calls_ = 0;
+        diag_npred_total_ = 0;
+        diag_suppressed_ = 0;
+        diag_lead_max_ = 0.0;
+        diag_lead_last_ = 0.0;
+        diag_leadtail_last_ = 0.0;
+        diag_vpred_max_ = 0.0;
+        diag_vpred_last_ = 0.0;
+        diag_vkal_last_ = 0.0;
+        diag_vtrue_last_ = 0.0;
+        diag_theta_last_ = 0.0;
+        diag_interval_ms_last_ = 0.0;
+        diag_lx_last_ = 0.0;
+        diag_ly_last_ = 0.0;
+        diag_ltu_last_ = 0.0;
+    }
+
     // 无锁内部重置：调用方必须已持有 mutex_（Configure/Reset 的公开入口负责加锁）。
     void ResetLocked() {
+        DiagFlushStroke();  // A8-5b 诊断：笔末汇总（内部自带 diag_calls_==0 早退）
         wobble_.Reset();
         resampler_.Reset();
         position_.Reset();
@@ -354,6 +479,8 @@ struct StrokeModeler::Impl {
         last_output_ = {};
         has_prev_ = false;
         prev_output_ = {};
+        has_prev_true_ = false;
+        prev_v_true_mag_ = 0.0;
     }
 
     std::mutex mutex_;  // 守卫以下全部状态；四个公开方法各自加锁，互斥执行。
@@ -375,6 +502,31 @@ struct StrokeModeler::Impl {
     // 必须随 ResetLocked() 清零（可逆/确定性）；无任何跨笔画 latch / 计数器。
     bool has_prev_ = false;
     StrokePoint prev_output_{};  // Update() 每次推真实点时滚动成前一个
+
+    // 减速判据的「上一批瞬时弦速度幅值」（bugfix-prediction-underscale）：单看
+    // |v_true| vs |v_kalman| 无法判减速——v_true 是单次采样间隔的瞬时弦速度，稳态匀速段
+    // 也会在 |v_kalman| 上下摆动（时间戳抖动 → 半个采样周期内的弦长忽长忽短）。改以
+    // 「本批 |v_true| 相对上一批显著坍缩」作真正的减速信号，与「相对卡尔曼显著坍缩」
+    // 两者取或。同机制 A 的窗口一样必须随 ResetLocked() 清零（可逆/确定性）。
+    bool has_prev_true_ = false;
+    double prev_v_true_mag_ = 0.0;
+
+    // A8-5b 诊断累计量（临时）。
+    int    diag_calls_            = 0;
+    int    diag_npred_total_      = 0;
+    int    diag_suppressed_       = 0;
+    double diag_lead_max_         = 0.0;
+    double diag_lead_last_        = 0.0;
+    double diag_leadtail_last_    = 0.0;
+    double diag_vpred_max_        = 0.0;
+    double diag_vpred_last_       = 0.0;
+    double diag_vkal_last_        = 0.0;
+    double diag_vtrue_last_       = 0.0;
+    double diag_theta_last_       = 0.0;
+    double diag_interval_ms_last_ = 0.0;
+    double diag_lx_last_          = 0.0;
+    double diag_ly_last_          = 0.0;
+    double diag_ltu_last_         = 0.0;
 };
 
 StrokeModeler::StrokeModeler() : impl_(std::make_unique<Impl>()) {
@@ -387,6 +539,14 @@ void StrokeModeler::Configure(const StrokeModelParams& params) {
     std::lock_guard<std::mutex> lock(impl_->mutex_);
     impl_->params_ = params;
     impl_->ApplyParams();
+    // A8-5b 诊断（临时）：打印生效参数，确认消费端 setBrushSetting 真到达 modeler。
+#ifdef DGCPAIN_PERF
+    DGCPAIN_PERF_LOG(
+        "[PRED-CFG] interval_ms=%.1f wobble_timeout_ms=%.1f min_rate_hz=%.1f "
+        "spring_mass=%.1f spring_drag=%.1f\n",
+        params.prediction_interval_ms, params.wobble_timeout_ms, params.min_output_rate_hz,
+        params.spring_mass_constant, params.spring_drag_constant);
+#endif
     impl_->ResetLocked();  // 内联重置，避免对 Reset() 重入加锁自死锁。
 }
 
@@ -446,8 +606,8 @@ void StrokeModeler::Predict(std::vector<StrokePoint>* out) {
 
     // 外推速度 v_pred：减速/停笔取真实位移方向（bugfix-prediction-decel），稳态/加速取
     // 「最近真实行进方向（弦，≈圆周切线）+ 卡尔曼平滑速度幅值」。
-    //   - 减速/停笔：最近真实位移坍缩 → v_pred 随之坍缩，末批预测点落在最近真实点附近，
-    //     不留下越出真实轨迹的永久凸尾（0aa99e1 保证）。
+    //   - 减速/停笔：最近真实位移显著坍缩（判据见 IsDecel）→ v_pred 随之坍缩，末批预测点
+    //     落在最近真实点附近，不留下越出真实轨迹的永久凸尾（0aa99e1 保证）。
     //   - 稳态/加速（含圆弧）：卡尔曼速度方向滞后圆周切线 ~30–40°（恒定速度模型对圆弧各轴
     //     正弦量测的相位滞后，幅值也被衰减），若照旧用 v_kalman 方向外推 interval=30ms 会把
     //     预测尖横向推离曲线（弧外毛边，见 bugfix-prediction-curve-overshoot）。故方向改用
@@ -456,6 +616,7 @@ void StrokeModeler::Predict(std::vector<StrokePoint>* out) {
     // 注意：外推用 v_pred，但机制 A 的转向夹角门仍用 v_kalman —— 只有滞后的卡尔曼 v 才能
     // 暴露高曲率转角（v_pred 方向=弦方向，夹角≈0 会漏拦转角，回归凸点）。
     Vec2 v_pred = v_kalman;
+    double v_true_mag = 0.0;  // A8-5b 诊断：最近真实位移速度幅值（|v_true|）
     if (impl_->has_prev_) {
         const std::uint64_t d = (last.t_us >= impl_->prev_output_.t_us)
                                     ? last.t_us - impl_->prev_output_.t_us
@@ -464,9 +625,12 @@ void StrokeModeler::Predict(std::vector<StrokePoint>* out) {
             Vec2 v_true;
             v_true.x = (double(last.x) - double(impl_->prev_output_.x)) / (double(d) / 1e6);
             v_true.y = (double(last.y) - double(impl_->prev_output_.y)) / (double(d) / 1e6);
+            v_true_mag = std::sqrt(Norm2(v_true));
             const double nk = Norm2(v_kalman);
             const double nt = Norm2(v_true);
-            if (nt < nk) {
+            const bool decel =
+                IsDecel(nk, nt, impl_->has_prev_true_, impl_->prev_v_true_mag_);
+            if (decel) {
                 // 减速/停笔：外推速度取真实位移方向（含 v_true==0 → 外推塌缩，与 0aa99e1 一致）。
                 v_pred = v_true;
             } else if (nt > 0.0) {
@@ -476,6 +640,8 @@ void StrokeModeler::Predict(std::vector<StrokePoint>* out) {
                 v_pred.y = v_true.y * scale;
             }
             // nt == nk == 0（死停且卡尔曼也归零）：保持 v_pred = v_kalman ≈ 0，外推自然塌缩。
+            impl_->has_prev_true_ = true;
+            impl_->prev_v_true_mag_ = v_true_mag;
         }
     }
 
@@ -489,6 +655,9 @@ void StrokeModeler::Predict(std::vector<StrokePoint>* out) {
     // 平滑点。正的小 interval（如 1ms）仍走下方既有 n 计算（n=0→1 兜底保留给
     // (0, period) 正区间，不动 test_modeler_param_changes_output 的 1ms 分支预期）。
     if (interval_us <= 0.0) {
+        impl_->DiagPredict(interval_us, 0, std::sqrt(Norm2(v_kalman)), 0.0,
+                           std::sqrt(Norm2(v_pred)), -1.0, 0.0, 0.0, "MECH_B_interval0",
+                           double(last.x), double(last.y), double(last.t_us));
         return;
     }
 
@@ -506,20 +675,26 @@ void StrokeModeler::Predict(std::vector<StrokePoint>* out) {
     // 暂态）把 Predict 拦空，违反「has_output_ 后产出领先点」契约并打回 test_stroke_predictor
     // 直线暖机样本。低速/停笔时 v→0，外推点自然坍缩到最近真实点附近（延伸 ∝ v），
     // 不会留下外凸漂移点，转角凸点由下方夹角门（机制 A）+ 机制 B 负责。
+    double lagDeg = 0.0;  // A8-5b 诊断：机制 A 的 θ（无 prev / 零位移时按 0 记）
     if (impl_->has_prev_) {
         const double dx = double(last.x) - double(impl_->prev_output_.x);
         const double dy = double(last.y) - double(impl_->prev_output_.y);
         if (dx != 0.0 || dy != 0.0) {
             const double cross = dx * v_kalman.y - dy * v_kalman.x;
             const double dot = dx * v_kalman.x + dy * v_kalman.y;
-            const double lagDeg = std::atan2(std::fabs(cross), dot) * 180.0 / kPi;
+            lagDeg = std::atan2(std::fabs(cross), dot) * 180.0 / kPi;
             if (lagDeg > 40.0) {  // 启动阈值(CALIB40)；校准带 40°–60°，零越框白盒断言为门
+                impl_->DiagPredict(interval_us, 0, std::sqrt(Norm2(v_kalman)), v_true_mag,
+                                   std::sqrt(Norm2(v_pred)), lagDeg, 0.0, 0.0,
+                                   "MECH_A_suppress", double(last.x), double(last.y),
+                                   double(last.t_us));
                 return;
             }
         }
     }
 
     // 均匀外推点数：预测区间内按 min_output_rate 布点（至少 1 个）。
+    const std::size_t pred_begin = out->size();  // A8-5b 诊断：本批预测点起点
     std::uint64_t n = std::uint64_t(interval_us / period_us);
     if (n == 0) {
         n = 1;
@@ -541,4 +716,23 @@ void StrokeModeler::Predict(std::vector<StrokePoint>* out) {
         p.t_us = last.t_us + std::uint64_t(interval_us);
         out->push_back(p);
     }
+
+    // A8-5b 诊断：n_pred = 本批产出预测点数。lead_far = 距最近真实点（last）最远的预测
+    // 点距离 —— 用户肉眼可感知的「笔尖前移量」（px）；lead_tail = 批次末点（停笔点）
+    // 距离，单独记以暴露「末端停笔点比均匀外推点更靠后」这一现象。
+    const int n_pred = int(out->size() - pred_begin);
+    double lead_far = 0.0;
+    double lead_tail = 0.0;
+    for (std::size_t i = pred_begin; i < out->size(); ++i) {
+        const double ddx = double((*out)[i].x) - double(last.x);
+        const double ddy = double((*out)[i].y) - double(last.y);
+        const double d = std::sqrt(ddx * ddx + ddy * ddy);
+        if (d > lead_far) {
+            lead_far = d;
+        }
+        lead_tail = d;  // 循环顺序即 push 顺序，末次即 back()
+    }
+    impl_->DiagPredict(interval_us, n_pred, std::sqrt(Norm2(v_kalman)), v_true_mag,
+                       std::sqrt(Norm2(v_pred)), lagDeg, lead_far, lead_tail, "ok",
+                       double(last.x), double(last.y), double(last.t_us));
 }

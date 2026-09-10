@@ -18,10 +18,16 @@
 // - readback：vkCmdCopyImageToBuffer + map 读回 RGBA8。
 // - exportPNG：readback + stb_image_write 编码 PNG。
 //
-// 窗口/swapchain 路径本期不做（init 收到非空 surface 时记录未实现）。
+// 窗口/swapchain 路径（A8-5，Android 先行）现为**可选实现**：init 收到非空 ANativeWindow*
+// （经 PlatformSurface 转 void*）时，VkBackend 建 VkSurfaceKHR+VkSwapchainKHR，present()
+// 从 no-op 改为 acquire → 源选择（tipHasContent_ ? merge 后 displayImage : canvasImage）→
+// blit → queuePresent，全程 GPU 内部不读回；离屏 canvasImage 仍唯一权威（determinism /
+// dgcExportPNG 零回归）。nullptr 仍走离屏，present 保持 no-op。Android WSI 代码一律以
+// DGCPAIN_ANDROID 隔离；host/headless 不 enable surface 扩展。
 // 内部用 std::mutex 串行化 GPU 提交与读回，避免 engine 渲染线程与 C API 线程竞态。
-// Vulkan 句柄由 Impl 内最小 RAII 守卫（VkTopHandle/VkDeviceHandle）持有，按
-// 「子对象 → device → instance」逆声明序析构；shutdown() 幂等（重复调用安全）。
+// Vulkan 句柄由 Impl 内最小 RAII 守卫（VkTopHandle/VkDeviceHandle/VkInstanceHandle）持有，
+// 按「swapchain → surface → 子对象 → device → instance」逆声明序析构；shutdown() 幂等
+// （重复调用安全）。
 class VkBackend : public IRenderBackend {
 public:
     VkBackend();
@@ -30,7 +36,8 @@ public:
     VkBackend(const VkBackend&) = delete;
     VkBackend& operator=(const VkBackend&) = delete;
 
-    // 窗口模式（保留接口，本期仅支持 surface==nullptr → 委托离屏）。
+    // 窗口模式（A8-5，Android 先行）：surface==nullptr → 离屏；非空 ANativeWindow* →
+    // onscreen（建 surface+swapchain，present 上屏）。host/headless 非空 surface 仅记录不支持。
     void init(PlatformSurface surface, int w, int h) override;
     void resize(int w, int h) override;
     void beginFrame() override;
