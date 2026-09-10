@@ -2,6 +2,21 @@
 
 #include <vulkan/vulkan.h>
 
+#ifdef DGCPAIN_ANDROID
+// A8-5：Android WSI。host 无 android platform 头/符号，须以 DGCPAIN_ANDROID 隔离。
+#include <android/native_window.h>  // ANativeWindow（消费端 dgcSetSurface 传入的窗口句柄）
+#include <vulkan/vulkan_android.h>  // vkCreateAndroidSurfaceKHR（VK_KHR_android_surface）
+#endif
+
+#ifdef __ANDROID__
+// A8-5 真机诊断：真机「user」固件不转发 native stderr 进 logcat（fprintf 无输出），
+// DGC-SWAP 走 Android 原生日志 API，用于确认 attach→swapchain→present 执行到哪一步。
+#include <android/log.h>
+#define DGC_SWAP_LOG(...) __android_log_print(ANDROID_LOG_INFO, "DGC-SWAP", __VA_ARGS__)
+#else
+#define DGC_SWAP_LOG(...) ((void)0)
+#endif
+
 #ifdef DGCPAIN_RENDERDOC_ENABLED
 #include "render/renderdoc/renderdoc_capture.h"
 #endif
@@ -20,10 +35,12 @@
 #ifdef DGCPAIN_PRECOMPILED_SPV
 #include "brush_composite_spv.h"  // Android：构建期 glslc 预编译内嵌（单一权威源仍是 .comp）
 #include "merge_spv.h"            // A8-2：merge.comp（canvas+tip→display）预编译内嵌
+#include "rotate_spv.h"           // A8-5：rotate.comp（预旋转）预编译内嵌
 #else
 #include <shaderc/shaderc.hpp>
 #include "brush_composite_glsl.h"  // 由 CMake 从 brush_composite.comp 生成（单一权威源）
 #include "merge_glsl.h"            // A8-2：merge.comp 运行时 shaderc 编译源
+#include "rotate_glsl.h"           // A8-5：rotate.comp 运行时 shaderc 编译源
 #endif
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -46,6 +63,16 @@ struct BrushPushConstant {
     float dispatchOffset[2];  // 包围盒 dispatch 原点（shader：c = gl_GlobalInvocationID.xy + offset）
 };
 static_assert(sizeof(BrushPushConstant) == 12 * sizeof(float), "push constant size");
+
+// 与 rotate.comp 的 push_constant 布局一一对应（A8-5 预旋转）。
+// ivec2 dstSize + int mode：与 GLSL 侧 vec2/int（std430/430 push constant 规则）对齐无坑，
+// 但仍显式排布为 12 字节并对齐到 4（int 无 16 字节对齐要求）。
+struct RotatePushConstant {
+    std::int32_t dstW;
+    std::int32_t dstH;
+    std::int32_t mode;  // 0=IDENTITY, 1=CCW90, 2=180, 3=CW90（几何定义，见 rotate.comp）
+};
+static_assert(sizeof(RotatePushConstant) == 3 * sizeof(std::int32_t), "rotate push size");
 
 // §4.5 GLSL → SPIR-V：host 用 shaderc 库在代码内编译（不 shell 调 glslc/glslangValidator）；
 // Android（NDK 无 libshaderc）改走构建期 glslc 预编译的内嵌 SPIR-V（DGCPAIN_PRECOMPILED_SPV）。
@@ -108,6 +135,36 @@ std::vector<uint32_t> CompileMergeShader(std::string* err) {
     shaderc::SpvCompilationResult result = compiler.CompileGlslToSpv(
         kMergeGlsl, std::strlen(kMergeGlsl),
         shaderc_compute_shader, "merge.comp", options);
+    if (result.GetCompilationStatus() != shaderc_compilation_status_success) {
+        if (err) {
+            *err = result.GetErrorMessage();
+        }
+        return {};
+    }
+    return std::vector<uint32_t>(result.begin(), result.end());
+#endif
+}
+
+// A8-5 预旋转：rotate.comp（离屏源 → swapchain image，按 currentTransform 旋转）。
+// 与 merge 同款：无 derivative/fwidth，用 gl_GlobalInvocationID + 普通 vkCmdDispatch。
+std::vector<uint32_t> CompileRotateShader(std::string* err) {
+#ifdef DGCPAIN_PRECOMPILED_SPV
+    (void)err;  // 预编译 SPIR-V 无运行时编译错误路径
+    const size_t nbytes = sizeof(kRotateSpv);
+    static_assert(sizeof(kRotateSpv) % sizeof(uint32_t) == 0,
+                  "embedded rotate SPIR-V byte array must be 4-byte aligned");
+    std::vector<uint32_t> spv(nbytes / sizeof(uint32_t));
+    std::memcpy(spv.data(), kRotateSpv, nbytes);
+    return spv;
+#else
+    shaderc::Compiler compiler;
+    shaderc::CompileOptions options;
+    options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1);
+    options.SetOptimizationLevel(shaderc_optimization_level_performance);
+    options.SetGenerateDebugInfo();
+    shaderc::SpvCompilationResult result = compiler.CompileGlslToSpv(
+        kRotateGlsl, std::strlen(kRotateGlsl),
+        shaderc_compute_shader, "rotate.comp", options);
     if (result.GetCompilationStatus() != shaderc_compilation_status_success) {
         if (err) {
             *err = result.GetErrorMessage();
@@ -353,6 +410,53 @@ struct VkDeviceHandle {
     }
 };
 
+// A8-5：VkSurfaceKHR 用 vkDestroySurfaceKHR(VkInstance, ...) 销毁，首参是 instance，与
+// VkDeviceHandle（首参 VkDevice）不匹配 → 新增 instance-bound 守卫（VK_KHR_surface）。
+// 模式完全仿 VkDeviceHandle：值语义、禁拷贝、可移动、reset()/析构幂等，额外持 instance。
+template <typename H, void (*Destroy)(VkInstance, H, const VkAllocationCallbacks*)>
+struct VkInstanceHandle {
+    VkInstance inst = VK_NULL_HANDLE;
+    H h = VK_NULL_HANDLE;
+
+    VkInstanceHandle() = default;
+    VkInstanceHandle(const VkInstanceHandle&) = delete;
+    VkInstanceHandle& operator=(const VkInstanceHandle&) = delete;
+    VkInstanceHandle(VkInstanceHandle&& other) noexcept : inst(other.inst), h(other.h) {
+        other.h = VK_NULL_HANDLE;
+    }
+    VkInstanceHandle& operator=(VkInstanceHandle&& other) noexcept {
+        if (this != &other) {
+            reset();
+            inst = other.inst;
+            h = other.h;
+            other.h = VK_NULL_HANDLE;
+        }
+        return *this;
+    }
+    ~VkInstanceHandle() { reset(); }
+
+    H get() const { return h; }
+    operator H() const { return h; }
+
+    void reset() {
+        if (h != VK_NULL_HANDLE) {
+            Destroy(inst, h, nullptr);
+            h = VK_NULL_HANDLE;
+        }
+    }
+    H release() {
+        H t = h;
+        h = VK_NULL_HANDLE;
+        return t;
+    }
+    // 收编新句柄：先销毁旧句柄，再记录 instance 与新句柄。
+    void assign(VkInstance i, H handle) {
+        reset();
+        inst = i;
+        h = handle;
+    }
+};
+
 }  // namespace
 
 struct VkBackend::Impl {
@@ -415,6 +519,46 @@ struct VkBackend::Impl {
     VkDeviceHandle<VkDescriptorPool, vkDestroyDescriptorPool> mergeDescriptorPool;
     VkDescriptorSet mergeDescriptorSet = VK_NULL_HANDLE;
 
+    // ── A8-5 预旋转（rotate.comp：离屏源 → swapchain image，按 currentTransform 旋转）──
+    // 真机 MDP1221 实测：preTransform=IDENTITY（方案 A）会让合成器按 ROTATE_90 处理我们
+    // 未旋转的内容，SurfaceView queueBuffer 挂死 4.4s 后 SIGSEGV（见 DGC-SWAP/DEBUG 日志）。
+    // 故必须保持 preTransform=currentTransform，并自行把内容旋转进身份朝向的 swapchain image。
+    VkDeviceHandle<VkDescriptorSetLayout, vkDestroyDescriptorSetLayout> rotateDescriptorLayout;
+    VkDeviceHandle<VkPipelineLayout, vkDestroyPipelineLayout> rotatePipelineLayout;
+    VkDeviceHandle<VkPipeline, vkDestroyPipeline> rotatePipeline;
+    VkDeviceHandle<VkDescriptorPool, vkDestroyDescriptorPool> rotateDescriptorPool;
+    VkDescriptorSet rotateDescriptorSet = VK_NULL_HANDLE;
+    // 预旋转临时目标：身份朝向（90/270 时 = (canvasH, canvasW)），GENERAL 布局，可 STORAGE 写。
+    VkDeviceHandle<VkImage, vkDestroyImage> rotateImage;
+    VkDeviceHandle<VkDeviceMemory, vkFreeMemory> rotateMemory;
+    VkDeviceHandle<VkImageView, vkDestroyImageView> rotateView;
+    uint32_t rotateW = 0;  // 0 = 未建
+    uint32_t rotateH = 0;
+
+    // ── A8-5 onscreen swapchain（可选上屏路径；离屏仍是唯一权威 canvasImage）──
+    // 声明序在 device 之后：逆声明序析构 = swapchain → surface → … → device → instance，
+    // 即 Vulkan 要求的孩子先于父释放（surface 只需 instance）。swapchainImages 属 swapchain
+    // 所有（image 生命随 swapchain，非自有资源），不逐个 vkDestroyImage、无独立守卫。
+    VkInstanceHandle<VkSurfaceKHR, vkDestroySurfaceKHR> surface;
+    VkDeviceHandle<VkSwapchainKHR, vkDestroySwapchainKHR> swapchain;
+    std::vector<VkImage> swapchainImages;  // 当前 swapchain 的 images（blit 目标池）
+    VkExtent2D swapchainExtent{};          // 当前 swapchain 尺寸（blit/present 目标区域）
+    VkPresentModeKHR presentMode_ = VK_PRESENT_MODE_FIFO_KHR;  // 实际选中（MAILBOX 优先退 FIFO）
+    // A8-5 预旋转状态（真机 MDP1221 实测：面板原生竖屏 1440x2160，横屏逻辑 2160x1440，
+    // SurfaceFlinger framebufferSpace=ROTATION_90，即 caps.currentTransform 非 IDENTITY）。
+    //   surfaceTransform_ = 创建时快照的 caps.currentTransform（诊断/旋转角来源）。
+    //   preRotate_        = 本帧 present 是否需要自行做 90/270 补偿（方案 B 开启后为真）。
+    // 语义见 CreateSwapchainLocked 顶部注释。
+    VkSurfaceTransformFlagBitsKHR surfaceTransform_ = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    bool preRotate_ = false;
+    VkFormat swapchainFormat_ = VK_FORMAT_UNDEFINED;  // 实际选中 swapchain image 格式（DGC-SWAP 诊断）
+    bool onscreen_ = false;       // 已绑 surface+swapchain → present() 走 onscreen 分支
+    bool swapchainValid_ = false; // 当前 swapchain 可用；out-of-date/surface-lost 置否
+    uint32_t presentSeq_ = 0;     // A8-5 DGC-SWAP：present 序号（限频日志用，仅 onscreen 计数）
+#ifdef DGCPAIN_ANDROID
+    ANativeWindow* androidWindow_ = nullptr;  // 建 surface 的窗口（同窗复用 / 换窗重建判定）
+#endif
+
     // bugfix（20fps 回退）：readback 快照缓存 —— 渲染线程每次 composite/clear 完成后
     // "顺手"把画布发布进这里；VkBackend::readback() 只从这里 memcpy，不碰 GPU、不等
     // 渲染线程。cache_mutex_ 与上面串行化 GPU 提交的 mutex_（VkBackend 成员）分开，
@@ -468,10 +612,18 @@ struct VkBackend::Impl {
         appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
         appInfo.apiVersion = VK_API_VERSION_1_1;
 
-        // 离屏：无 surface 扩展、无 layer。
+        // 离屏：无 layer。A8-5：Android 编译期无条件 enable WSI surface 扩展（.so 纯
+        // Android 构建，无副作用；host/headless 不 enable，present 保持 no-op）。
         VkInstanceCreateInfo instanceInfo{};
         instanceInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
         instanceInfo.pApplicationInfo = &appInfo;
+#ifdef DGCPAIN_ANDROID
+        const char* instExtNames[] = {VK_KHR_SURFACE_EXTENSION_NAME,
+                                      VK_KHR_ANDROID_SURFACE_EXTENSION_NAME};
+        instanceInfo.enabledExtensionCount =
+            (uint32_t)(sizeof(instExtNames) / sizeof(instExtNames[0]));
+        instanceInfo.ppEnabledExtensionNames = instExtNames;
+#endif
         VkInstance inst = VK_NULL_HANDLE;
         if (vkCreateInstance(&instanceInfo, nullptr, &inst) != VK_SUCCESS) {
             std::fprintf(stderr, "[VkBackend] vkCreateInstance failed\n");
@@ -548,13 +700,23 @@ struct VkBackend::Impl {
         derivFeatures.computeDerivativeGroupQuads = VK_TRUE;
         const char* derivExtName = VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME;
 
+        // 设备扩展：B4-1 fwidth（若支持）+ A8-5 Android VK_KHR_swapchain（编译期无条件，
+        // 与实例级 surface 扩展配套；host/headless 不 enable）。
+        std::array<const char*, 2> devExtNames{};
+        uint32_t devExtCount = 0;
+        if (useDerivatives) {
+            devExtNames[devExtCount++] = derivExtName;
+        }
+#ifdef DGCPAIN_ANDROID
+        devExtNames[devExtCount++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+#endif
         VkDeviceCreateInfo deviceInfo{};
         deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         deviceInfo.queueCreateInfoCount = 1;
         deviceInfo.pQueueCreateInfos = &queueInfo;
+        deviceInfo.enabledExtensionCount = devExtCount;
+        deviceInfo.ppEnabledExtensionNames = devExtCount ? devExtNames.data() : nullptr;
         if (useDerivatives) {
-            deviceInfo.enabledExtensionCount = 1;
-            deviceInfo.ppEnabledExtensionNames = &derivExtName;
             deviceInfo.pNext = &derivFeatures;
         }
         // storage image 写入是 core，无需额外 feature（shader 用 rgba8 显式格式）。
@@ -730,6 +892,72 @@ struct VkBackend::Impl {
             vkDestroyShaderModule(device, mmodule, nullptr);
         }
 
+        // ── A8-5 预旋转管线（源 image → swapchain image；2 storage image + push constant）──
+        // 与 merge 的唯一结构差异：带 push constant（dstSize + rotation mode）。
+        {
+            std::array<VkDescriptorSetLayoutBinding, 2> rb{};
+            rb[0].binding = 0;
+            rb[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            rb[0].descriptorCount = 1;
+            rb[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            rb[1].binding = 1;
+            rb[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            rb[1].descriptorCount = 1;
+            rb[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            VkDescriptorSetLayoutCreateInfo rlayoutInfo{};
+            rlayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            rlayoutInfo.bindingCount = (uint32_t)rb.size();
+            rlayoutInfo.pBindings = rb.data();
+            VkDescriptorSetLayout rdsl = VK_NULL_HANDLE;
+            vkCreateDescriptorSetLayout(device, &rlayoutInfo, nullptr, &rdsl);
+            rotateDescriptorLayout.assign(device, rdsl);
+
+            VkPushConstantRange rpcRange{};
+            rpcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            rpcRange.offset = 0;
+            rpcRange.size = sizeof(RotatePushConstant);
+            VkPipelineLayoutCreateInfo rplInfo{};
+            rplInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+            rplInfo.setLayoutCount = 1;
+            VkDescriptorSetLayout rsetLayouts[] = {rotateDescriptorLayout};
+            rplInfo.pSetLayouts = rsetLayouts;
+            rplInfo.pushConstantRangeCount = 1;
+            rplInfo.pPushConstantRanges = &rpcRange;
+            VkPipelineLayout rpl = VK_NULL_HANDLE;
+            vkCreatePipelineLayout(device, &rplInfo, nullptr, &rpl);
+            rotatePipelineLayout.assign(device, rpl);
+
+            std::string rerr;
+            std::vector<uint32_t> rspv = CompileRotateShader(&rerr);
+            if (rspv.empty()) {
+                std::fprintf(stderr, "[VkBackend] rotate shaderc compile failed: %s\n", rerr.c_str());
+                return;
+            }
+            VkShaderModuleCreateInfo rmoduleInfo{};
+            rmoduleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            rmoduleInfo.codeSize = rspv.size() * sizeof(uint32_t);
+            rmoduleInfo.pCode = rspv.data();
+            VkShaderModule rmodule = VK_NULL_HANDLE;
+            if (vkCreateShaderModule(device, &rmoduleInfo, nullptr, &rmodule) != VK_SUCCESS) {
+                std::fprintf(stderr, "[VkBackend] vkCreateShaderModule(rotate) failed\n");
+                return;
+            }
+            VkComputePipelineCreateInfo rpipeInfo{};
+            rpipeInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+            rpipeInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            rpipeInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            rpipeInfo.stage.module = rmodule;
+            rpipeInfo.stage.pName = "main";
+            rpipeInfo.layout = rotatePipelineLayout;
+            VkPipeline rpipe = VK_NULL_HANDLE;
+            if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &rpipeInfo, nullptr, &rpipe) !=
+                VK_SUCCESS) {
+                std::fprintf(stderr, "[VkBackend] vkCreateComputePipelines(rotate) failed\n");
+            }
+            rotatePipeline.assign(device, rpipe);
+            vkDestroyShaderModule(device, rmodule, nullptr);
+        }
+
         deviceReady = true;
     }
 
@@ -753,6 +981,13 @@ struct VkBackend::Impl {
         displayMemory.reset();
         mergeDescriptorPool.reset();
         mergeDescriptorSet = VK_NULL_HANDLE;
+        // A8-5 预旋转：descriptor pool/set + 临时目标 image（随画布重建/销毁）。
+        rotateDescriptorPool.reset();
+        rotateDescriptorSet = VK_NULL_HANDLE;
+        rotateView.reset();
+        rotateImage.reset();
+        rotateMemory.reset();
+        rotateW = rotateH = 0;
         width = height = 0;
         readbackSize = 0;
         readbackCached_ = false;
@@ -918,6 +1153,31 @@ struct VkBackend::Impl {
                 mWrites[i].pImageInfo = &mInfos[i];
             }
             vkUpdateDescriptorSets(device, 3, mWrites, 0, nullptr);
+        }
+
+        // A8-5 预旋转：descriptor 池/set（binding 0=源、1=rotateImage）+ 临时目标 image。
+        // rotateImage 尺寸在 present 时按「源身份朝向」确定（90/270 时 =(canvasH, canvasW)），
+        // 与 swapchain imageExtent 恒等 ⇒ 可 blit 1:1 进 swapchain。此处只建设施，尺寸待用。
+        {
+            std::array<VkDescriptorPoolSize, 1> rPoolSizes{};
+            rPoolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            rPoolSizes[0].descriptorCount = 2;
+            VkDescriptorPoolCreateInfo rpoolInfo{};
+            rpoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+            rpoolInfo.maxSets = 1;
+            rpoolInfo.poolSizeCount = (uint32_t)rPoolSizes.size();
+            rpoolInfo.pPoolSizes = rPoolSizes.data();
+            VkDescriptorPool rpool = VK_NULL_HANDLE;
+            vkCreateDescriptorPool(device, &rpoolInfo, nullptr, &rpool);
+            rotateDescriptorPool.assign(device, rpool);
+
+            VkDescriptorSetAllocateInfo rAlloc{};
+            rAlloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            rAlloc.descriptorPool = rotateDescriptorPool;
+            rAlloc.descriptorSetCount = 1;
+            VkDescriptorSetLayout rsetLayouts[] = {rotateDescriptorLayout};
+            rAlloc.pSetLayouts = rsetLayouts;
+            vkAllocateDescriptorSets(device, &rAlloc, &rotateDescriptorSet);
         }
 
         canvasReady = true;
@@ -1239,35 +1499,46 @@ struct VkBackend::Impl {
     // 的 command buffer；调用方必须已调过 BeginCommands()，本函数不调 SubmitAndWait()——
     // 可以是独立一次提交的一部分（RefreshReadbackCacheLocked 单独调用场景），也可以是
     // CompositeLocked 自己那次提交的一部分（合并省一次 GPU 往返）。
+    // A8-2/A8-5 共用的「显示源选择」：present 与读回 refresh 同一口径。仅当 tipHasContent_
+    // 为真时，先 fullscreen merge（canvas+tip → displayImage），并插一次 merge shader write →
+    // transfer read 的屏障（copy/blit 均为 transfer read）；返回应作为显示/读回源的 image。
+    // 无 tip 时直接返回 canvasImage（零额外 GPU 开销）。调用方已 BeginCommands()；返回的
+    // image 仍处 GENERAL（blit 的 src 布局过渡由 present 侧自行处理）。
+    // 抽成单一实现供读回与 present 复用，避免同一 merge 约定写成两份（§10.6）。
+    VkImage RecordDisplaySourceMergeLocked() {
+        if (!tipHasContent_) {
+            return canvasImage.get();
+        }
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, mergePipeline);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                mergePipelineLayout, 0, 1, &mergeDescriptorSet, 0, nullptr);
+        vkCmdDispatch(commandBuffer, (uint32_t)((width + 7) / 8),
+                      (uint32_t)((height + 7) / 8), 1);
+        // merge 写 displayImage（shader write）→ 后续 transfer read（copy/blit）。
+        VkImageMemoryBarrier mergeBarrier{};
+        mergeBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        mergeBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mergeBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        mergeBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        mergeBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        mergeBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        mergeBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        mergeBarrier.image = displayImage;
+        mergeBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &mergeBarrier);
+        return displayImage.get();
+    }
+
     void RecordRefreshCommands() {
 #ifdef DGCPAIN_TEST_HOOKS
         ++snapshotRefreshCount_;  // 每次实际快照刷新 +1（test hook，仅测试构建）。
 #endif
         // A8-2：有 tip 时先 fullscreen merge（canvas+tip → displayImage），读回源改为
         // displayImage；无 tip 时读回源仍为 canvasImage（与改造前逐位一致、零额外 GPU 拷贝）。
-        VkImage srcImage = canvasImage.get();
-        if (tipHasContent_) {
-            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, mergePipeline);
-            vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                    mergePipelineLayout, 0, 1, &mergeDescriptorSet, 0, nullptr);
-            vkCmdDispatch(commandBuffer, (uint32_t)((width + 7) / 8),
-                          (uint32_t)((height + 7) / 8), 1);
-            // merge 写 displayImage（shader write）→ CopyImageToBuffer 读（transfer read）。
-            VkImageMemoryBarrier mergeBarrier{};
-            mergeBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            mergeBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            mergeBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            mergeBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-            mergeBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            mergeBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            mergeBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            mergeBarrier.image = displayImage;
-            mergeBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                                 &mergeBarrier);
-            srcImage = displayImage.get();
-        }
+        // 源选择逻辑在 RecordDisplaySourceMergeLocked（与 A8-5 present 同口径，单一实现）。
+        VkImage srcImage = RecordDisplaySourceMergeLocked();
         VkBufferImageCopy region{};
         region.bufferOffset = 0;
         region.bufferRowLength = 0;
@@ -1315,6 +1586,559 @@ struct VkBackend::Impl {
         FinishRefreshReadback();
     }
 
+    // ── A8-5 onscreen swapchain 辅助 ──
+
+    // 拆除 surface+swapchain（幂等）。swapchain 先于 surface 释放，均先于 device/instance
+    // （DestroyDevice 于 device.reset() 前调用）。切回离屏（dgcSetSurface(NULL)）/换窗/销毁
+    // 竞态兜底时调用。live swapchain 存在时先 vkDeviceWaitIdle，确保无 in-flight acquire/
+    // present 引用将销毁的 images。
+    void TeardownSwapchainLocked() {
+        if (swapchain != VK_NULL_HANDLE) {
+            vkDeviceWaitIdle(device);
+        }
+        swapchain.reset();
+        swapchainImages.clear();
+        swapchainExtent = {};
+        swapchainValid_ = false;
+        onscreen_ = false;
+        surface.reset();
+#ifdef DGCPAIN_ANDROID
+        androidWindow_ = nullptr;
+#endif
+    }
+
+    // 从 ANativeWindow* 建 VkSurfaceKHR（仅 Android）。同窗已有 surface → 复用（resize/重建
+    // swapchain 时 surface 无需重建）；窗口变了 → 先拆旧 surface+swapchain 再建新 surface。
+    // 返回 false = 建 surface 失败（走既有错误路径：fprintf + 状态判定，不抛半初始化句柄）。
+#ifdef DGCPAIN_ANDROID
+    bool SetupAndroidSurfaceLocked(ANativeWindow* window) {
+        if (surface != VK_NULL_HANDLE && androidWindow_ == window) {
+            return true;
+        }
+        TeardownSwapchainLocked();
+        VkAndroidSurfaceCreateInfoKHR ci{};
+        ci.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
+        ci.window = window;
+        VkSurfaceKHR surf = VK_NULL_HANDLE;
+        if (vkCreateAndroidSurfaceKHR(instance.get(), &ci, nullptr, &surf) != VK_SUCCESS) {
+            std::fprintf(stderr, "[VkBackend] vkCreateAndroidSurfaceKHR failed\n");
+            return false;
+        }
+        surface.assign(instance.get(), surf);
+        androidWindow_ = window;
+        return true;
+    }
+#endif
+
+    // 查询 surface 能力并建 swapchain（present mode 优先 MAILBOX 退 FIFO，记录实际选中）。
+    // 重建（resize/out-of-date）时先释放旧 swapchain。失败走错误路径：onscreen_/swapchainValid_
+    // 保持 false → present 维持 no-op，不崩。swapchain image 以 TRANSFER_DST 建（blit 目标）。
+    void CreateSwapchainLocked() {
+        if (!deviceReady || surface == VK_NULL_HANDLE) {
+            return;
+        }
+        if (swapchain != VK_NULL_HANDLE) {
+            vkDeviceWaitIdle(device);  // 旧 swapchain 的 in-flight present 先落地
+            swapchain.reset();
+            swapchainImages.clear();
+        }
+        swapchainValid_ = false;
+        onscreen_ = false;
+
+        VkSurfaceCapabilitiesKHR caps{};
+        if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, surface.get(), &caps) !=
+            VK_SUCCESS) {
+            std::fprintf(stderr, "[VkBackend] vkGetPhysicalDeviceSurfaceCapabilitiesKHR failed\n");
+            return;
+        }
+        uint32_t fmtCount = 0;
+        vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface.get(), &fmtCount, nullptr);
+        std::vector<VkSurfaceFormatKHR> formats(fmtCount);
+        if (fmtCount) {
+            vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface.get(), &fmtCount,
+                                                 formats.data());
+        }
+        VkSurfaceFormatKHR format =
+            formats.empty() ? VkSurfaceFormatKHR{VK_FORMAT_B8G8R8A8_UNORM,
+                                                 VK_COLOR_SPACE_SRGB_NONLINEAR_KHR}
+                            : formats[0];
+        for (const VkSurfaceFormatKHR& f : formats) {
+            if (f.format == kCanvasFormat) {  // 尽量与离屏 canvas 同格式，blit 免格式转换
+                format = f;
+                break;
+            }
+        }
+        uint32_t pmCount = 0;
+        vkGetPhysicalDeviceSurfacePresentModesKHR(physicalDevice, surface.get(), &pmCount,
+                                                  nullptr);
+        std::vector<VkPresentModeKHR> modes(pmCount);
+        if (pmCount) {
+            vkGetPhysicalDeviceSurfacePresentModesKHR(physicalDevice, surface.get(), &pmCount,
+                                                      modes.data());
+        }
+        VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
+        for (const VkPresentModeKHR m : modes) {
+            if (m == VK_PRESENT_MODE_MAILBOX_KHR) {  // 优先 MAILBOX（低延迟），不支持退 FIFO
+                mode = m;
+                break;
+            }
+        }
+        presentMode_ = mode;
+        swapchainFormat_ = format.format;  // 记录实际选中格式（A8-5 DGC-SWAP 诊断：RGBA8=37 / BGRA8=44）
+        std::fprintf(stderr, "[VkBackend] present mode: %s\n",
+                     (mode == VK_PRESENT_MODE_MAILBOX_KHR) ? "MAILBOX" : "FIFO");
+
+        // ── A8-5 预旋转：变换与 extent（真机 MDP1221 实测 caps.currentTransform != IDENTITY）──
+        // Vulkan/Android 契约：preTransform = caps.currentTransform ⇒ 向合成器声明「内容已按该
+        // 变换预旋转好」，合成器便**不再**施加该旋转；此时 swapchain image 必须是**已旋转**的
+        // 身份尺寸（currentExtent 在 90/270 下相对面板身份尺寸横竖互换，需换回）。
+        //   方案 A（保底）：preTransform = IDENTITY，合成器自行施加旋转，blit 原样不改。
+        //   方案 B（终态，低延迟）：preTransform = caps.currentTransform + 自行按角预旋转内容。
+        const VkSurfaceTransformFlagBitsKHR tf = caps.currentTransform;
+        const bool rot90 = (tf & VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR) != 0;
+        const bool rot180 = (tf & VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR) != 0;
+        const bool rot270 = (tf & VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) != 0;
+        const bool swapXY = rot90 || rot270;  // 90/270 ⇒ 横竖互换
+        const bool anyRot = rot90 || rot180 || rot270;
+        surfaceTransform_ = tf;
+
+        // 帧缓冲（物理扫描）尺寸 = caps.currentExtent；身份（面板原生）尺寸 = 90/270 时互换。
+        const VkExtent2D fbExtent = caps.currentExtent;
+        VkExtent2D identityExtent = caps.currentExtent;
+        if (swapXY) {
+            std::swap(identityExtent.width, identityExtent.height);
+        }
+        VkExtent2D useFbExtent = fbExtent;
+        if (identityExtent.width == 0xFFFFFFFFu || identityExtent.width == 0 ||
+            identityExtent.height == 0xFFFFFFFFu || identityExtent.height == 0) {
+            // 非固定尺寸/暂时为 0（如最小化）：以离屏 canvas 尺寸（身份朝向）为期望，夹到 caps。
+            identityExtent.width = std::clamp((uint32_t)width, caps.minImageExtent.width,
+                                              caps.maxImageExtent.width);
+            identityExtent.height = std::clamp((uint32_t)height, caps.minImageExtent.height,
+                                               caps.maxImageExtent.height);
+            useFbExtent = identityExtent;
+            if (swapXY) {
+                std::swap(useFbExtent.width, useFbExtent.height);
+            }
+        }
+        // 方案 A：extent = 帧缓冲尺寸（未预旋转，与 canvas 同朝向，旋转交给合成器）；
+        // 方案 B：extent = 身份尺寸（内容已预旋转，合成器不再施加）。
+        const bool kUsePreRotation = true;  // 方案 B（终态）：真机验证 A 不可行（见 NOTE）
+        const VkExtent2D extent = kUsePreRotation ? identityExtent : useFbExtent;
+        swapchainExtent = extent;
+        preRotate_ = kUsePreRotation && anyRot;
+
+        uint32_t imageCount = caps.minImageCount + 1;  // 尽量 double/triple buffer
+        if (caps.maxImageCount > 0 && imageCount > caps.maxImageCount) {
+            imageCount = caps.maxImageCount;
+        }
+        // blit 目标需 TRANSFER_DST；不支持则如实记录，不强行走本路径。
+        const VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if ((caps.supportedUsageFlags & usage) == 0) {
+            std::fprintf(stderr, "[VkBackend] surface lacks TRANSFER_DST for blit present\n");
+            return;
+        }
+
+        VkSwapchainCreateInfoKHR sci{};
+        sci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+        sci.surface = surface.get();
+        sci.minImageCount = imageCount;
+        sci.imageFormat = format.format;
+        sci.imageColorSpace = format.colorSpace;
+        sci.imageExtent = extent;
+        sci.imageArrayLayers = 1;
+        sci.imageUsage = usage;
+        sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        // 方案 A：IDENTITY（合成器施加 currentTransform）；方案 B：匹配 caps.currentTransform
+        // （声明已自行预旋转，合成器不再施加）。
+        sci.preTransform =
+            kUsePreRotation ? tf : VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+        sci.compositeAlpha = (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR)
+                                 ? VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR
+                                 : VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+        sci.presentMode = mode;
+        sci.clipped = VK_TRUE;
+        sci.oldSwapchain = VK_NULL_HANDLE;
+        VkSwapchainKHR swap = VK_NULL_HANDLE;
+        if (vkCreateSwapchainKHR(device.get(), &sci, nullptr, &swap) != VK_SUCCESS) {
+            std::fprintf(stderr, "[VkBackend] vkCreateSwapchainKHR failed\n");
+            return;
+        }
+        swapchain.assign(device.get(), swap);
+
+        uint32_t imgCount = 0;
+        vkGetSwapchainImagesKHR(device.get(), swapchain.get(), &imgCount, nullptr);
+        swapchainImages.resize(imgCount);
+        vkGetSwapchainImagesKHR(device.get(), swapchain.get(), &imgCount, swapchainImages.data());
+        // A8-5 诊断（真机决定性）：打印 transform 位/extent/preTransform/方案。
+        {
+            const char* tfName = (tf & VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR)    ? "ROTATE_90"
+                                 : (tf & VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) ? "ROTATE_270"
+                                 : (tf & VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR) ? "ROTATE_180"
+                                                                                  : "IDENTITY";
+            DGC_SWAP_LOG("swapchain create: currentTransform=%s(0x%x) currentExtent=%ux%u "
+                         "identity=%ux%u sci.imageExtent=%ux%u preTransform=%s mode=%d images=%u "
+                         "plan=%s",
+                         tfName, (unsigned)tf, fbExtent.width, fbExtent.height, identityExtent.width,
+                         identityExtent.height, extent.width, extent.height,
+                         kUsePreRotation ? "currentTransform" : "IDENTITY",
+                         (int)mode, imgCount, kUsePreRotation ? "B" : "A");
+        }
+        swapchainValid_ = true;
+        onscreen_ = true;
+    }
+
+    // present() onscreen 真实现；离屏/未绑 → no-op（权威 canvasImage 不受影响，离屏行为零变化）。
+    // acquire → 显示源选择 → 布局过渡（UNDEFINED→TRANSFER_DST_OPTIMAL→PRESENT_SRC）→
+    // vkCmdBlitImage → vkQueuePresentKHR，全程 GPU 内不读回。CPU 同步（mutex_ 串行、单帧在
+    // 飞）：acquire 用现成 fence 等到 image 可用；blit 走 SubmitAndWait（fence-wait）；present
+    // 无 wait semaphore 亦安全（同队列 + 已 fence-wait，无并发帧引用该 image）。
+    void PresentLocked() {
+        if (!onscreen_ || !swapchainValid_ || !canvasReady) {
+            return;
+        }
+#ifdef DGCPAIN_ANDROID
+        if (swapchainImages.empty()) {
+            return;
+        }
+        vkResetFences(device.get(), 1, &fence.h);
+        uint32_t imageIndex = 0;
+        VkResult aq = vkAcquireNextImageKHR(device.get(), swapchain.get(), UINT64_MAX,
+                                            VK_NULL_HANDLE, fence.get(), &imageIndex);
+        // VK_SUCCESS 与 VK_SUBOPTIMAL_KHR 都返回了有效 image（SUBOPTIMAL 在 present 时再重建，
+        // 避免每帧重建 churn）；仅 VK_ERROR_OUT_OF_DATE_KHR 需立即重建后重试一次本帧。
+        if (aq == VK_ERROR_OUT_OF_DATE_KHR) {
+            // swapchain 与 surface 尺寸失配/过时 → 重建后重试一次本帧。
+            CreateSwapchainLocked();
+            if (!swapchainValid_ || swapchainImages.empty()) {
+                return;
+            }
+            vkResetFences(device.get(), 1, &fence.h);
+            aq = vkAcquireNextImageKHR(device.get(), swapchain.get(), UINT64_MAX, VK_NULL_HANDLE,
+                                       fence.get(), &imageIndex);
+            if (aq != VK_SUCCESS && aq != VK_SUBOPTIMAL_KHR) {
+                std::fprintf(stderr, "[VkBackend] vkAcquireNextImageKHR retry failed (%d)\n", aq);
+                return;
+            }
+        } else if (aq == VK_ERROR_SURFACE_LOST_KHR) {
+            std::fprintf(stderr, "[VkBackend] vkAcquireNextImageKHR surface lost\n");
+            TeardownSwapchainLocked();  // 等下次 dgcSetSurface 重建
+            return;
+        } else if (aq != VK_SUCCESS && aq != VK_SUBOPTIMAL_KHR) {
+            // 含 VK_TIMEOUT（暂无空闲 image，如 FIFO 满帧）：本帧跳过，不崩。
+            std::fprintf(stderr, "[VkBackend] vkAcquireNextImageKHR failed (%d)\n", aq);
+            return;
+        }
+        vkWaitForFences(device.get(), 1, &fence.h, VK_TRUE, UINT64_MAX);
+        if (imageIndex >= swapchainImages.size()) {
+            return;
+        }
+        ++presentSeq_;
+        if (presentSeq_ == 1 || presentSeq_ % 180 == 0) {
+            DGC_SWAP_LOG("present seq=%u image=%u extent=%dx%d", presentSeq_, imageIndex,
+                         (int)swapchainExtent.width, (int)swapchainExtent.height);
+        }
+
+        BeginCommands();
+        // ── 方案 B：预旋转路径（source → rotateImage[身份朝向] → swapchain）──────────────
+        // 真机验证：preTransform=IDENTITY（方案 A）会让 SurfaceView queueBuffer 挂死 4.4s
+        // 后 SIGSEGV，故必须 preTransform=currentTransform 并自行旋转。vkCmdBlitImage 无法
+        // 转置（x→x、y→y 两个独立 1D 缩放），改用 rotate.comp。
+        if (preRotate_) {
+            // 源身份朝向尺寸 = 90/270 时 (canvasH, canvasW)（与 swapchain imageExtent 恒等）。
+            const uint32_t reqW = (surfaceTransform_ & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR |
+                                                        VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR))
+                                      ? (uint32_t)height
+                                      : (uint32_t)width;
+            const uint32_t reqH = (surfaceTransform_ & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR |
+                                                        VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR))
+                                      ? (uint32_t)width
+                                      : (uint32_t)height;
+            if (reqW != rotateW || reqH != rotateH) {
+                rotateView.reset();
+                rotateImage.reset();
+                rotateMemory.reset();
+                VkImage rimg = VK_NULL_HANDLE;
+                VkDeviceMemory rmem = VK_NULL_HANDLE;
+                CreateImage(device.get(), physicalDevice, reqW, reqH, kCanvasFormat,
+                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                            VK_IMAGE_LAYOUT_GENERAL, rimg, rmem);
+                rotateImage.assign(device.get(), rimg);
+                rotateMemory.assign(device.get(), rmem);
+                rotateView.assign(device.get(),
+                                  CreateImageView(device.get(), rimg, kCanvasFormat));
+                if (rotateView.get() == VK_NULL_HANDLE || rotateDescriptorSet == VK_NULL_HANDLE) {
+                    std::fprintf(stderr, "[VkBackend] rotate image/view create failed\n");
+                    rotateImage.reset();
+                    rotateMemory.reset();
+                    rotateView.reset();
+                    rotateW = rotateH = 0;
+                    return;
+                }
+                VkDescriptorImageInfo rInfos[2]{};
+                rInfos[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;  // 源（每帧写）
+                rInfos[1].imageView = rotateView;
+                rInfos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                // 绑定 0 的 imageView 每帧随源变，先占位（fill 时逐帧更新）。
+                rInfos[0].imageView = canvasView;
+                VkWriteDescriptorSet rWrites[2]{};
+                for (int i = 0; i < 2; ++i) {
+                    rWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    rWrites[i].dstSet = rotateDescriptorSet;
+                    rWrites[i].dstBinding = (uint32_t)i;
+                    rWrites[i].descriptorCount = 1;
+                    rWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                    rWrites[i].pImageInfo = &rInfos[i];
+                }
+                vkUpdateDescriptorSets(device.get(), 2, rWrites, 0, nullptr);
+                rotateW = reqW;
+                rotateH = reqH;
+            }
+            // 源选择（同 readback 口径）；把源 imageView 写进 rotate 描述符 binding 0。
+            VkImage srcImage = RecordDisplaySourceMergeLocked();
+            VkImageView srcView = (srcImage == displayImage.get() && displayView.get() != VK_NULL_HANDLE)
+                                      ? displayView.get()
+                                      : canvasView.get();
+            VkDescriptorImageInfo sInfo{};
+            sInfo.imageView = srcView;
+            sInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            VkWriteDescriptorSet sw{};
+            sw.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            sw.dstSet = rotateDescriptorSet;
+            sw.dstBinding = 0;
+            sw.descriptorCount = 1;
+            sw.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            sw.pImageInfo = &sInfo;
+            vkUpdateDescriptorSets(device.get(), 1, &sw, 0, nullptr);
+
+            // 源 GENERAL → GENERAL（storage 读写，无需换布局；仅补访问/阶段同步）。
+            VkImageMemoryBarrier sBar{};
+            sBar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            sBar.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            sBar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            sBar.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            sBar.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            sBar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            sBar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            sBar.image = srcImage;
+            sBar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                 &sBar);
+
+            // rotateImage 写入前同步：新图首帧内容未定义、且此后进入 SHADER_WRITE，
+            // 显式 GENERAL→GENERAL 补一次（全像素覆盖，无需保留旧内容）。
+            VkImageMemoryBarrier rIn{};
+            rIn.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            rIn.srcAccessMask = 0;
+            rIn.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            rIn.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            rIn.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            rIn.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            rIn.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            rIn.image = rotateImage.get();
+            rIn.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                 &rIn);
+
+            // surface transform → rotate.comp mode（mode 几何定义见 rotate.comp 头注释）：
+            //   IDENTITY → 0, ROTATE_90 → 3(CW90), ROTATE_180 → 2(180), ROTATE_270 → 1(CCW90)。
+            // 注意 90↔3 / 270↔1 是**反直觉**的：ROTATE_90 需要的是顺时针 90°。真机 MDP1221
+            // 实测把 ROTATE_90 接 mode 1（逆时针）时内容整整偏 180°（F 探针：竖笔左右相反
+            // 且两横臂上下颠倒）—— 即当时的映射方向反了，本处按实测修正。
+            const int rotMode = (surfaceTransform_ & VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR)    ? 1
+                                : (surfaceTransform_ & VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR)  ? 2
+                                : (surfaceTransform_ & VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR)   ? 3
+                                                                                                 : 0;
+            RotatePushConstant rpc{};
+            rpc.dstW = (std::int32_t)rotateW;
+            rpc.dstH = (std::int32_t)rotateH;
+            rpc.mode = rotMode;
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rotatePipeline);
+            vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rotatePipelineLayout,
+                                    0, 1, &rotateDescriptorSet, 0, nullptr);
+            vkCmdPushConstants(commandBuffer, rotatePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                               sizeof(rpc), &rpc);
+            vkCmdDispatch(commandBuffer, (rotateW + 7) / 8, (rotateH + 7) / 8, 1);
+            // rotateImage GENERAL（shader write）→ TRANSFER_SRC_OPTIMAL（blit 源）。
+            VkImageMemoryBarrier rOut{};
+            rOut.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            rOut.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            rOut.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            rOut.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            rOut.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            rOut.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            rOut.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            rOut.image = rotateImage.get();
+            rOut.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                 &rOut);
+
+            // swapchain image UNDEFINED → TRANSFER_DST_OPTIMAL，blit rotateImage（1:1）。
+            VkImage dst = swapchainImages[imageIndex];
+            VkImageMemoryBarrier dstBar{};
+            dstBar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            dstBar.srcAccessMask = 0;
+            dstBar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            dstBar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            dstBar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            dstBar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            dstBar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            dstBar.image = dst;
+            dstBar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                 &dstBar);
+            VkImageBlit blit{};
+            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            blit.srcOffsets[0] = {0, 0, 0};
+            blit.srcOffsets[1] = {(int32_t)rotateW, (int32_t)rotateH, 1};
+            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            blit.dstOffsets[0] = {0, 0, 0};
+            blit.dstOffsets[1] = {(int32_t)swapchainExtent.width, (int32_t)swapchainExtent.height, 1};
+            vkCmdBlitImage(commandBuffer, rotateImage.get(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+            // 收尾：rotateImage 回 GENERAL；swapchain → PRESENT_SRC。
+            VkImageMemoryBarrier rBack{};
+            rBack.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            rBack.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            rBack.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            rBack.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            rBack.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            rBack.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            rBack.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            rBack.image = rotateImage.get();
+            rBack.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            VkImageMemoryBarrier dstPresent{};
+            dstPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            dstPresent.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            dstPresent.dstAccessMask = 0;
+            dstPresent.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            dstPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            dstPresent.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            dstPresent.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            dstPresent.image = dst;
+            dstPresent.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            VkImageMemoryBarrier postBars[2] = {rBack, dstPresent};
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2,
+                                 postBars);
+            SubmitAndWait();
+
+            VkPresentInfoKHR pi{};
+            pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+            pi.swapchainCount = 1;
+            pi.pSwapchains = &swapchain.h;
+            pi.pImageIndices = &imageIndex;
+            VkResult pr = vkQueuePresentKHR(queue, &pi);
+            if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
+                CreateSwapchainLocked();
+            } else if (pr == VK_ERROR_SURFACE_LOST_KHR) {
+                std::fprintf(stderr, "[VkBackend] vkQueuePresentKHR surface lost\n");
+                TeardownSwapchainLocked();
+            } else if (pr != VK_SUCCESS) {
+                std::fprintf(stderr, "[VkBackend] vkQueuePresentKHR failed (%d)\n", pr);
+            }
+            return;
+        }
+
+        // ── 方案 A：未预旋转（extent 与 canvas 同朝向，旋转交合成器）──
+        // 1) blit 源 = 显示源选择（同 readback 口径：tipHasContent_ 先 merge → displayImage）。
+        VkImage srcImage = RecordDisplaySourceMergeLocked();
+        // 源布局 GENERAL → TRANSFER_SRC_OPTIMAL（vkCmdBlitImage 要求 transfer src）。
+        VkImageMemoryBarrier srcBar{};
+        srcBar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        srcBar.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        srcBar.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        srcBar.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        srcBar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        srcBar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        srcBar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        srcBar.image = srcImage;
+        srcBar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &srcBar);
+        // 2) swapchain image UNDEFINED → TRANSFER_DST_OPTIMAL（每帧全量覆盖，无需保留旧内容）。
+        VkImage dst = swapchainImages[imageIndex];
+        VkImageMemoryBarrier dstBar{};
+        dstBar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        dstBar.srcAccessMask = 0;
+        dstBar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        dstBar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        dstBar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        dstBar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        dstBar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        dstBar.image = dst;
+        dstBar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &dstBar);
+        // 3) blit 全画布 → swapchain image（尺寸不一致时线性缩放）。
+        //    A8-5 预旋转（方案 B）：preTransform 已声明自行预旋转，需在此把内容按 transform
+        //    旋转。vkCmdBlitImage 的 src/dst offsets 是**两个独立 1D 缩放**（x→x、y→y），**不能
+        //    转置**，故 90/270 不能靠重排 offsets 实现——需旋转渲染路径（见 PresentLocked 顶部
+        //    TODO）。方案 A（preRotate_ 恒 false）下保持原样 1:1 blit。
+        VkImageBlit blit{};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.srcOffsets[0] = {0, 0, 0};
+        blit.srcOffsets[1] = {std::max(width, 1), std::max(height, 1), 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.dstOffsets[0] = {0, 0, 0};
+        blit.dstOffsets[1] = {(int32_t)swapchainExtent.width, (int32_t)swapchainExtent.height, 1};
+        // 画布与 swapchain 通常同尺寸同格式（1:1 免缩放）；canvas 尺寸由离屏权威决定，可能与
+        // swapchain 实际 extent 不同（缩放时才用得上 filter）。选 NEAREST：格式不一致时规格
+        // 只允许 NEAREST，且 1:1 blit 时 filter 无影响（不引入 LINEAR 的格式采样特性依赖）。
+        vkCmdBlitImage(commandBuffer, srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+        // 4) 收尾过渡：源回 GENERAL（后续 composite/readback 期待 GENERAL）；swapchain →
+        // PRESENT_SRC（present engine 读）。
+        VkImageMemoryBarrier srcBack{};
+        srcBack.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        srcBack.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        srcBack.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+        srcBack.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        srcBack.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        srcBack.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        srcBack.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        srcBack.image = srcImage;
+        srcBack.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkImageMemoryBarrier dstPresent{};
+        dstPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        dstPresent.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        dstPresent.dstAccessMask = 0;  // present engine read（隐式依赖由 vkQueuePresentKHR 承担）
+        dstPresent.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        dstPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        dstPresent.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        dstPresent.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        dstPresent.image = dst;
+        dstPresent.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkImageMemoryBarrier postBars[2] = {srcBack, dstPresent};
+        vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2,
+                             postBars);
+        SubmitAndWait();
+
+        VkPresentInfoKHR pi{};
+        pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        pi.swapchainCount = 1;
+        pi.pSwapchains = &swapchain.h;
+        pi.pImageIndices = &imageIndex;
+        VkResult pr = vkQueuePresentKHR(queue, &pi);
+        if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
+            CreateSwapchainLocked();  // 本帧已交付；下一帧用新 swapchain
+        } else if (pr == VK_ERROR_SURFACE_LOST_KHR) {
+            std::fprintf(stderr, "[VkBackend] vkQueuePresentKHR surface lost\n");
+            TeardownSwapchainLocked();
+        } else if (pr != VK_SUCCESS) {
+            std::fprintf(stderr, "[VkBackend] vkQueuePresentKHR failed (%d)\n", pr);
+        }
+#endif  // DGCPAIN_ANDROID
+    }
+
     void DestroyDevice() {
 #ifdef DGCPAIN_RENDERDOC_ENABLED
         // 若从未触发过首次 composite（未画任何笔迹），确保未闭合的初始化抓帧在此收尾，避免悬挂。
@@ -1328,6 +2152,17 @@ struct VkBackend::Impl {
         }
         vkDeviceWaitIdle(device);
         DestroyCanvas();
+        // A8-5：onscreen swapchain → surface 先于 device/instance 释放（swapchain→surface→
+        // device→instance）。surface 只需 instance、swapchain 需 device（此刻仍活）。
+        swapchain.reset();
+        surface.reset();
+        swapchainImages.clear();
+        swapchainExtent = {};
+        swapchainValid_ = false;
+        onscreen_ = false;
+#ifdef DGCPAIN_ANDROID
+        androidWindow_ = nullptr;
+#endif
         fence.reset();
         pipeline.reset();
         pipelineLayout.reset();
@@ -1335,6 +2170,12 @@ struct VkBackend::Impl {
         mergePipeline.reset();
         mergePipelineLayout.reset();
         mergeDescriptorLayout.reset();
+        // A8-5 预旋转：与 merge 同理，须在 device.reset() 前显式释放 device 子对象，
+        // 否则 Impl 析构时 rotatePipeline 守卫会对已销毁的 device 调 vkDestroyPipeline
+        // → VUID-vkDestroyPipeline-device-parameter → abort（真机/主机 ctest 同一路径）。
+        rotatePipeline.reset();
+        rotatePipelineLayout.reset();
+        rotateDescriptorLayout.reset();
         commandPool.reset();
         commandBuffer = VK_NULL_HANDLE;
         device.reset();
@@ -1355,8 +2196,38 @@ void VkBackend::init(PlatformSurface surface, int w, int h) {
         initOffscreen(w, h);
         return;
     }
-    // 窗口/swapchain 路径本期不做。
-    std::fprintf(stderr, "[VkBackend] windowed surface path not implemented (B2-1)\n");
+    // A8-5：非空 surface（ANativeWindow*）→ onscreen。仅 Android 建 VkSurfaceKHR +
+    // VkSwapchainKHR；host 无可建 surface 的平台路径（headless/lavapipe），如实记录，
+    // 离屏权威 canvas 不受影响。离屏 canvasImage 仍照常建（present 的 blit 源）。
+#ifdef DGCPAIN_ANDROID
+    std::lock_guard<std::mutex> lock(mutex_);
+    impl_->EnsureDevice();
+    if (!impl_->deviceReady) {
+        return;
+    }
+    // 画布仅当缺失/尺寸变化才重建（换窗/重复 setSurface 不清空既有笔迹）。
+    if (impl_->width != w || impl_->height != h || !impl_->canvasReady) {
+        impl_->CreateCanvas(w, h);
+    }
+    if (!impl_->SetupAndroidSurfaceLocked(reinterpret_cast<ANativeWindow*>(surface))) {
+        return;
+    }
+    impl_->CreateSwapchainLocked();
+    // A8-5 修复（SWAPCHAIN 全黑）：attach 后立即把当前 canvas present 一次——present() 原本
+    // 仅随输入驱动的 composite flush 触发，attach（dgcSetSurface 非空窗）后若无输入则永无
+    // 首帧，SurfaceView(BLAST) 恒黑。此处同步补一次「现状画布」blit→queuePresent，进
+    // SWAPCHAIN 即有可见画面；canvas 此刻已 clear/composite 过（消费端 nativeInit 后即 dgcClear
+    // 纸白、笔画实时 composite），内容有效。离屏/未绑不受影响（本分支仅非空窗走）。
+    DGC_SWAP_LOG("attach surface w=%d h=%d fmt=%d pmmode=%s valid=%d onscreen=%d", impl_->width,
+                 impl_->height, (int)impl_->swapchainFormat_,
+                 (impl_->presentMode_ == VK_PRESENT_MODE_MAILBOX_KHR) ? "MAILBOX" : "FIFO",
+                 int(impl_->swapchainValid_), int(impl_->onscreen_));
+    if (impl_->swapchainValid_ && impl_->onscreen_) {
+        impl_->PresentLocked();  // 立即上屏首帧（PresentLocked 内部已在 Onscreen 分支）
+    }
+#else
+    std::fprintf(stderr, "[VkBackend] windowed present (A8-5) requires Android build\n");
+#endif
 }
 
 void VkBackend::resize(int w, int h) {
@@ -1365,6 +2236,12 @@ void VkBackend::resize(int w, int h) {
         return;
     }
     impl_->CreateCanvas(w, h);
+#ifdef DGCPAIN_ANDROID
+    // A8-5：onscreen 态 surface 尺寸变化 → 重建 swapchain（离屏态无 swapchain，行为不变）。
+    if (impl_->onscreen_) {
+        impl_->CreateSwapchainLocked();
+    }
+#endif
 }
 
 void VkBackend::beginFrame() {
@@ -1387,7 +2264,11 @@ void VkBackend::clearCanvas(float r, float g, float b, float a) {
 }
 
 void VkBackend::present() {
-    // 离屏模式 no-op（§4.0.5）。
+    // A8-5：onscreen 绑定下走 PresentLocked（acquire → 源选择 → blit → queuePresent，
+    // 全程 GPU 内不读回）；离屏/未绑时 PresentLocked 内部早退，保持 no-op（§4.0.5 语义）。
+    // 离屏每帧开销仅一次无竞争 mutex 加解锁（与 composite 同线程串行），可忽略。
+    std::lock_guard<std::mutex> lock(mutex_);
+    impl_->PresentLocked();
 }
 
 void VkBackend::requestSnapshotRefresh() {
@@ -1416,6 +2297,9 @@ void VkBackend::shutdown() {
 
 void VkBackend::initOffscreen(int w, int h) {
     std::lock_guard<std::mutex> lock(mutex_);
+    // A8-5：切回离屏（dgcSetSurface(NULL) / 首启离屏）时释放已绑 surface/swapchain，
+    // present 回 no-op。幂等：未绑过 onscreen 时 no-op。
+    impl_->TeardownSwapchainLocked();
     impl_->EnsureDevice();
     impl_->CreateCanvas(w, h);
 }

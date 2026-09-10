@@ -249,3 +249,11 @@ add_executable(test_predictor_curve_overshoot test_predictor_curve_overshoot.cpp
 target_include_directories(test_predictor_curve_overshoot PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(test_predictor_curve_overshoot PRIVATE dgc_paint)
 add_test(NAME test_predictor_curve_overshoot COMMAND test_predictor_curve_overshoot)
+
+# bugfix-prediction-underscale 正式回归：稳态匀速段的外推前移量必须贴 |v_kalman|·interval，
+# 不得被「单样本瞬时弦速度」压到其下（真机实测抑制 12–14%）。纯 CPU 白盒：抖动匀速直线
+# 的 lead/ideal ≥ 96% + 抖动敏感度 ≤ 5% + 领先守卫。无条件构建/跑。
+add_executable(test_predictor_steady_no_underscale test_predictor_steady_no_underscale.cpp)
+target_include_directories(test_predictor_steady_no_underscale PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_predictor_steady_no_underscale PRIVATE dgc_paint)
+add_test(NAME test_predictor_steady_no_underscale COMMAND test_predictor_steady_no_underscale)
