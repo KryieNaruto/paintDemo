@@ -21,6 +21,12 @@ option(DGCPAIN_RENDER_VULKAN  "Routes A/E/B: Vulkan compute"        ON)
 option(DGCPAIN_RENDER_SKIA    "Route C: Skia GLES3"                 OFF)
 option(DGCPAIN_RENDER_BGFX    "Route D: bgfx"                       OFF)
 
+# A8-5b 诊断插桩（临时）：把 [PRED]/[PRED-CFG]/[PRED-SUM]/[PERF] 诊断日志编进库并经
+# __android_log_print 送上真机 logcat（真机 user 固件不转发 native stderr）。默认 OFF，
+# 生产构建零开销。测量结束后连同 core/dgc_perf_log.h、core/stroke_predictor.cpp 的
+# DGCPAIN_PERF_LOG 调用点一起移除。
+option(DGCPAIN_PERF          "Emit diagnostic logs to logcat (measurement only)" OFF)
+
 # 通用选项
 option(DGCPAIN_BUILD_TESTS    "Build host unit tests"               ON)
 option(DGCPAIN_BUILD_CLI      "Build CLI host (host only)"          ON)
@@ -103,6 +109,12 @@ if(DGCPAIN_ANDROID)
 endif()
 if(DGCPAIN_TEST_HOOKS)
     target_compile_definitions(dgc_paint PRIVATE DGCPAIN_TEST_HOOKS=1)
+endif()
+if(DGCPAIN_PERF)
+    # A8-5b 诊断（临时）：打开 core/engine.cpp:445 与 core/stroke_predictor.cpp 的
+    # [PERF]/[PRED] 日志；Android 下 DGCPAIN_PERF_LOG 走 __android_log_print（liblog
+    # 已在上面 DGCPAIN_ANDROID 块内链接），host 下回落 fprintf(stderr) 供本地复现。
+    target_compile_definitions(dgc_paint PRIVATE DGCPAIN_PERF=1)
 endif()
 
 # ── 路线分发：E0-3 各子目录尚不存在，`if(EXISTS ...)` 守卫生效为空操作；
