@@ -38,6 +38,44 @@ struct Vec2 {
 // 模平方（减速不过冲用：比较卡尔曼 v 与最近真实速度的大小，取较小者作外推速度）。
 static double Norm2(const Vec2& v) { return v.x * v.x + v.y * v.y; }
 
+// ── 减速/停笔判据（bugfix-prediction-underscale）──────────────────────────────
+// 语义：只有当「本批瞬时弦速度相对上一批、或相对卡尔曼平滑速度」发生显著坍缩时，才认定
+// 笔在减速/停笔，此时外推速度取真实位移方向（v_pred = v_true），末尾预测点随之坍缩、
+// 不留永久凸尾（0aa99e1 / bugfix-prediction-decel 契约）。
+//
+// 为什么不能沿用原来的 `|v_true| < |v_kalman|`：v_true 是**单个重采样间隔**的瞬时弦速度。
+// 稳态匀速段两者本应相等，但只要样本时间戳带一点抖动（真机必然），单间隔弦长就会忽长忽
+// 短，|v_true| 在一半样本上低于 |v_kalman| → 原判据在匀速段恒命中，把 v_pred 压到弦速度
+// 之下（真机实测 v_pred/|v_kalman| 中位 0.88，抑制 12–14%），外推距离系统性不足。
+//
+// 新判据两条并联，任一条成立即判减速：
+//   (1) 相对卡尔曼显著坍缩：|v_true| < |v_kalman| · kDecelRatioVsKalman。相对量纲，
+//       速度快慢通吃；稳态弦速度抖动幅度由「抖动 / 半采样间隔」决定，恒 < 30%，
+//       故 0.55 的余量不会被抖动吃穿。
+//   (2) 相对上一批显著坍缩：|v_true| < |v_true_prev| · kDecelRatioVsPrev。真减速是
+//       逐样本单调坍缩，两批之间必然跌破一半；时间戳抖动只影响单批，不改变批间趋势。
+// 停笔（本批 v_true == 0）两条都天然命中。
+//
+// 取 0.55 而非更低，是为了保住原判据在「人为无抖动、纯线性减速」档案里的逐位行为
+// （见 test_predictor_decel_clean：该档案下 |v_true|/|v_kalman| 在尾部降到 0.198，
+// 0.55 处仍有 5 个样本如实判减速，与修复前一致）。
+constexpr double kDecelRatioVsKalman = 0.55;
+constexpr double kDecelRatioVsPrev = 0.50;
+
+static bool IsDecel(double nk, double nt, bool has_prev_true, double prev_v_true_mag) {
+    if (nt <= 0.0) {
+        return true;  // 完全停住：外推塌缩到最近真实点。
+    }
+    if (nt < nk * kDecelRatioVsKalman) {
+        return true;
+    }
+    if (has_prev_true && prev_v_true_mag > 0.0 &&
+        std::sqrt(nt) < prev_v_true_mag * kDecelRatioVsPrev) {
+        return true;
+    }
+    return false;
+}
+
 // ── WobbleSmoother ──────────────────────────────────────────────────────────
 // 镜像 ink_stroke_modeler::WobbleSmoother：低通滤波（运动）→ 时间变权移动平均
 // （静止 dwell 分支累积平均）。抑制手抖（高频分量）。
@@ -441,6 +479,8 @@ struct StrokeModeler::Impl {
         last_output_ = {};
         has_prev_ = false;
         prev_output_ = {};
+        has_prev_true_ = false;
+        prev_v_true_mag_ = 0.0;
     }
 
     std::mutex mutex_;  // 守卫以下全部状态；四个公开方法各自加锁，互斥执行。
@@ -462,6 +502,14 @@ struct StrokeModeler::Impl {
     // 必须随 ResetLocked() 清零（可逆/确定性）；无任何跨笔画 latch / 计数器。
     bool has_prev_ = false;
     StrokePoint prev_output_{};  // Update() 每次推真实点时滚动成前一个
+
+    // 减速判据的「上一批瞬时弦速度幅值」（bugfix-prediction-underscale）：单看
+    // |v_true| vs |v_kalman| 无法判减速——v_true 是单次采样间隔的瞬时弦速度，稳态匀速段
+    // 也会在 |v_kalman| 上下摆动（时间戳抖动 → 半个采样周期内的弦长忽长忽短）。改以
+    // 「本批 |v_true| 相对上一批显著坍缩」作真正的减速信号，与「相对卡尔曼显著坍缩」
+    // 两者取或。同机制 A 的窗口一样必须随 ResetLocked() 清零（可逆/确定性）。
+    bool has_prev_true_ = false;
+    double prev_v_true_mag_ = 0.0;
 
     // A8-5b 诊断累计量（临时）。
     int    diag_calls_            = 0;
@@ -558,8 +606,8 @@ void StrokeModeler::Predict(std::vector<StrokePoint>* out) {
 
     // 外推速度 v_pred：减速/停笔取真实位移方向（bugfix-prediction-decel），稳态/加速取
     // 「最近真实行进方向（弦，≈圆周切线）+ 卡尔曼平滑速度幅值」。
-    //   - 减速/停笔：最近真实位移坍缩 → v_pred 随之坍缩，末批预测点落在最近真实点附近，
-    //     不留下越出真实轨迹的永久凸尾（0aa99e1 保证）。
+    //   - 减速/停笔：最近真实位移显著坍缩（判据见 IsDecel）→ v_pred 随之坍缩，末批预测点
+    //     落在最近真实点附近，不留下越出真实轨迹的永久凸尾（0aa99e1 保证）。
     //   - 稳态/加速（含圆弧）：卡尔曼速度方向滞后圆周切线 ~30–40°（恒定速度模型对圆弧各轴
     //     正弦量测的相位滞后，幅值也被衰减），若照旧用 v_kalman 方向外推 interval=30ms 会把
     //     预测尖横向推离曲线（弧外毛边，见 bugfix-prediction-curve-overshoot）。故方向改用
@@ -580,7 +628,9 @@ void StrokeModeler::Predict(std::vector<StrokePoint>* out) {
             v_true_mag = std::sqrt(Norm2(v_true));
             const double nk = Norm2(v_kalman);
             const double nt = Norm2(v_true);
-            if (nt < nk) {
+            const bool decel =
+                IsDecel(nk, nt, impl_->has_prev_true_, impl_->prev_v_true_mag_);
+            if (decel) {
                 // 减速/停笔：外推速度取真实位移方向（含 v_true==0 → 外推塌缩，与 0aa99e1 一致）。
                 v_pred = v_true;
             } else if (nt > 0.0) {
@@ -590,6 +640,8 @@ void StrokeModeler::Predict(std::vector<StrokePoint>* out) {
                 v_pred.y = v_true.y * scale;
             }
             // nt == nk == 0（死停且卡尔曼也归零）：保持 v_pred = v_kalman ≈ 0，外推自然塌缩。
+            impl_->has_prev_true_ = true;
+            impl_->prev_v_true_mag_ = v_true_mag;
         }
     }
 
