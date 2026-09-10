@@ -8,16 +8,24 @@
 //
 // 几何（currentExtent=逻辑 Cl×Ch=2160×1440；identity=swap=Ch×Cl=1440×2160）：
 //   swapchain buffer 为身份(竖屏)朝向，dst 尺寸 = (srcH, srcW)（90/270 时）。
-//   ROTATE_90  ：内容逆时针 90° → dst(bx,by) = src(srcW-1-by, bx)
-//   ROTATE_270 ：内容顺时针 90° → dst(bx,by) = src(by, srcH-1-bx)
-//   ROTATE_180 ：                  dst(bx,by) = src(srcW-1-bx, srcH-1-by)
-//   IDENTITY   ：                  dst(bx,by) = src(bx, by)
+//   本 shader 解的是「目标像素 d → 源像素 s」的**逆映射**；坐标系一律为
+//   **屏幕坐标：原点左上、x 向右、y 向下**（与 Android view / 触摸坐标同向）。
+//   mode 0：IDENTITY        s = (d.x, d.y)
+//   mode 1：视觉**逆时针** 90°（CCW）s = (srcW-1-d.y, d.x)  ⇔ src 左上(0,0) → dst 左下
+//   mode 2：视觉 180°       s = (srcW-1-d.x, srcH-1-d.y) ⇔ src 左上(0,0) → dst 右下
+//   mode 3：视觉**顺时针** 90°（CW）s = (d.y, srcH-1-d.x)  ⇔ src 左上(0,0) → dst 右上
+//   （mode 1 与 mode 3 互差 180°；mode 2 只在 90/270 之外用，此时 src/dst 尺寸相等。）
+//
+// 真机事实（MDP1221，ROTATE_90）：需要的是**顺时针** 90°（= mode 3）。早前把 ROTATE_90
+// 接到 mode 1（逆时针）实测得到整整 180° 误差（F 探针：竖笔左右相反 + 两横臂上下颠倒），
+// 即方向反了 —— 故 vk_backend.cpp 的 rotMode 必须 90→3、270→1，勿再按「90 = 逆时针」想当然。
 // 用 imageSize() 取实际尺寸，几何自洽；1:1 无缩放（dst 尺寸恒等于 identity，源=逻辑）。
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0, rgba8) uniform readonly image2D u_Src;
 layout(set = 0, binding = 1, rgba8) uniform writeonly image2D u_Dst;
 
-// mode: 0=IDENTITY, 1=ROTATE_90, 2=ROTATE_180, 3=ROTATE_270。
+// mode 语义按**几何**命名（不绑定 VkSurfaceTransform，映射见 vk_backend.cpp rotMode）：
+//   0=IDENTITY, 1=CCW90, 2=180, 3=CW90。
 layout(push_constant) uniform Push {
     ivec2 dstSize;  // swapchain image 尺寸（= identity extent）
     int mode;
@@ -29,11 +37,11 @@ void main() {
 
     ivec2 ssz = imageSize(u_Src);
     ivec2 s;
-    if (pc.mode == 1) {          // ROTATE_90：逆时针 90°
+    if (pc.mode == 1) {          // CCW90：视觉逆时针 90°（src 左上 → dst 左下）
         s = ivec2(ssz.x - 1 - d.y, d.x);
-    } else if (pc.mode == 2) {   // ROTATE_180
+    } else if (pc.mode == 2) {   // 180（src 左上 → dst 右下）
         s = ivec2(ssz.x - 1 - d.x, ssz.y - 1 - d.y);
-    } else if (pc.mode == 3) {   // ROTATE_270：顺时针 90°
+    } else if (pc.mode == 3) {   // CW90：视觉顺时针 90°（src 左上 → dst 右上）
         s = ivec2(d.y, ssz.y - 1 - d.x);
     } else {                     // IDENTITY
         s = d;

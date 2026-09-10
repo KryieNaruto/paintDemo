@@ -70,7 +70,7 @@ static_assert(sizeof(BrushPushConstant) == 12 * sizeof(float), "push constant si
 struct RotatePushConstant {
     std::int32_t dstW;
     std::int32_t dstH;
-    std::int32_t mode;  // 0=IDENTITY, 1=ROTATE_90, 2=ROTATE_180, 3=ROTATE_270
+    std::int32_t mode;  // 0=IDENTITY, 1=CCW90, 2=180, 3=CW90（几何定义，见 rotate.comp）
 };
 static_assert(sizeof(RotatePushConstant) == 3 * sizeof(std::int32_t), "rotate push size");
 
@@ -1943,9 +1943,14 @@ struct VkBackend::Impl {
                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
                                  &rIn);
 
-            const int rotMode = (surfaceTransform_ & VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR)     ? 1
+            // surface transform → rotate.comp mode（mode 几何定义见 rotate.comp 头注释）：
+            //   IDENTITY → 0, ROTATE_90 → 3(CW90), ROTATE_180 → 2(180), ROTATE_270 → 1(CCW90)。
+            // 注意 90↔3 / 270↔1 是**反直觉**的：ROTATE_90 需要的是顺时针 90°。真机 MDP1221
+            // 实测把 ROTATE_90 接 mode 1（逆时针）时内容整整偏 180°（F 探针：竖笔左右相反
+            // 且两横臂上下颠倒）—— 即当时的映射方向反了，本处按实测修正。
+            const int rotMode = (surfaceTransform_ & VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR)    ? 1
                                 : (surfaceTransform_ & VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR)  ? 2
-                                : (surfaceTransform_ & VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR)  ? 3
+                                : (surfaceTransform_ & VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR)   ? 3
                                                                                                  : 0;
             RotatePushConstant rpc{};
             rpc.dstW = (std::int32_t)rotateW;
