@@ -35,10 +35,12 @@
 #ifdef DGCPAIN_PRECOMPILED_SPV
 #include "brush_composite_spv.h"  // Android：构建期 glslc 预编译内嵌（单一权威源仍是 .comp）
 #include "merge_spv.h"            // A8-2：merge.comp（canvas+tip→display）预编译内嵌
+#include "rotate_spv.h"           // A8-5：rotate.comp（预旋转）预编译内嵌
 #else
 #include <shaderc/shaderc.hpp>
 #include "brush_composite_glsl.h"  // 由 CMake 从 brush_composite.comp 生成（单一权威源）
 #include "merge_glsl.h"            // A8-2：merge.comp 运行时 shaderc 编译源
+#include "rotate_glsl.h"           // A8-5：rotate.comp 运行时 shaderc 编译源
 #endif
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -61,6 +63,16 @@ struct BrushPushConstant {
     float dispatchOffset[2];  // 包围盒 dispatch 原点（shader：c = gl_GlobalInvocationID.xy + offset）
 };
 static_assert(sizeof(BrushPushConstant) == 12 * sizeof(float), "push constant size");
+
+// 与 rotate.comp 的 push_constant 布局一一对应（A8-5 预旋转）。
+// ivec2 dstSize + int mode：与 GLSL 侧 vec2/int（std430/430 push constant 规则）对齐无坑，
+// 但仍显式排布为 12 字节并对齐到 4（int 无 16 字节对齐要求）。
+struct RotatePushConstant {
+    std::int32_t dstW;
+    std::int32_t dstH;
+    std::int32_t mode;  // 0=IDENTITY, 1=ROTATE_90, 2=ROTATE_180, 3=ROTATE_270
+};
+static_assert(sizeof(RotatePushConstant) == 3 * sizeof(std::int32_t), "rotate push size");
 
 // §4.5 GLSL → SPIR-V：host 用 shaderc 库在代码内编译（不 shell 调 glslc/glslangValidator）；
 // Android（NDK 无 libshaderc）改走构建期 glslc 预编译的内嵌 SPIR-V（DGCPAIN_PRECOMPILED_SPV）。
@@ -123,6 +135,36 @@ std::vector<uint32_t> CompileMergeShader(std::string* err) {
     shaderc::SpvCompilationResult result = compiler.CompileGlslToSpv(
         kMergeGlsl, std::strlen(kMergeGlsl),
         shaderc_compute_shader, "merge.comp", options);
+    if (result.GetCompilationStatus() != shaderc_compilation_status_success) {
+        if (err) {
+            *err = result.GetErrorMessage();
+        }
+        return {};
+    }
+    return std::vector<uint32_t>(result.begin(), result.end());
+#endif
+}
+
+// A8-5 预旋转：rotate.comp（离屏源 → swapchain image，按 currentTransform 旋转）。
+// 与 merge 同款：无 derivative/fwidth，用 gl_GlobalInvocationID + 普通 vkCmdDispatch。
+std::vector<uint32_t> CompileRotateShader(std::string* err) {
+#ifdef DGCPAIN_PRECOMPILED_SPV
+    (void)err;  // 预编译 SPIR-V 无运行时编译错误路径
+    const size_t nbytes = sizeof(kRotateSpv);
+    static_assert(sizeof(kRotateSpv) % sizeof(uint32_t) == 0,
+                  "embedded rotate SPIR-V byte array must be 4-byte aligned");
+    std::vector<uint32_t> spv(nbytes / sizeof(uint32_t));
+    std::memcpy(spv.data(), kRotateSpv, nbytes);
+    return spv;
+#else
+    shaderc::Compiler compiler;
+    shaderc::CompileOptions options;
+    options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1);
+    options.SetOptimizationLevel(shaderc_optimization_level_performance);
+    options.SetGenerateDebugInfo();
+    shaderc::SpvCompilationResult result = compiler.CompileGlslToSpv(
+        kRotateGlsl, std::strlen(kRotateGlsl),
+        shaderc_compute_shader, "rotate.comp", options);
     if (result.GetCompilationStatus() != shaderc_compilation_status_success) {
         if (err) {
             *err = result.GetErrorMessage();
@@ -476,6 +518,22 @@ struct VkBackend::Impl {
     VkDeviceHandle<VkPipeline, vkDestroyPipeline> mergePipeline;
     VkDeviceHandle<VkDescriptorPool, vkDestroyDescriptorPool> mergeDescriptorPool;
     VkDescriptorSet mergeDescriptorSet = VK_NULL_HANDLE;
+
+    // ── A8-5 预旋转（rotate.comp：离屏源 → swapchain image，按 currentTransform 旋转）──
+    // 真机 MDP1221 实测：preTransform=IDENTITY（方案 A）会让合成器按 ROTATE_90 处理我们
+    // 未旋转的内容，SurfaceView queueBuffer 挂死 4.4s 后 SIGSEGV（见 DGC-SWAP/DEBUG 日志）。
+    // 故必须保持 preTransform=currentTransform，并自行把内容旋转进身份朝向的 swapchain image。
+    VkDeviceHandle<VkDescriptorSetLayout, vkDestroyDescriptorSetLayout> rotateDescriptorLayout;
+    VkDeviceHandle<VkPipelineLayout, vkDestroyPipelineLayout> rotatePipelineLayout;
+    VkDeviceHandle<VkPipeline, vkDestroyPipeline> rotatePipeline;
+    VkDeviceHandle<VkDescriptorPool, vkDestroyDescriptorPool> rotateDescriptorPool;
+    VkDescriptorSet rotateDescriptorSet = VK_NULL_HANDLE;
+    // 预旋转临时目标：身份朝向（90/270 时 = (canvasH, canvasW)），GENERAL 布局，可 STORAGE 写。
+    VkDeviceHandle<VkImage, vkDestroyImage> rotateImage;
+    VkDeviceHandle<VkDeviceMemory, vkFreeMemory> rotateMemory;
+    VkDeviceHandle<VkImageView, vkDestroyImageView> rotateView;
+    uint32_t rotateW = 0;  // 0 = 未建
+    uint32_t rotateH = 0;
 
     // ── A8-5 onscreen swapchain（可选上屏路径；离屏仍是唯一权威 canvasImage）──
     // 声明序在 device 之后：逆声明序析构 = swapchain → surface → … → device → instance，
@@ -834,6 +892,72 @@ struct VkBackend::Impl {
             vkDestroyShaderModule(device, mmodule, nullptr);
         }
 
+        // ── A8-5 预旋转管线（源 image → swapchain image；2 storage image + push constant）──
+        // 与 merge 的唯一结构差异：带 push constant（dstSize + rotation mode）。
+        {
+            std::array<VkDescriptorSetLayoutBinding, 2> rb{};
+            rb[0].binding = 0;
+            rb[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            rb[0].descriptorCount = 1;
+            rb[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            rb[1].binding = 1;
+            rb[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            rb[1].descriptorCount = 1;
+            rb[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            VkDescriptorSetLayoutCreateInfo rlayoutInfo{};
+            rlayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            rlayoutInfo.bindingCount = (uint32_t)rb.size();
+            rlayoutInfo.pBindings = rb.data();
+            VkDescriptorSetLayout rdsl = VK_NULL_HANDLE;
+            vkCreateDescriptorSetLayout(device, &rlayoutInfo, nullptr, &rdsl);
+            rotateDescriptorLayout.assign(device, rdsl);
+
+            VkPushConstantRange rpcRange{};
+            rpcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            rpcRange.offset = 0;
+            rpcRange.size = sizeof(RotatePushConstant);
+            VkPipelineLayoutCreateInfo rplInfo{};
+            rplInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+            rplInfo.setLayoutCount = 1;
+            VkDescriptorSetLayout rsetLayouts[] = {rotateDescriptorLayout};
+            rplInfo.pSetLayouts = rsetLayouts;
+            rplInfo.pushConstantRangeCount = 1;
+            rplInfo.pPushConstantRanges = &rpcRange;
+            VkPipelineLayout rpl = VK_NULL_HANDLE;
+            vkCreatePipelineLayout(device, &rplInfo, nullptr, &rpl);
+            rotatePipelineLayout.assign(device, rpl);
+
+            std::string rerr;
+            std::vector<uint32_t> rspv = CompileRotateShader(&rerr);
+            if (rspv.empty()) {
+                std::fprintf(stderr, "[VkBackend] rotate shaderc compile failed: %s\n", rerr.c_str());
+                return;
+            }
+            VkShaderModuleCreateInfo rmoduleInfo{};
+            rmoduleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            rmoduleInfo.codeSize = rspv.size() * sizeof(uint32_t);
+            rmoduleInfo.pCode = rspv.data();
+            VkShaderModule rmodule = VK_NULL_HANDLE;
+            if (vkCreateShaderModule(device, &rmoduleInfo, nullptr, &rmodule) != VK_SUCCESS) {
+                std::fprintf(stderr, "[VkBackend] vkCreateShaderModule(rotate) failed\n");
+                return;
+            }
+            VkComputePipelineCreateInfo rpipeInfo{};
+            rpipeInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+            rpipeInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            rpipeInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            rpipeInfo.stage.module = rmodule;
+            rpipeInfo.stage.pName = "main";
+            rpipeInfo.layout = rotatePipelineLayout;
+            VkPipeline rpipe = VK_NULL_HANDLE;
+            if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &rpipeInfo, nullptr, &rpipe) !=
+                VK_SUCCESS) {
+                std::fprintf(stderr, "[VkBackend] vkCreateComputePipelines(rotate) failed\n");
+            }
+            rotatePipeline.assign(device, rpipe);
+            vkDestroyShaderModule(device, rmodule, nullptr);
+        }
+
         deviceReady = true;
     }
 
@@ -857,6 +981,13 @@ struct VkBackend::Impl {
         displayMemory.reset();
         mergeDescriptorPool.reset();
         mergeDescriptorSet = VK_NULL_HANDLE;
+        // A8-5 预旋转：descriptor pool/set + 临时目标 image（随画布重建/销毁）。
+        rotateDescriptorPool.reset();
+        rotateDescriptorSet = VK_NULL_HANDLE;
+        rotateView.reset();
+        rotateImage.reset();
+        rotateMemory.reset();
+        rotateW = rotateH = 0;
         width = height = 0;
         readbackSize = 0;
         readbackCached_ = false;
@@ -1022,6 +1153,31 @@ struct VkBackend::Impl {
                 mWrites[i].pImageInfo = &mInfos[i];
             }
             vkUpdateDescriptorSets(device, 3, mWrites, 0, nullptr);
+        }
+
+        // A8-5 预旋转：descriptor 池/set（binding 0=源、1=rotateImage）+ 临时目标 image。
+        // rotateImage 尺寸在 present 时按「源身份朝向」确定（90/270 时 =(canvasH, canvasW)），
+        // 与 swapchain imageExtent 恒等 ⇒ 可 blit 1:1 进 swapchain。此处只建设施，尺寸待用。
+        {
+            std::array<VkDescriptorPoolSize, 1> rPoolSizes{};
+            rPoolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            rPoolSizes[0].descriptorCount = 2;
+            VkDescriptorPoolCreateInfo rpoolInfo{};
+            rpoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+            rpoolInfo.maxSets = 1;
+            rpoolInfo.poolSizeCount = (uint32_t)rPoolSizes.size();
+            rpoolInfo.pPoolSizes = rPoolSizes.data();
+            VkDescriptorPool rpool = VK_NULL_HANDLE;
+            vkCreateDescriptorPool(device, &rpoolInfo, nullptr, &rpool);
+            rotateDescriptorPool.assign(device, rpool);
+
+            VkDescriptorSetAllocateInfo rAlloc{};
+            rAlloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            rAlloc.descriptorPool = rotateDescriptorPool;
+            rAlloc.descriptorSetCount = 1;
+            VkDescriptorSetLayout rsetLayouts[] = {rotateDescriptorLayout};
+            rAlloc.pSetLayouts = rsetLayouts;
+            vkAllocateDescriptorSets(device, &rAlloc, &rotateDescriptorSet);
         }
 
         canvasReady = true;
@@ -1540,8 +1696,10 @@ struct VkBackend::Impl {
         //   方案 B（终态，低延迟）：preTransform = caps.currentTransform + 自行按角预旋转内容。
         const VkSurfaceTransformFlagBitsKHR tf = caps.currentTransform;
         const bool rot90 = (tf & VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR) != 0;
+        const bool rot180 = (tf & VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR) != 0;
         const bool rot270 = (tf & VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) != 0;
         const bool swapXY = rot90 || rot270;  // 90/270 ⇒ 横竖互换
+        const bool anyRot = rot90 || rot180 || rot270;
         surfaceTransform_ = tf;
 
         // 帧缓冲（物理扫描）尺寸 = caps.currentExtent；身份（面板原生）尺寸 = 90/270 时互换。
@@ -1565,10 +1723,10 @@ struct VkBackend::Impl {
         }
         // 方案 A：extent = 帧缓冲尺寸（未预旋转，与 canvas 同朝向，旋转交给合成器）；
         // 方案 B：extent = 身份尺寸（内容已预旋转，合成器不再施加）。
-        const bool kUsePreRotation = false;  // ← 方案 B 实现并真机验证后置 true（A8-5 终态）
+        const bool kUsePreRotation = true;  // 方案 B（终态）：真机验证 A 不可行（见 NOTE）
         const VkExtent2D extent = kUsePreRotation ? identityExtent : useFbExtent;
         swapchainExtent = extent;
-        preRotate_ = kUsePreRotation && swapXY;
+        preRotate_ = kUsePreRotation && anyRot;
 
         uint32_t imageCount = caps.minImageCount + 1;  // 尽量 double/triple buffer
         if (caps.maxImageCount > 0 && imageCount > caps.maxImageCount) {
@@ -1682,6 +1840,207 @@ struct VkBackend::Impl {
         }
 
         BeginCommands();
+        // ── 方案 B：预旋转路径（source → rotateImage[身份朝向] → swapchain）──────────────
+        // 真机验证：preTransform=IDENTITY（方案 A）会让 SurfaceView queueBuffer 挂死 4.4s
+        // 后 SIGSEGV，故必须 preTransform=currentTransform 并自行旋转。vkCmdBlitImage 无法
+        // 转置（x→x、y→y 两个独立 1D 缩放），改用 rotate.comp。
+        if (preRotate_) {
+            // 源身份朝向尺寸 = 90/270 时 (canvasH, canvasW)（与 swapchain imageExtent 恒等）。
+            const uint32_t reqW = (surfaceTransform_ & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR |
+                                                        VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR))
+                                      ? (uint32_t)height
+                                      : (uint32_t)width;
+            const uint32_t reqH = (surfaceTransform_ & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR |
+                                                        VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR))
+                                      ? (uint32_t)width
+                                      : (uint32_t)height;
+            if (reqW != rotateW || reqH != rotateH) {
+                rotateView.reset();
+                rotateImage.reset();
+                rotateMemory.reset();
+                VkImage rimg = VK_NULL_HANDLE;
+                VkDeviceMemory rmem = VK_NULL_HANDLE;
+                CreateImage(device.get(), physicalDevice, reqW, reqH, kCanvasFormat,
+                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                            VK_IMAGE_LAYOUT_GENERAL, rimg, rmem);
+                rotateImage.assign(device.get(), rimg);
+                rotateMemory.assign(device.get(), rmem);
+                rotateView.assign(device.get(),
+                                  CreateImageView(device.get(), rimg, kCanvasFormat));
+                if (rotateView.get() == VK_NULL_HANDLE || rotateDescriptorSet == VK_NULL_HANDLE) {
+                    std::fprintf(stderr, "[VkBackend] rotate image/view create failed\n");
+                    rotateImage.reset();
+                    rotateMemory.reset();
+                    rotateView.reset();
+                    rotateW = rotateH = 0;
+                    return;
+                }
+                VkDescriptorImageInfo rInfos[2]{};
+                rInfos[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;  // 源（每帧写）
+                rInfos[1].imageView = rotateView;
+                rInfos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                // 绑定 0 的 imageView 每帧随源变，先占位（fill 时逐帧更新）。
+                rInfos[0].imageView = canvasView;
+                VkWriteDescriptorSet rWrites[2]{};
+                for (int i = 0; i < 2; ++i) {
+                    rWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    rWrites[i].dstSet = rotateDescriptorSet;
+                    rWrites[i].dstBinding = (uint32_t)i;
+                    rWrites[i].descriptorCount = 1;
+                    rWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                    rWrites[i].pImageInfo = &rInfos[i];
+                }
+                vkUpdateDescriptorSets(device.get(), 2, rWrites, 0, nullptr);
+                rotateW = reqW;
+                rotateH = reqH;
+            }
+            // 源选择（同 readback 口径）；把源 imageView 写进 rotate 描述符 binding 0。
+            VkImage srcImage = RecordDisplaySourceMergeLocked();
+            VkImageView srcView = (srcImage == displayImage.get() && displayView.get() != VK_NULL_HANDLE)
+                                      ? displayView.get()
+                                      : canvasView.get();
+            VkDescriptorImageInfo sInfo{};
+            sInfo.imageView = srcView;
+            sInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            VkWriteDescriptorSet sw{};
+            sw.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            sw.dstSet = rotateDescriptorSet;
+            sw.dstBinding = 0;
+            sw.descriptorCount = 1;
+            sw.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            sw.pImageInfo = &sInfo;
+            vkUpdateDescriptorSets(device.get(), 1, &sw, 0, nullptr);
+
+            // 源 GENERAL → GENERAL（storage 读写，无需换布局；仅补访问/阶段同步）。
+            VkImageMemoryBarrier sBar{};
+            sBar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            sBar.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            sBar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            sBar.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            sBar.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            sBar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            sBar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            sBar.image = srcImage;
+            sBar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                 &sBar);
+
+            // rotateImage 写入前同步：新图首帧内容未定义、且此后进入 SHADER_WRITE，
+            // 显式 GENERAL→GENERAL 补一次（全像素覆盖，无需保留旧内容）。
+            VkImageMemoryBarrier rIn{};
+            rIn.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            rIn.srcAccessMask = 0;
+            rIn.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            rIn.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            rIn.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            rIn.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            rIn.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            rIn.image = rotateImage.get();
+            rIn.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                 &rIn);
+
+            const int rotMode = (surfaceTransform_ & VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR)     ? 1
+                                : (surfaceTransform_ & VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR)  ? 2
+                                : (surfaceTransform_ & VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR)  ? 3
+                                                                                                 : 0;
+            RotatePushConstant rpc{};
+            rpc.dstW = (std::int32_t)rotateW;
+            rpc.dstH = (std::int32_t)rotateH;
+            rpc.mode = rotMode;
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rotatePipeline);
+            vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rotatePipelineLayout,
+                                    0, 1, &rotateDescriptorSet, 0, nullptr);
+            vkCmdPushConstants(commandBuffer, rotatePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                               sizeof(rpc), &rpc);
+            vkCmdDispatch(commandBuffer, (rotateW + 7) / 8, (rotateH + 7) / 8, 1);
+            // rotateImage GENERAL（shader write）→ TRANSFER_SRC_OPTIMAL（blit 源）。
+            VkImageMemoryBarrier rOut{};
+            rOut.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            rOut.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            rOut.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            rOut.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            rOut.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            rOut.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            rOut.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            rOut.image = rotateImage.get();
+            rOut.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                 &rOut);
+
+            // swapchain image UNDEFINED → TRANSFER_DST_OPTIMAL，blit rotateImage（1:1）。
+            VkImage dst = swapchainImages[imageIndex];
+            VkImageMemoryBarrier dstBar{};
+            dstBar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            dstBar.srcAccessMask = 0;
+            dstBar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            dstBar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            dstBar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            dstBar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            dstBar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            dstBar.image = dst;
+            dstBar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                 &dstBar);
+            VkImageBlit blit{};
+            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            blit.srcOffsets[0] = {0, 0, 0};
+            blit.srcOffsets[1] = {(int32_t)rotateW, (int32_t)rotateH, 1};
+            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            blit.dstOffsets[0] = {0, 0, 0};
+            blit.dstOffsets[1] = {(int32_t)swapchainExtent.width, (int32_t)swapchainExtent.height, 1};
+            vkCmdBlitImage(commandBuffer, rotateImage.get(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+            // 收尾：rotateImage 回 GENERAL；swapchain → PRESENT_SRC。
+            VkImageMemoryBarrier rBack{};
+            rBack.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            rBack.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            rBack.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            rBack.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            rBack.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            rBack.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            rBack.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            rBack.image = rotateImage.get();
+            rBack.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            VkImageMemoryBarrier dstPresent{};
+            dstPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            dstPresent.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            dstPresent.dstAccessMask = 0;
+            dstPresent.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            dstPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            dstPresent.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            dstPresent.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            dstPresent.image = dst;
+            dstPresent.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            VkImageMemoryBarrier postBars[2] = {rBack, dstPresent};
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2,
+                                 postBars);
+            SubmitAndWait();
+
+            VkPresentInfoKHR pi{};
+            pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+            pi.swapchainCount = 1;
+            pi.pSwapchains = &swapchain.h;
+            pi.pImageIndices = &imageIndex;
+            VkResult pr = vkQueuePresentKHR(queue, &pi);
+            if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
+                CreateSwapchainLocked();
+            } else if (pr == VK_ERROR_SURFACE_LOST_KHR) {
+                std::fprintf(stderr, "[VkBackend] vkQueuePresentKHR surface lost\n");
+                TeardownSwapchainLocked();
+            } else if (pr != VK_SUCCESS) {
+                std::fprintf(stderr, "[VkBackend] vkQueuePresentKHR failed (%d)\n", pr);
+            }
+            return;
+        }
+
+        // ── 方案 A：未预旋转（extent 与 canvas 同朝向，旋转交合成器）──
         // 1) blit 源 = 显示源选择（同 readback 口径：tipHasContent_ 先 merge → displayImage）。
         VkImage srcImage = RecordDisplaySourceMergeLocked();
         // 源布局 GENERAL → TRANSFER_SRC_OPTIMAL（vkCmdBlitImage 要求 transfer src）。

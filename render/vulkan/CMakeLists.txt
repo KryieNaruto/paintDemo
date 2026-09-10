@@ -98,6 +98,30 @@ if(DGCPAIN_ANDROID)
         message(FATAL_ERROR
             "merge_spv.h 内嵌 SPIR-V 与 merge.spv 不一致（merge_spv.h.in 变量串用回归）")
     endif()
+
+    # A8-5：rotate.comp（离屏源 → swapchain image，按 currentTransform 预旋转）同款。
+    execute_process(
+        COMMAND ${GLSLC_BIN} -g -fshader-stage=compute
+            ${CMAKE_CURRENT_SOURCE_DIR}/rotate.comp
+            -o ${CMAKE_CURRENT_BINARY_DIR}/rotate.spv
+        RESULT_VARIABLE _rotate_glslc_rc
+        OUTPUT_VARIABLE _rotate_glslc_out
+        ERROR_VARIABLE _rotate_glslc_err)
+    if(NOT _rotate_glslc_rc EQUAL 0)
+        message(FATAL_ERROR "glslc failed compiling rotate.comp:\n${_rotate_glslc_err}")
+    endif()
+    file(READ ${CMAKE_CURRENT_BINARY_DIR}/rotate.spv _rotate_spv HEX)
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," ROTATE_SPV_C_ARRAY "${_rotate_spv}")
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/rotate_spv.h.in
+                   ${CMAKE_CURRENT_BINARY_DIR}/rotate_spv.h @ONLY)
+    # 回归：rotate_spv.h 必须内嵌 rotate.spv 的字节（同 merge 的变量串用回归防护）。
+    file(READ ${CMAKE_CURRENT_BINARY_DIR}/rotate_spv.h _rotate_hdr)
+    string(FIND "${_rotate_hdr}" "${ROTATE_SPV_C_ARRAY}" _rotate_spv_pos)
+    if(_rotate_spv_pos EQUAL -1)
+        message(FATAL_ERROR
+            "rotate_spv.h 内嵌 SPIR-V 与 rotate.spv 不一致（rotate_spv.h.in 变量串用回归）")
+    endif()
+
     target_compile_definitions(dgc_paint PRIVATE DGCPAIN_PRECOMPILED_SPV=1)
 else()
     # ── host：运行时 shaderc 编译（B2-1 不变）──
@@ -128,6 +152,11 @@ else()
     file(READ ${CMAKE_CURRENT_SOURCE_DIR}/merge.comp GLSL_SOURCE)
     configure_file(${CMAKE_CURRENT_SOURCE_DIR}/merge_glsl.h.in
                    ${CMAKE_CURRENT_BINARY_DIR}/merge_glsl.h @ONLY)
+
+    # A8-5：rotate.comp 内嵌头（运行时 shaderc 编译；复用 @GLSL_SOURCE@ 占位符）。
+    file(READ ${CMAKE_CURRENT_SOURCE_DIR}/rotate.comp GLSL_SOURCE)
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/rotate_glsl.h.in
+                   ${CMAKE_CURRENT_BINARY_DIR}/rotate_glsl.h @ONLY)
 
     target_include_directories(dgc_paint PRIVATE ${SHADERC_INCLUDE_DIR})
     target_link_libraries(dgc_paint PRIVATE ${SHADERC_LIBRARY})
