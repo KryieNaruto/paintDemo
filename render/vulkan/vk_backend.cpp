@@ -484,8 +484,15 @@ struct VkBackend::Impl {
     VkInstanceHandle<VkSurfaceKHR, vkDestroySurfaceKHR> surface;
     VkDeviceHandle<VkSwapchainKHR, vkDestroySwapchainKHR> swapchain;
     std::vector<VkImage> swapchainImages;  // 当前 swapchain 的 images（blit 目标池）
-    VkExtent2D swapchainExtent{};          // 当前 swapchain 尺寸（blit 目标区域）
+    VkExtent2D swapchainExtent{};          // 当前 swapchain 尺寸（blit/present 目标区域）
     VkPresentModeKHR presentMode_ = VK_PRESENT_MODE_FIFO_KHR;  // 实际选中（MAILBOX 优先退 FIFO）
+    // A8-5 预旋转状态（真机 MDP1221 实测：面板原生竖屏 1440x2160，横屏逻辑 2160x1440，
+    // SurfaceFlinger framebufferSpace=ROTATION_90，即 caps.currentTransform 非 IDENTITY）。
+    //   surfaceTransform_ = 创建时快照的 caps.currentTransform（诊断/旋转角来源）。
+    //   preRotate_        = 本帧 present 是否需要自行做 90/270 补偿（方案 B 开启后为真）。
+    // 语义见 CreateSwapchainLocked 顶部注释。
+    VkSurfaceTransformFlagBitsKHR surfaceTransform_ = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    bool preRotate_ = false;
     VkFormat swapchainFormat_ = VK_FORMAT_UNDEFINED;  // 实际选中 swapchain image 格式（DGC-SWAP 诊断）
     bool onscreen_ = false;       // 已绑 surface+swapchain → present() 走 onscreen 分支
     bool swapchainValid_ = false; // 当前 swapchain 可用；out-of-date/surface-lost 置否
@@ -1525,17 +1532,43 @@ struct VkBackend::Impl {
         std::fprintf(stderr, "[VkBackend] present mode: %s\n",
                      (mode == VK_PRESENT_MODE_MAILBOX_KHR) ? "MAILBOX" : "FIFO");
 
-        VkExtent2D extent = caps.currentExtent;
-        if (extent.width == 0xFFFFFFFFu || extent.width == 0 || extent.height == 0xFFFFFFFFu ||
-            extent.height == 0) {
-            // 非固定尺寸（或暂时为 0，如最小化）：以离屏 canvas 尺寸为期望，夹到 caps 的
-            // min/max（无旋转前提下 canvas 与屏幕 1:1，blit 免缩放）。
-            extent.width = std::clamp((uint32_t)width, caps.minImageExtent.width,
-                                      caps.maxImageExtent.width);
-            extent.height = std::clamp((uint32_t)height, caps.minImageExtent.height,
-                                       caps.maxImageExtent.height);
+        // ── A8-5 预旋转：变换与 extent（真机 MDP1221 实测 caps.currentTransform != IDENTITY）──
+        // Vulkan/Android 契约：preTransform = caps.currentTransform ⇒ 向合成器声明「内容已按该
+        // 变换预旋转好」，合成器便**不再**施加该旋转；此时 swapchain image 必须是**已旋转**的
+        // 身份尺寸（currentExtent 在 90/270 下相对面板身份尺寸横竖互换，需换回）。
+        //   方案 A（保底）：preTransform = IDENTITY，合成器自行施加旋转，blit 原样不改。
+        //   方案 B（终态，低延迟）：preTransform = caps.currentTransform + 自行按角预旋转内容。
+        const VkSurfaceTransformFlagBitsKHR tf = caps.currentTransform;
+        const bool rot90 = (tf & VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR) != 0;
+        const bool rot270 = (tf & VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) != 0;
+        const bool swapXY = rot90 || rot270;  // 90/270 ⇒ 横竖互换
+        surfaceTransform_ = tf;
+
+        // 帧缓冲（物理扫描）尺寸 = caps.currentExtent；身份（面板原生）尺寸 = 90/270 时互换。
+        const VkExtent2D fbExtent = caps.currentExtent;
+        VkExtent2D identityExtent = caps.currentExtent;
+        if (swapXY) {
+            std::swap(identityExtent.width, identityExtent.height);
         }
+        VkExtent2D useFbExtent = fbExtent;
+        if (identityExtent.width == 0xFFFFFFFFu || identityExtent.width == 0 ||
+            identityExtent.height == 0xFFFFFFFFu || identityExtent.height == 0) {
+            // 非固定尺寸/暂时为 0（如最小化）：以离屏 canvas 尺寸（身份朝向）为期望，夹到 caps。
+            identityExtent.width = std::clamp((uint32_t)width, caps.minImageExtent.width,
+                                              caps.maxImageExtent.width);
+            identityExtent.height = std::clamp((uint32_t)height, caps.minImageExtent.height,
+                                               caps.maxImageExtent.height);
+            useFbExtent = identityExtent;
+            if (swapXY) {
+                std::swap(useFbExtent.width, useFbExtent.height);
+            }
+        }
+        // 方案 A：extent = 帧缓冲尺寸（未预旋转，与 canvas 同朝向，旋转交给合成器）；
+        // 方案 B：extent = 身份尺寸（内容已预旋转，合成器不再施加）。
+        const bool kUsePreRotation = false;  // ← 方案 B 实现并真机验证后置 true（A8-5 终态）
+        const VkExtent2D extent = kUsePreRotation ? identityExtent : useFbExtent;
         swapchainExtent = extent;
+        preRotate_ = kUsePreRotation && swapXY;
 
         uint32_t imageCount = caps.minImageCount + 1;  // 尽量 double/triple buffer
         if (caps.maxImageCount > 0 && imageCount > caps.maxImageCount) {
@@ -1558,7 +1591,10 @@ struct VkBackend::Impl {
         sci.imageArrayLayers = 1;
         sci.imageUsage = usage;
         sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        sci.preTransform = caps.currentTransform;
+        // 方案 A：IDENTITY（合成器施加 currentTransform）；方案 B：匹配 caps.currentTransform
+        // （声明已自行预旋转，合成器不再施加）。
+        sci.preTransform =
+            kUsePreRotation ? tf : VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
         sci.compositeAlpha = (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR)
                                  ? VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR
                                  : VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -1576,6 +1612,20 @@ struct VkBackend::Impl {
         vkGetSwapchainImagesKHR(device.get(), swapchain.get(), &imgCount, nullptr);
         swapchainImages.resize(imgCount);
         vkGetSwapchainImagesKHR(device.get(), swapchain.get(), &imgCount, swapchainImages.data());
+        // A8-5 诊断（真机决定性）：打印 transform 位/extent/preTransform/方案。
+        {
+            const char* tfName = (tf & VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR)    ? "ROTATE_90"
+                                 : (tf & VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) ? "ROTATE_270"
+                                 : (tf & VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR) ? "ROTATE_180"
+                                                                                  : "IDENTITY";
+            DGC_SWAP_LOG("swapchain create: currentTransform=%s(0x%x) currentExtent=%ux%u "
+                         "identity=%ux%u sci.imageExtent=%ux%u preTransform=%s mode=%d images=%u "
+                         "plan=%s",
+                         tfName, (unsigned)tf, fbExtent.width, fbExtent.height, identityExtent.width,
+                         identityExtent.height, extent.width, extent.height,
+                         kUsePreRotation ? "currentTransform" : "IDENTITY",
+                         (int)mode, imgCount, kUsePreRotation ? "B" : "A");
+        }
         swapchainValid_ = true;
         onscreen_ = true;
     }
@@ -1664,6 +1714,10 @@ struct VkBackend::Impl {
                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
                              &dstBar);
         // 3) blit 全画布 → swapchain image（尺寸不一致时线性缩放）。
+        //    A8-5 预旋转（方案 B）：preTransform 已声明自行预旋转，需在此把内容按 transform
+        //    旋转。vkCmdBlitImage 的 src/dst offsets 是**两个独立 1D 缩放**（x→x、y→y），**不能
+        //    转置**，故 90/270 不能靠重排 offsets 实现——需旋转渲染路径（见 PresentLocked 顶部
+        //    TODO）。方案 A（preRotate_ 恒 false）下保持原样 1:1 blit。
         VkImageBlit blit{};
         blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         blit.srcOffsets[0] = {0, 0, 0};
