@@ -2165,6 +2165,12 @@ struct VkBackend::Impl {
         mergePipeline.reset();
         mergePipelineLayout.reset();
         mergeDescriptorLayout.reset();
+        // A8-5 预旋转：与 merge 同理，须在 device.reset() 前显式释放 device 子对象，
+        // 否则 Impl 析构时 rotatePipeline 守卫会对已销毁的 device 调 vkDestroyPipeline
+        // → VUID-vkDestroyPipeline-device-parameter → abort（真机/主机 ctest 同一路径）。
+        rotatePipeline.reset();
+        rotatePipelineLayout.reset();
+        rotateDescriptorLayout.reset();
         commandPool.reset();
         commandBuffer = VK_NULL_HANDLE;
         device.reset();
